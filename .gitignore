@@ -163,3 +163,6 @@ scripts/demo/node_modules
 *.bak
 **/execution_log.md
 mcpproxy-linux-amd64
+mcpproxy-go
+.project_map.json
+.scout-cache/
