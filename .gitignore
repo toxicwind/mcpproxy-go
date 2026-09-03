@@ -166,3 +166,7 @@ mcpproxy-linux-amd64
 mcpproxy-go
 .project_map.json
 .scout-cache/
+!config/mesh_config.json
+!config/
+!config/mesh_config.json
+mesh-gateway

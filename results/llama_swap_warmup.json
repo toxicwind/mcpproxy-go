@@ -1,0 +1,61 @@
+{
+  "api_base": "http://127.0.0.1:25100",
+  "config_file": "/tmp/llm-coding-benchmark/config/models.nvidia.json",
+  "generated_at": "2026-09-02T04:26:12+00:00",
+  "results": [
+    {
+      "llama_swap_model": "gemma4:27b",
+      "reason": "gemma4:27b not in /v1/models",
+      "slug": "gemma4_31b",
+      "status": "skipped"
+    },
+    {
+      "llama_swap_model": "qwen3:32b",
+      "reason": "qwen3:32b not in /v1/models",
+      "slug": "qwen3_32b",
+      "status": "skipped"
+    },
+    {
+      "llama_swap_model": "qwen3.5:35b",
+      "reason": "qwen3.5:35b not in /v1/models",
+      "slug": "qwen3_5_35b",
+      "status": "skipped"
+    },
+    {
+      "llama_swap_model": "qwen3.6:35b",
+      "reason": "qwen3.6:35b not in /v1/models",
+      "slug": "qwen3_6_35b",
+      "status": "skipped"
+    },
+    {
+      "llama_swap_model": "gpt-oss:20b",
+      "reason": "gpt-oss:20b not in /v1/models",
+      "slug": "gpt_oss_20b",
+      "status": "skipped"
+    },
+    {
+      "llama_swap_model": "qwen3.5:27b-claude",
+      "reason": "qwen3.5:27b-claude not in /v1/models",
+      "slug": "qwen3_5_27b_claude",
+      "status": "skipped"
+    },
+    {
+      "llama_swap_model": "qwen2.5-coder:32b",
+      "reason": "qwen2.5-coder:32b not in /v1/models",
+      "slug": "qwen2_5_coder_32b",
+      "status": "skipped"
+    },
+    {
+      "llama_swap_model": "qwen3-coder:30b",
+      "reason": "qwen3-coder:30b not in /v1/models",
+      "slug": "qwen3_coder_30b",
+      "status": "skipped"
+    },
+    {
+      "llama_swap_model": "qwen3.5-sushi-coder:27b",
+      "reason": "qwen3.5-sushi-coder:27b not in /v1/models",
+      "slug": "qwen3_5_27b_sushi_coder",
+      "status": "skipped"
+    }
+  ]
+}
