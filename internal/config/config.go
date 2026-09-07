@@ -1,11 +1,13 @@
 package config
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -2197,15 +2199,59 @@ func (c *Config) MarshalJSON() ([]byte, error) {
 	return json.Marshal((*Alias)(c))
 }
 
-// UnmarshalJSON implements json.Unmarshaler interface
+// UnmarshalJSON implements json.Unmarshaler interface, accepting mcpServers as either
+// a slice ([]*ServerConfig) or an object map (map[string]*ServerConfig).
 func (c *Config) UnmarshalJSON(data []byte) error {
 	type Alias Config
 	aux := &struct {
+		RawServers json.RawMessage `json:"mcpServers"`
 		*Alias
 	}{
 		Alias: (*Alias)(c),
 	}
-	return json.Unmarshal(data, aux)
+	if err := json.Unmarshal(data, aux); err != nil {
+		return err
+	}
+
+	if len(aux.RawServers) == 0 {
+		return nil
+	}
+
+	trimmed := bytes.TrimSpace(aux.RawServers)
+	if len(trimmed) == 0 || string(trimmed) == "null" {
+		c.Servers = nil
+		return nil
+	}
+
+	if trimmed[0] == '[' {
+		var servers []*ServerConfig
+		if err := json.Unmarshal(aux.RawServers, &servers); err != nil {
+			return fmt.Errorf("failed to unmarshal mcpServers array: %w", err)
+		}
+		c.Servers = servers
+		return nil
+	} else if trimmed[0] == '{' {
+		var serverMap map[string]*ServerConfig
+		if err := json.Unmarshal(aux.RawServers, &serverMap); err != nil {
+			return fmt.Errorf("failed to unmarshal mcpServers map: %w", err)
+		}
+		servers := make([]*ServerConfig, 0, len(serverMap))
+		for name, srv := range serverMap {
+			if srv != nil {
+				if srv.Name == "" {
+					srv.Name = name
+				}
+				servers = append(servers, srv)
+			}
+		}
+		sort.Slice(servers, func(i, j int) bool {
+			return servers[i].Name < servers[j].Name
+		})
+		c.Servers = servers
+		return nil
+	}
+
+	return fmt.Errorf("invalid mcpServers format: expected array or object, got %s", string(trimmed[:1]))
 }
 
 // OAuthConfigChanged checks if OAuth configuration has changed between two configs.
