@@ -1855,31 +1855,72 @@ func (p *MCPProxyServer) handleRetrieveToolsWithMode(ctx context.Context, reques
 	// resolved one.
 	producer := p.cacheAuthorizationWith(ctx, profileName, profileScope, profileIdx)
 	searchIndex := p.index
+	// sharedIndexFallback is true only when a profile IS in effect but its
+	// physical per-profile index could not be opened, so searchIndex stays the
+	// shared (whole-fleet) index instead of a store already limited to the
+	// profile's own servers (Spec 105 FR-005 D3).
+	sharedIndexFallback := false
 	if profileName != "" && !profileScope.DeniesAll() {
 		if pIdx, perr := p.index.ForProfile(profileName); perr == nil && pIdx != nil {
 			searchIndex = pIdx
 		} else if perr != nil {
+			sharedIndexFallback = true
 			p.logger.Warn("per-profile index unavailable; falling back to shared index with post-filter",
 				zap.String("profile", profileName), zap.Error(perr))
 		}
 	}
 
-	// Perform search using the resolved index manager
-	results, err := searchIndex.Search(query, limit)
+	// Spec 028 + blocked tool semantics: filter results to only include callable tools
+	// from servers the agent can access. Disabled/blocked tools are treated as non-existent
+	// for runtime discovery. The auth context is hoisted out of the search and the loop
+	// below because it's a per-request value and AuthContextFromContext does a
+	// context.Value lookup we don't want to repeat per result.
+	authCtx := auth.AuthContextFromContext(ctx)
+	// Spec 057 / Profiles v2: profileScope was resolved above (token pin > URL >
+	// session) and filters independently of agent-scope (nil = allow all).
+
+	// serverDiscoverable applies the agent-scope (Spec 049 FR-007) and profile
+	// (Spec 057) filters BEFORE classification so an agent never learns a tool
+	// exists on a server it cannot access. It delegates to the shared
+	// visibility resolver's scope step (Spec 085, mcp_visibility.go) — shared
+	// by the search below, the callable-result loop, the quarantined-tool
+	// discovery pass, and describe_tool, so they never drift.
+	serverDiscoverable := func(serverName string) bool {
+		return p.serverInScope(authCtx, profileScope, serverName)
+	}
+
+	// Spec 105 FR-005 G1: a scoped caller's search MUST filter to its
+	// authorized population BEFORE the ranked result is cut to `limit` — an
+	// out-of-scope hit that outranks an authorized one must never displace it
+	// from the window. Search(query, limit) alone cannot do this: it ranks and
+	// cuts over the WHOLE corpus a physical index holds, and the post-filter
+	// loop below runs only after the cut. SearchToolsScoped instead filters
+	// the SAME ranked stream through serverDiscoverable before collecting
+	// `limit` hits (index/bleve.go), so it is correct regardless of which
+	// physical index (shared or per-profile) backs the search — a per-profile
+	// index still needs it when the caller's OWN token scope is narrower than
+	// the profile's server set.
+	//
+	// A profile-scoped administrator on the shared-index fallback gets the
+	// same treatment (D3, SC-005 named exception): with no per-profile index
+	// to rely on, the shared search must filter before the cut too, or a
+	// `limit:1` request whose top hit sits outside the profile would return an
+	// empty page instead of the best authorized hit. Every OTHER administrator
+	// path (unprofiled, or profiled with a working per-profile index) keeps
+	// plain Search — byte-for-byte with the pre-105 behaviour.
+	useScopedSearch := auth.IsScopedCaller(ctx) || (profileName != "" && sharedIndexFallback)
+
+	var results []*config.SearchResult
+	if useScopedSearch {
+		results, err = searchIndex.SearchToolsScoped(query, limit, serverDiscoverable)
+	} else {
+		results, err = searchIndex.Search(query, limit)
+	}
 	if err != nil {
 		p.logger.Error("Search failed", zap.String("query", query), zap.Error(err))
 		p.emitActivityInternalToolCall("retrieve_tools", "", "", "", sessionID, requestID, "error", err.Error(), time.Since(startTime).Milliseconds(), args, nil, nil, "")
 		return mcp.NewToolResultError(fmt.Sprintf("Search failed: %v", err)), nil
 	}
-
-	// Spec 028 + blocked tool semantics: filter results to only include callable tools
-	// from servers the agent can access. Disabled/blocked tools are treated as non-existent
-	// for runtime discovery. The auth context is hoisted out of the loop because it's a
-	// per-request value and AuthContextFromContext does a context.Value lookup we don't
-	// want to repeat per result.
-	authCtx := auth.AuthContextFromContext(ctx)
-	// Spec 057 / Profiles v2: profileScope was resolved above (token pin > URL >
-	// session) and filters independently of agent-scope (nil = allow all).
 
 	// Spec 049: opt-in discovery of locked tools. When false (default) the
 	// behavior below is byte-for-byte identical to before — disabled tools are
@@ -1889,16 +1930,6 @@ func (p *MCPProxyServer) handleRetrieveToolsWithMode(ctx context.Context, reques
 	if includeDisabled {
 		p.recordIncludeDisabled()
 		args["include_disabled"] = true
-	}
-
-	// serverDiscoverable applies the agent-scope (Spec 049 FR-007) and profile
-	// (Spec 057) filters BEFORE classification so an agent never learns a tool
-	// exists on a server it cannot access. It delegates to the shared
-	// visibility resolver's scope step (Spec 085, mcp_visibility.go) — shared
-	// by the callable-result loop, the quarantined-tool discovery pass below,
-	// and describe_tool, so they never drift.
-	serverDiscoverable := func(serverName string) bool {
-		return p.serverInScope(authCtx, profileScope, serverName)
 	}
 
 	var callableResults []*config.SearchResult
@@ -2157,7 +2188,17 @@ func (p *MCPProxyServer) handleRetrieveToolsWithMode(ctx context.Context, reques
 	if p.mainServer != nil && p.mainServer.runtime != nil {
 		if sup := p.mainServer.runtime.Supervisor(); sup != nil {
 			snapshot := sup.StateView().Snapshot()
-			risk := analyzeSessionRisk(snapshot)
+			// Spec 105 FR-005 G3: a scoped caller's session_risk must reflect
+			// only its own authorized servers' tool annotations — otherwise the
+			// level (and the lethal-trifecta verdict) leaks the existence and
+			// shape of a hidden server's tools. Administrators are unaffected
+			// (not a named SC-005 exception): they keep the whole-fleet view.
+			var risk SessionRisk
+			if auth.IsScopedCaller(ctx) {
+				risk = analyzeSessionRiskScoped(snapshot, serverDiscoverable)
+			} else {
+				risk = analyzeSessionRisk(snapshot)
+			}
 			includeWarning := false
 			if p.config != nil && p.config.ToolResponseSessionRiskWarning {
 				includeWarning = true
@@ -2171,8 +2212,18 @@ func (p *MCPProxyServer) handleRetrieveToolsWithMode(ctx context.Context, reques
 
 	// Add debug information if requested
 	if debugMode {
+		// Spec 105 FR-005 G4: total_indexed_tools must count the scoped
+		// caller's own authorized population, not the whole fleet's document
+		// count — regardless of whether search itself ran against the shared
+		// index or an already-scoped per-profile one (scopedIndexedToolCount
+		// re-derives it from the shared index's server_name facet, so both
+		// paths agree). Administrators are unaffected (not an SC-005 exception).
+		totalIndexedTools := p.getIndexedToolCount()
+		if auth.IsScopedCaller(ctx) {
+			totalIndexedTools = p.scopedIndexedToolCount(serverDiscoverable)
+		}
 		response["debug"] = map[string]interface{}{
-			"total_indexed_tools": p.getIndexedToolCount(),
+			"total_indexed_tools": totalIndexedTools,
 			"search_backend":      "BM25",
 			"query_analysis":      p.analyzeQuery(query),
 			"limit_applied":       limit,
@@ -2186,8 +2237,30 @@ func (p *MCPProxyServer) handleRetrieveToolsWithMode(ctx context.Context, reques
 
 	// Add tool statistics summary if requested
 	if includeStats {
-		stats, err := p.storage.GetToolStats(10)
-		if err == nil {
+		// Spec 105 FR-005 G2: a scoped caller's usage ranking must be computed
+		// over its authorized population's APPROVED tools only — a stale usage
+		// record for a tool that was removed, hidden, or is still pending
+		// review must never resurface. Population membership alone would admit
+		// a pending tool (it is indexed); approval alone never checks the tool
+		// still exists (mcp_direct_callability.go) — both gates are required.
+		// The sort-then-cut happens AFTER filtering (GetToolStatsFiltered), so
+		// a used-but-hidden tool can never evict an authorized one from the
+		// top-10 window. Administrators are unaffected (not an SC-005
+		// exception): GetToolStats(10) stays byte-for-byte, quarantine-blind.
+		var stats []map[string]interface{}
+		var statsErr error
+		if auth.IsScopedCaller(ctx) {
+			stats, statsErr = p.storage.GetToolStatsFiltered(func(fullToolName string) bool {
+				serverName, rawToolName, ok := splitServerTool(fullToolName)
+				if !ok {
+					return false
+				}
+				return p.usageStatEligible(authCtx, profileScope, serverName, rawToolName)
+			}, 10)
+		} else {
+			stats, statsErr = p.storage.GetToolStats(10)
+		}
+		if statsErr == nil {
 			response["usage_summary"] = map[string]interface{}{
 				"top_tools": stats,
 			}
@@ -2500,7 +2573,25 @@ func (p *MCPProxyServer) handleCallToolVariant(ctx context.Context, request mcp.
 	// never re-derived here — cacheAuthorizationWith's caller-intersected
 	// ProfileServers stamp needs it (Spec 105 PR D review round 17).
 	producer := p.cacheAuthorizationWith(ctx, profileSlug, profileScope, profileIdx)
-	if profileScope != nil && !profileScope.Allows(serverName) {
+	// Spec 105 FR-010 gap G7: effective scope is profile ∩ token, checked in
+	// ONE evaluation with ONE refusal body for a scoped agent caller — never
+	// the profile-only check alone, which used to run here regardless of
+	// caller kind and could answer a DIFFERENT body ("server 'b' is not in
+	// profile 'P'") than the token-scope check further below ("Server 'b' is
+	// not in scope for this agent token") for the SAME server, depending on
+	// which of the two excluded it. A server inside the pin but outside the
+	// token (or the reverse) must be indistinguishable from a nonexistent
+	// one. Administrators keep today's profile-only text unchanged — they
+	// have no token scope to intersect with.
+	scopeAuthCtx := auth.AuthContextFromContext(ctx)
+	scopedCallerForScope := scopeAuthCtx != nil && !scopeAuthCtx.IsAdmin()
+	if scopedCallerForScope {
+		if !p.serverInScope(scopeAuthCtx, profileScope, serverName) {
+			errMsg := fmt.Sprintf("Server '%s' is not in scope for this agent token", serverName)
+			p.emitActivityPolicyDecision(ctx, serverName, actualToolName, getSessionID(), requestID, "blocked", errMsg, telemetry.BlockReasonTokenScope)
+			return mcp.NewToolResultError(errMsg), nil
+		}
+	} else if profileScope != nil && !profileScope.Allows(serverName) {
 		errMsg := fmt.Sprintf("server '%s' is not in profile '%s'", serverName, profileScope.Name)
 		p.emitActivityPolicyDecision(ctx, serverName, actualToolName, getSessionID(), requestID, "blocked", errMsg, telemetry.BlockReasonProfileScope)
 		return mcp.NewToolResultError(errMsg), nil
@@ -2548,19 +2639,14 @@ func (p *MCPProxyServer) handleCallToolVariant(ctx context.Context, request mcp.
 		p.dispatchGatePause(serverName, actualToolName)
 	}
 
-	// Spec 028: Enforce agent token scope restrictions. The server-scope and
-	// variant-permission gates run before the identity gate so a scoped
-	// caller learns nothing about a server outside its scope from the shape
-	// of the refusal.
-	authCtx := auth.AuthContextFromContext(ctx)
-	scopedCaller := authCtx != nil && !authCtx.IsAdmin()
+	// Spec 028: Enforce agent token scope restrictions. The server-scope gate
+	// above (effective scope = profile ∩ token, Spec 105 FR-010 G7) already
+	// ran before the identity gate so a scoped caller learns nothing about a
+	// server outside its scope from the shape of the refusal; only the
+	// variant-permission gate remains here.
+	authCtx := scopeAuthCtx
+	scopedCaller := scopedCallerForScope
 	if scopedCaller {
-		// Check server scope
-		if !authCtx.CanAccessServer(serverName) {
-			errMsg := fmt.Sprintf("Server '%s' is not in scope for this agent token", serverName)
-			p.emitActivityPolicyDecision(ctx, serverName, actualToolName, getSessionID(), requestID, "blocked", errMsg, telemetry.BlockReasonTokenScope)
-			return mcp.NewToolResultError(errMsg), nil
-		}
 		// Check permission scope — map tool variant to required permission
 		var requiredPerm string
 		switch toolVariant {
@@ -2813,8 +2899,23 @@ func (p *MCPProxyServer) handleCallToolVariant(ctx context.Context, request mcp.
 		// the admission queue and immediately before the transport.
 		certified = live
 	} else {
-		// Get list of available servers for helpful error message
+		// Get list of available servers for helpful error message. Spec 105
+		// FR-010 G1/T100: for a scoped agent caller this list is filtered
+		// through the SAME effective-scope predicate (serverInScope =
+		// profile ∩ token) the dispatch gates above already evaluated — an
+		// unauthorized server's mere existence must not leak into a hint
+		// meant to help the caller find ITS OWN servers. Administrators are
+		// unaffected: their branch below is untouched.
 		availableServers := p.upstreamManager.GetAllServerNames()
+		if scopedCaller {
+			visible := make([]string, 0, len(availableServers))
+			for _, name := range availableServers {
+				if p.serverInScope(authCtx, profileScope, name) {
+					visible = append(visible, name)
+				}
+			}
+			availableServers = visible
+		}
 		serverList := strings.Join(availableServers, ", ")
 		if len(availableServers) == 0 {
 			serverList = "(no servers configured)"

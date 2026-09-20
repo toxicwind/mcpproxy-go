@@ -4,6 +4,8 @@ import (
 	"context"
 	"strings"
 
+	"go.uber.org/zap"
+
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/auth"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/profile"
@@ -74,14 +76,45 @@ const (
 // pending "a:erase" rendered its definition on the approved sibling's gate
 // and an approved one was withheld on the pending sibling's.
 func (p *MCPProxyServer) toolVisibleToSession(ctx context.Context, serverName, toolName string) (visible bool, reason string) {
-	if !p.toolIndexed(serverName, toolName) {
-		return false, visReasonNotIndexed
-	}
 	authCtx := auth.AuthContextFromContext(ctx)
 	_, profileScope := p.resolveActiveProfile(ctx)
 
-	if !p.serverInScope(authCtx, profileScope, serverName) {
-		return false, visReasonServerNotInScope
+	// Spec 105 FR-010 G2: for a SCOPED caller (agent token), scope is
+	// checked BEFORE index presence. An id whose server is outside the
+	// caller's effective scope must answer the same reason whether or not a
+	// hidden document happens to exist under that exact (server, tool) pair
+	// — checking index presence first let the mere existence of a hidden
+	// collision (e.g. a case-different "b:read" on a server outside scope,
+	// alongside an authorized "B:read") swap the answer from not_indexed (no
+	// suggestion attempted below) to server_not_in_scope, silently
+	// suppressing the did-you-mean a token would otherwise get when the
+	// hidden document didn't exist at all. The scope predicate itself only
+	// reads the caller's own auth/profile state, never the index, so
+	// reordering costs nothing for a genuinely visible id.
+	//
+	// Gated to auth.IsScopedCaller (codex round-1 review, MUST-FIX): a
+	// profile-scoped ADMINISTRATOR is not a scoped caller, and reordering
+	// unconditionally changed WHICH reason it gets back even outside any
+	// hidden-collision scenario (e.g. a genuinely nonexistent server: index-
+	// first gave not_indexed pre-fix, scope-first gives server_not_in_scope
+	// post-fix) — which then fed the suggestion gate below and silently
+	// dropped a case-correction suggestion a profile-scoped admin used to
+	// get. FR-010 requires admin resolution unchanged; only the agent-facing
+	// order actually needed to move.
+	if auth.IsScopedCaller(ctx) {
+		if !p.serverInScope(authCtx, profileScope, serverName) {
+			return false, visReasonServerNotInScope
+		}
+		if !p.toolIndexed(serverName, toolName) {
+			return false, visReasonNotIndexed
+		}
+	} else {
+		if !p.toolIndexed(serverName, toolName) {
+			return false, visReasonNotIndexed
+		}
+		if !p.serverInScope(authCtx, profileScope, serverName) {
+			return false, visReasonServerNotInScope
+		}
 	}
 	// Spec 105 FR-009 (research D4), astra r2 C2: an index document is not a
 	// registration identity. A name the KNOWN, CONNECTED server's completed
@@ -207,6 +240,49 @@ func (p *MCPProxyServer) serverInScope(authCtx *auth.AuthContext, profileScope *
 		return false
 	}
 	return profileScope.Allows(serverName)
+}
+
+// scopedIndexedToolCount returns the number of indexed tools belonging to
+// servers discoverable admits (Spec 105 FR-005 G4): a scoped caller's
+// `debug.total_indexed_tools` must count its own authorized population, not
+// the whole fleet's document count, regardless of whether the search that
+// produced the response ran against the shared index or an already-scoped
+// per-profile one — this always re-derives the count from the shared index's
+// server_name facet, so the two paths can never disagree about the count for
+// the identical effective scope.
+func (p *MCPProxyServer) scopedIndexedToolCount(discoverable func(serverName string) bool) int {
+	count, err := p.index.ScopedDocumentCount(discoverable)
+	if err != nil {
+		p.logger.Warn("Failed to get scoped document count", zap.Error(err))
+		return 0
+	}
+	if count > 0x7FFFFFFF { // Check for potential overflow
+		return 0x7FFFFFFF
+	}
+	return int(count)
+}
+
+// usageStatEligible reports whether a recorded tool-usage stat for
+// (serverName, toolName) belongs to the CURRENT authorized population and is
+// fully approved (Spec 105 FR-005 G2): a scoped caller's usage_summary must
+// exclude a stale record for a tool that was removed, hidden by scope, or is
+// still pending/changed review. Population membership alone would admit a
+// pending tool (it is indexed); approval alone never checks that the tool
+// still exists (mcp_direct_callability.go) — both are required. Deliberately
+// stricter than indexedToolVisible (the SEARCH gate, which stays permissive
+// for pending/changed tools per FR-006 byte-identity): usage ranking is not
+// search, and a still-under-review tool should not be recommended by name.
+func (p *MCPProxyServer) usageStatEligible(authCtx *auth.AuthContext, profileScope *profile.ProfileScope, serverName, toolName string) bool {
+	if !p.serverInScope(authCtx, profileScope, serverName) {
+		return false
+	}
+	if p.lookupIndexedTool(serverName, toolName) == nil {
+		return false
+	}
+	if !p.isExactToolCallable(serverName, toolName) {
+		return false
+	}
+	return p.describeGateReason(serverName, toolName) == ""
 }
 
 // toolIndexed reports whether the tool is present in the shared search index
