@@ -2,8 +2,8 @@ package supervisor
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
-	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -14,6 +14,7 @@ import (
 
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/diagnostics"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/diagnostics/hints"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/runtime/configsvc"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/runtime/stateview"
 	transportpkg "github.com/smart-mcp-proxy/mcpproxy-go/internal/transport"
@@ -55,56 +56,53 @@ func classifyAndAttach(status *stateview.ServerStatus, err error, hints diagnost
 	}
 }
 
+// applyRetryStopped projects a connection's permanent-park state onto the read
+// model. Both stateview writers (the reconcile sweep and the event fast path)
+// call it, because RetryCount is written by both and a status that carried a
+// stale RetryStopped next to a fresh RetryCount would tell the user the opposite
+// of the truth (GH #1145).
+func applyRetryStopped(status *stateview.ServerStatus, ci *types.ConnectionInfo) {
+	if ci == nil || !ci.Terminal || ci.RetryCount < types.PermanentFailureAttempts {
+		status.RetryStopped = false
+		status.RetryStoppedCode = ""
+		status.RetryStoppedReason = ""
+		return
+	}
+	status.RetryStopped = true
+	status.RetryStoppedCode = ci.TerminalCode
+	status.RetryStoppedReason = terminalReason(ci)
+}
+
+// terminalReason renders the user-facing cause of a permanent park. It prefers
+// the diagnostics catalog message for the code that justified stopping — that is
+// the text written to tell a user how to fix exactly this — and falls back to
+// the raw error so the reason is never empty.
+func terminalReason(ci *types.ConnectionInfo) string {
+	if ci == nil {
+		return ""
+	}
+	raw := ""
+	if ci.LastError != nil {
+		raw = ci.LastError.Error()
+	}
+	return diagnostics.PermanentFailureReason(diagnostics.Code(ci.TerminalCode), raw)
+}
+
 // classifierHints builds the diagnostics.ClassifierHints for a server's failure,
 // including the Docker-isolation enrichment context (MCP-2909) the
 // DockerExecNotFound remediation needs: the configured command (→ detected
 // runtime), the per-server isolation.image override (likely culprit), and the
-// global default_images map (→ recommended image). The enrichment fields are
+// global default_images map (→ recommended image). The args come along for
+// DockerMissingToolchain, which reads them to tell a git dependency apart from
+// any other missing tool (#1144). The enrichment fields are
 // only populated for Docker-isolated servers; they are inert for every other
 // code.
 func (s *Supervisor) classifierHints(srv *config.ServerConfig, transport string) diagnostics.ClassifierHints {
-	hints := diagnostics.ClassifierHints{
-		Transport:      transport,
-		DockerIsolated: s.usesDockerIsolation(srv),
+	var global *config.Config
+	if snap := s.configSvc.Current(); snap != nil {
+		global = snap.Config
 	}
-	if hints.DockerIsolated && srv != nil {
-		hints.DockerCommand = srv.Command
-		if srv.Isolation != nil {
-			hints.DockerImageOverride = srv.Isolation.Image
-		}
-		if snap := s.configSvc.Current(); snap != nil && snap.Config != nil && snap.Config.DockerIsolation != nil {
-			hints.DockerDefaultImages = snap.Config.DockerIsolation.DefaultImages
-		}
-	}
-	return hints
-}
-
-// usesDockerIsolation reports whether the given server would be launched
-// through Docker isolation, so the classifier can attribute spawn/exec failures
-// to DOCKER codes (#696 CLI missing, in-container interpreter missing) rather
-// than a generic stdio ENOENT. This is a side-effect-free mirror of
-// core.IsolationManager.ShouldIsolate (internal/upstream/core/isolation.go) —
-// it is only a classifier hint, so faithfulness matters more than sharing the
-// (logging) implementation.
-func (s *Supervisor) usesDockerIsolation(srv *config.ServerConfig) bool {
-	if srv == nil || srv.Command == "" {
-		return false
-	}
-	snap := s.configSvc.Current()
-	if snap == nil || snap.Config == nil || snap.Config.DockerIsolation == nil ||
-		!snap.Config.DockerIsolation.Enabled {
-		return false
-	}
-	// Per-server explicit opt-out wins over the global enable.
-	if srv.Isolation != nil && srv.Isolation.Enabled != nil && !*srv.Isolation.Enabled {
-		return false
-	}
-	// Servers already running docker themselves are not double-isolated.
-	cmdBase := filepath.Base(srv.Command)
-	if cmdBase == "docker" || strings.Contains(srv.Command, "docker") {
-		return false
-	}
-	return true
+	return hints.For(global, srv, transport)
 }
 
 // Supervisor manages the desired vs actual state reconciliation for upstream servers.
@@ -487,6 +485,20 @@ func (s *Supervisor) computeReconcilePlan(configSnapshot *configsvc.Snapshot, ac
 				// BUT: Don't auto-reconnect if user explicitly logged out
 				if userLoggedOut[name] {
 					plan.Actions[name] = ActionNone
+				} else if actual, ok := actualStates[name]; ok && !actual.ConnectionInfo.ShouldAutoReconnect(time.Now()) {
+					// Respect the client's retry policy: exponential backoff after
+					// consecutive failures, the coarse OAuth ladder, half-hourly
+					// probes once the client gave up, and PendingAuth servers
+					// parked waiting on user OAuth login. Without this gate the
+					// periodic 30s reconciliation re-dials a dead upstream forever,
+					// hammering the remote server (~3 requests per tick).
+					s.logger.Debug("Skipping auto-reconnect (backoff/pending-auth/permanent)",
+						zap.String("server", name),
+						zap.String("state", actual.ConnectionInfo.State.String()),
+						zap.Int("retry_count", actual.ConnectionInfo.RetryCount),
+						zap.Bool("terminal", actual.ConnectionInfo.Terminal),
+						zap.String("terminal_code", actual.ConnectionInfo.TerminalCode))
+					plan.Actions[name] = ActionNone
 				} else {
 					plan.Actions[name] = ActionConnect
 				}
@@ -516,17 +528,18 @@ func (s *Supervisor) computeReconcilePlan(configSnapshot *configsvc.Snapshot, ac
 	return plan
 }
 
-// configChanged checks if server configuration has changed.
+// configChanged checks if a server's connection configuration has changed, which
+// makes the reconcile plan ActionReconnect.
+//
+// ActionReconnect is computed BEFORE the auto-reconnect backoff gate, so it is
+// the documented bypass: a user-driven config change for this server reconnects
+// it whatever the ladder says. Since GH #1145 that bypass is also the ONLY way a
+// permanently parked server comes back on its own, so the comparison has to see
+// every connection field — this used to check five of them, and an unresolvable
+// `args` or a wrong `isolation.image` (the two most likely causes of a permanent
+// failure) were both invisible to it.
 func (s *Supervisor) configChanged(old, new *config.ServerConfig) bool {
-	if old == nil || new == nil {
-		return old != new
-	}
-
-	return old.URL != new.URL ||
-		old.Protocol != new.Protocol ||
-		old.Command != new.Command ||
-		old.Enabled != new.Enabled ||
-		old.Quarantined != new.Quarantined
+	return !config.ConnectionEquivalent(old, new)
 }
 
 // executeAction performs the specified action on a server.
@@ -640,6 +653,9 @@ func (s *Supervisor) updateSnapshot(configSnapshot *configsvc.Snapshot, actualSt
 		Timestamp: time.Now(),
 		Version:   s.version,
 	}
+	// Servers whose live connection token moved unobserved (astra r2 C3);
+	// their reactive discovery is kicked once the snapshot is stored.
+	var rediscover []string
 
 	// Add all configured servers
 	for _, srv := range configSnapshot.Config.Servers {
@@ -661,12 +677,52 @@ func (s *Supervisor) updateSnapshot(configSnapshot *configsvc.Snapshot, actualSt
 			state.Connected = actual.Connected
 			state.ConnectionInfo = actual.ConnectionInfo
 			state.ToolCount = actual.ToolCount
+			state.ConnectionEpoch = actual.ConnectionEpoch
 		}
 
 		// Merge with existing snapshot for data only available from events
 		if existing, ok := existingStates[srv.Name]; ok {
 			state.LastSeen = existing.LastSeen
 			state.Tools = existing.Tools // Tools come from background discovery
+			state.ConnectionGeneration = existing.ConnectionGeneration
+			// Reconcile is authoritative for Connected, so it is authoritative
+			// for the per-connection discovery marker too (astra r1 I4): a
+			// disconnect the manager reports but whose event was dropped
+			// (actor_pool.emitEvent drops on a full channel) must not carry
+			// the previous connection's stamp — or its generation — forward.
+			state.ToolsDiscovered = existing.ToolsDiscovered && state.Connected
+			state.DiscoveryEpoch = existing.DiscoveryEpoch
+			if existing.Connected && !state.Connected {
+				state.ConnectionGeneration++
+			}
+			// The live client's connection token is the edge detector the
+			// events are not (astra r2 C3): a disconnect+reconnect whose BOTH
+			// events were dropped leaves the manager reporting "connected"
+			// on both observations, so the marker, tools and generation of
+			// the previous connection would survive until the next sweep
+			// (default 5 min). A token that moved since the last observation
+			// is a missed edge, and a stamp captured under a token other
+			// than the live one is the previous connection's: clear the
+			// marker, move the generation (a result captured on the old
+			// connection is dropped at publish time) and kick the reactive
+			// discovery the dropped connect event would have kicked.
+			if state.Connected && state.ConnectionEpoch != 0 {
+				missedEdge := existing.ConnectionEpoch != 0 && existing.ConnectionEpoch != state.ConnectionEpoch
+				staleStamp := state.ToolsDiscovered && state.DiscoveryEpoch != state.ConnectionEpoch
+				if missedEdge || staleStamp {
+					s.logger.Info("Reconcile observed a connection the events did not report; invalidating the server's discovery stamp and re-listing",
+						zap.String("server", srv.Name),
+						zap.Int64("observed_epoch", existing.ConnectionEpoch),
+						zap.Int64("discovery_epoch", state.DiscoveryEpoch),
+						zap.Int64("live_epoch", state.ConnectionEpoch))
+					state.ToolsDiscovered = false
+					state.ConnectionGeneration++
+					rediscover = append(rediscover, srv.Name)
+				}
+			}
+			if !state.ToolsDiscovered {
+				state.DiscoveryEpoch = 0
+			}
 			// If actual state didn't have tool count but existing does, keep it
 			if state.ToolCount == 0 && existing.ToolCount > 0 {
 				state.ToolCount = existing.ToolCount
@@ -681,6 +737,19 @@ func (s *Supervisor) updateSnapshot(configSnapshot *configsvc.Snapshot, actualSt
 
 	s.snapshot.Store(newSnapshot)
 
+	if len(rediscover) > 0 {
+		s.callbackMu.RLock()
+		callback := s.onServerConnectedCallback
+		s.callbackMu.RUnlock()
+		if callback != nil {
+			for _, name := range rediscover {
+				// Asynchronous, exactly as the connect event dispatches it:
+				// the caller holds stateMu.
+				go callback(name)
+			}
+		}
+	}
+
 	// Remove servers from stateview that are no longer in config
 	currentView := s.stateView.Snapshot()
 	for name := range currentView.Servers {
@@ -694,6 +763,12 @@ func (s *Supervisor) updateSnapshot(configSnapshot *configsvc.Snapshot, actualSt
 func (s *Supervisor) updateStateView(name string, state *ServerState) {
 	var classifiedCode string
 	s.stateView.UpdateServer(name, func(status *stateview.ServerStatus) {
+		// Edge-trigger basis. View.UpdateServer deep-clones the snapshot and
+		// hands us the PREVIOUS status, so these two reads (taken before any
+		// mutation below) are the state as of the last pass. See
+		// shouldNotifyErrorCode for why they gate the telemetry notification.
+		prevCode, prevRetryCount, prevErrorTime := errorCodeEdgeBasis(status)
+
 		oldState := status.State
 		status.Config = state.Config
 		status.Enabled = state.Enabled
@@ -703,6 +778,8 @@ func (s *Supervisor) updateStateView(name string, state *ServerState) {
 
 		// Phase 7.1: Convert ToolMetadata to ToolInfo and cache in StateView
 		status.Tools = toolInfosFromMetadata(state.Tools)
+		status.ToolsDiscovered = state.ToolsDiscovered
+		status.DiscoveryEpoch = state.DiscoveryEpoch
 
 		// Map connection state to string
 		// Use detailed state from ConnectionInfo when available to avoid mislabeling disconnected servers as "connecting"
@@ -730,6 +807,7 @@ func (s *Supervisor) updateStateView(name string, state *ServerState) {
 			status.LastError = ""
 			status.LastErrorTime = nil
 			status.Diagnostic = nil
+			applyRetryStopped(status, nil)
 		}
 
 		// Update connection info if available
@@ -755,9 +833,16 @@ func (s *Supervisor) updateStateView(name string, state *ServerState) {
 				classifyAndAttach(status, state.ConnectionInfo.LastError, s.classifierHints(state.Config, transport))
 				// Spec 044 Phase H / Spec 080 FR-012: capture the classified
 				// code; delivered synchronously after the stateview lock is
-				// released (see notifyErrorCode).
+				// released (see notifyErrorCode). MCP-2967: only on an EDGE —
+				// reconcile() runs this for every configured server every 30s
+				// and ConnectionInfo.LastError is sticky, so propagating
+				// unconditionally counted the same standing failure ~2880
+				// times a day per server.
 				if status.Diagnostic != nil {
-					classifiedCode = string(status.Diagnostic.Code)
+					code := string(status.Diagnostic.Code)
+					if shouldNotifyErrorCode(prevCode, code, prevRetryCount, state.ConnectionInfo.RetryCount, prevErrorTime, state.ConnectionInfo.LastRetryTime) {
+						classifiedCode = code
+					}
 				}
 
 				// Set last error time if available
@@ -771,6 +856,11 @@ func (s *Supervisor) updateStateView(name string, state *ServerState) {
 
 			// Copy retry count
 			status.RetryCount = state.ConnectionInfo.RetryCount
+
+			// GH #1145: surface a permanently parked server explicitly. Without
+			// this it is indistinguishable from a server still working through
+			// its backoff, and the user waits for a retry that never comes.
+			applyRetryStopped(status, state.ConnectionInfo)
 
 			// Store full connection info in metadata for debugging
 			if status.Metadata == nil {
@@ -790,6 +880,146 @@ func (s *Supervisor) updateStateView(name string, state *ServerState) {
 		}
 	})
 	s.notifyErrorCode(classifiedCode)
+}
+
+// errorCodeEdgeBasis extracts the previous diagnostic code and retry count
+// from a ServerStatus. It must be called at the very top of a
+// View.UpdateServer callback, before any mutation: View.UpdateServer clones
+// the snapshot and passes the PREVIOUS status in, so these are last-pass
+// values only until the callback starts writing.
+func errorCodeEdgeBasis(status *stateview.ServerStatus) (code string, retryCount int, errorTime time.Time) {
+	if status == nil {
+		return "", 0, time.Time{}
+	}
+	if status.Diagnostic != nil {
+		code = string(status.Diagnostic.Code)
+	}
+	if status.LastErrorTime != nil {
+		errorTime = *status.LastErrorTime
+	}
+	return code, status.RetryCount, errorTime
+}
+
+// shouldNotifyErrorCode reports whether a freshly classified diagnostic is a
+// new EVENT rather than the same standing condition re-observed.
+//
+// MCP-2967. The telemetry counter behind diagnostics.error_code_counts_24h was
+// level-triggered: reconcile() calls updateStateView for EVERY configured
+// server on a 30s ticker, and ConnectionInfo.LastError is sticky (cleared only
+// on a transition to Ready, see upstream/types.SetState). A server parked
+// awaiting OAuth login therefore emitted 86400/30 = 2880 "events" a day while
+// making zero connection attempts, and the number tracked failing-server count
+// times uptime rather than anything a user did. Field data corroborated:
+// install-days above the tick cadence averaged 3.89x it, on installs averaging
+// 18.8 configured servers.
+//
+// The edge is any of:
+//   - a different classified code — a new failure, or the first failure after
+//     a recovery that cleared the standing diagnostic;
+//   - a changed ConnectionInfo.RetryCount — the count advances on each failed
+//     attempt, and the state machine resets it to 0 on a transition to Ready,
+//     so a DECREASE marks a new failure episode after a recovery that no
+//     stateview pass happened to observe. Either direction is a real event,
+//     which is why this compares != rather than >.
+//   - a changed ConnectionInfo.LastRetryTime — the timestamp every failure
+//     setter stamps with time.Now() (upstream/types.SetError:347,
+//     SetTerminalError:400, SetPendingAuth:465, SetOAuthError:726) and that
+//     nothing else advances, so a fresh value is a fresh ATTEMPT. Without this
+//     term, OAuth failures coalesced without bound rather than within an
+//     observation window: SetOAuthError increments oauthRetryCount and NOT
+//     retryCount, so a server failing OAuth over and over held (same code,
+//     same RetryCount) and edged exactly once, ever. It also closes two ABA
+//     routes that need no dropped event — a Reset()+Connect() that returns to
+//     the same (code, RetryCount), and a recover-then-refail observed through
+//     a state fetched after the queued connected event.
+//     Re-observing a STICKY error does not advance it, which is the whole
+//     point; reconcile never writes it.
+//
+// The standing condition itself is not lost: classifyAndAttach still runs on
+// every pass (so the UI, REST API and CLI keep rendering the diagnostic), and
+// Supervisor.CurrentErrorCodes reports the standing set for telemetry.
+//
+// Known and accepted imprecision — this is a SAMPLED predicate over two
+// observations, not an event log tapped at the failure site, so it can alias:
+//   - Coalescing (under-count): several attempts failing between two
+//     observations collapse into one notification, and a transient different
+//     code that has already reverted is not seen at all. Bounded by the
+//     observation cadence.
+//   - ABA (under-count): a recovery followed by a new failure that returns to
+//     the identical (code, RetryCount, LastRetryTime) triple with no
+//     observation in between. Needs all three to match, so in practice it
+//     needs a clock that did not move.
+//   - Double-stamping (over-count): one attempt routed through two failure
+//     setters (SetError then SetPendingAuth, say) stamps LastRetryTime twice
+//     and can edge twice. Bounded at a small constant per attempt.
+//   - Stale-observation replay (over-count): reconcile pre-fetches upstream
+//     states BEFORE taking stateMu (a deliberate lock-ordering choice, see
+//     reconcile), so it can publish a state older than one the event writer
+//     already applied, clearing the diagnostic and letting the same standing
+//     failure edge a second time.
+//
+// All are bounded by the observation cadence or by a small constant, and are
+// orders of magnitude smaller than the ~2880/day/server they replace. Closing
+// them means giving failures a monotonic identity at the source rather than
+// diffing sampled projections, which is a supervisor-wide change and
+// deliberately out of scope here. Treat the counter as "roughly how often
+// something newly broke", and read CurrentErrorCodes for an exact right-now
+// number.
+func shouldNotifyErrorCode(prevCode, code string, prevRetryCount, retryCount int, prevErrorTime, errorTime time.Time) bool {
+	if code == "" {
+		return false
+	}
+	if code != prevCode {
+		return true
+	}
+	if retryCount != prevRetryCount {
+		return true
+	}
+	// Zero means the state manager never stamped an attempt time (a synthesised
+	// ConnectionInfo, or one built before the failure setters ran); fall back to
+	// the two counter terms rather than inventing an edge.
+	return !errorTime.IsZero() && !errorTime.Equal(prevErrorTime)
+}
+
+// CurrentErrorCodes returns the standing diagnostic state of this install:
+// stable MCPX_* code -> number of configured servers currently in that state.
+// Returns nil when nothing is failing.
+//
+// This is the companion to the edge-triggered counter above and exists because
+// edge-triggering alone would DELETE the "installs currently affected" signal:
+// diagnostics.error_code_counts_24h decays over a 24h window, carries
+// omitempty, and the whole Diagnostics object is omitted when isZero(). A
+// permanently parked install would emit one event and then vanish from the
+// payload — trading an inflated number for a missing one, which reads as zero.
+//
+// Anonymity: the map is keyed exclusively by the fixed MCPX_ catalog (~30
+// codes, prefix-checked here as defense in depth) and valued by a count. It
+// carries no server name, URL, command, or free text. Only enabled,
+// non-quarantined servers are counted — a server the user disabled or
+// quarantined is not "currently affected".
+func (s *Supervisor) CurrentErrorCodes() map[string]int {
+	snap := s.stateView.Snapshot()
+	if snap == nil || len(snap.Servers) == 0 {
+		return nil
+	}
+	counts := make(map[string]int)
+	for _, status := range snap.Servers {
+		if status == nil || status.Diagnostic == nil {
+			continue
+		}
+		if !status.Enabled || status.Quarantined {
+			continue
+		}
+		code := string(status.Diagnostic.Code)
+		if !strings.HasPrefix(code, "MCPX_") {
+			continue
+		}
+		counts[code]++
+	}
+	if len(counts) == 0 {
+		return nil
+	}
+	return counts
 }
 
 // notifyErrorCode delivers a freshly classified MCPX_* code to the registered
@@ -848,13 +1078,13 @@ func toolInfosFromMetadata(tools []*config.ToolMetadata) []stateview.ToolInfo {
 	}
 	infos := make([]stateview.ToolInfo, len(tools))
 	for i, tool := range tools {
-		// Parse ParamsJSON into InputSchema
+		// Parse ParamsJSON into InputSchema. StateView is served verbatim by the
+		// REST/CLI tool listings, so a malformed schema must stay nil (field
+		// omitted downstream) rather than become a misleading empty object.
 		var inputSchema map[string]interface{}
 		if tool.ParamsJSON != "" {
-			// ParamsJSON is already a JSON string; the API endpoint parses it if needed.
-			inputSchema = map[string]interface{}{
-				"type":       "object",
-				"properties": map[string]interface{}{}, // TODO: Parse ParamsJSON
+			if err := json.Unmarshal([]byte(tool.ParamsJSON), &inputSchema); err != nil {
+				inputSchema = nil
 			}
 		}
 
@@ -869,11 +1099,68 @@ func toolInfosFromMetadata(tools []*config.ToolMetadata) []stateview.ToolInfo {
 	return infos
 }
 
+// DiscoveryGenerations returns every known server's current
+// DiscoveryCapture — the Supervisor's ConnectionGeneration and the live
+// client's connection token. A discovery caller captures it BEFORE listing
+// tools and hands it back to the publish call, which drops any server whose
+// generation has moved on (Spec 105 FR-009 "stale generation"; astra r1 I2)
+// and stamps the token on the result (astra r2 C3).
+func (s *Supervisor) DiscoveryGenerations() map[string]DiscoveryCapture {
+	// The live tokens come from the adapter (manager lock) and are read
+	// BEFORE stateMu, per the lock-ordering rule reconcile documents.
+	actual := s.upstream.GetAllStates()
+
+	s.stateMu.RLock()
+	defer s.stateMu.RUnlock()
+	snapshot := s.CurrentSnapshot()
+	gens := make(map[string]DiscoveryCapture, len(snapshot.Servers))
+	for name, state := range snapshot.Servers {
+		if state == nil {
+			continue
+		}
+		capture := DiscoveryCapture{Generation: state.ConnectionGeneration}
+		if live, ok := actual[name]; ok && live != nil {
+			capture.Epoch = live.ConnectionEpoch
+		}
+		gens[name] = capture
+	}
+	return gens
+}
+
+// DiscoveryGeneration returns one server's current DiscoveryCapture (a zero
+// Generation for a server the snapshot does not hold — the live token is
+// still captured, so the StateView write such a server gets carries it); see
+// DiscoveryGenerations.
+func (s *Supervisor) DiscoveryGeneration(serverName string) DiscoveryCapture {
+	var epoch int64
+	if live, err := s.upstream.GetServerState(serverName); err == nil && live != nil {
+		epoch = live.ConnectionEpoch
+	}
+
+	s.stateMu.RLock()
+	defer s.stateMu.RUnlock()
+	if state, ok := s.CurrentSnapshot().Servers[serverName]; ok && state != nil {
+		return DiscoveryCapture{Generation: state.ConnectionGeneration, Epoch: epoch}
+	}
+	return DiscoveryCapture{Epoch: epoch}
+}
+
 // RefreshToolsFromDiscovery updates both the Supervisor snapshot and StateView with tools from background discovery.
-// This is called after DiscoverAndIndexTools completes to populate the UI cache.
-func (s *Supervisor) RefreshToolsFromDiscovery(tools []*config.ToolMetadata) error {
+// This is called after DiscoverAndIndexTools completes to keep the cached tool lists in sync.
+//
+// Only servers that contributed at least one tool are touched: a server absent
+// from the flat list cannot be told apart from one that listed zero tools, so
+// it keeps whatever the previous pass published. A single server whose
+// discovery completed with ZERO tools is published through
+// RefreshServerToolsFromDiscovery, which names the server explicitly.
+//
+// gens is the DiscoveryGenerations() capture taken before the tools were
+// listed: a server whose connection generation has moved on since is NOT
+// published (its result belongs to a previous connection) and is returned in
+// stale, so the caller can re-list it under the current connection.
+func (s *Supervisor) RefreshToolsFromDiscovery(tools []*config.ToolMetadata, gens map[string]DiscoveryCapture) (stale []string, err error) {
 	if tools == nil {
-		return nil
+		return nil, nil
 	}
 
 	// Group tools by server name
@@ -882,8 +1169,145 @@ func (s *Supervisor) RefreshToolsFromDiscovery(tools []*config.ToolMetadata) err
 		toolsByServer[tool.ServerName] = append(toolsByServer[tool.ServerName], tool)
 	}
 
-	// Update Supervisor's snapshot first (source of truth for StateView)
+	stale = s.publishDiscoveredTools(toolsByServer, gens)
+	s.logger.Debug("Refreshed tools in Supervisor snapshot and StateView from discovery",
+		zap.Int("server_count", len(toolsByServer)),
+		zap.Int("total_tools", len(tools)),
+		zap.Strings("stale_servers", stale))
+	return stale, nil
+}
+
+// RefreshServerToolsFromDiscovery publishes ONE server's completed discovery
+// result — tools may be empty — into the Supervisor snapshot and the
+// StateView, stamping ToolsDiscovered for it (Spec 105 FR-009, research D4).
+// This is the per-server discovery path (connect, tools/list_changed, the
+// operator's refresh), where an empty result is authoritative: the server
+// really lists no tools, so every name on it must resolve as undiscovered
+// rather than fall through to the connect→discovery window's fallback.
+//
+// gen is the server's DiscoveryGeneration() captured before the tools were
+// listed; published reports whether the result landed (false: the connection
+// generation moved on, the result was dropped and the caller should re-list).
+func (s *Supervisor) RefreshServerToolsFromDiscovery(serverName string, tools []*config.ToolMetadata, gen DiscoveryCapture) (published bool, err error) {
+	if serverName == "" {
+		return false, nil
+	}
+	serverTools := make([]*config.ToolMetadata, 0, len(tools))
+	for _, tool := range tools {
+		if tool != nil && tool.ServerName == serverName {
+			serverTools = append(serverTools, tool)
+		}
+	}
+	stale := s.publishDiscoveredTools(map[string][]*config.ToolMetadata{serverName: serverTools}, map[string]DiscoveryCapture{serverName: gen})
+	s.logger.Debug("Refreshed tools in Supervisor snapshot and StateView from server discovery",
+		zap.String("server", serverName),
+		zap.Int("total_tools", len(serverTools)),
+		zap.Bool("published", len(stale) == 0))
+	return len(stale) == 0, nil
+}
+
+// MarkServersToolsDiscovered stamps ToolsDiscovered on the named servers
+// WITHOUT touching their tool sets (Spec 105 FR-009, research D4). It is the
+// marker for a discovery pass that completed with zero tools on a path that
+// deliberately keeps whatever tool set the server already has — the lenient
+// reactive connect path and the sweep, which must not wipe a server's tools on
+// a transient empty result. A server that has never published a tool set is
+// thereby "discovered, nothing served": every name on it resolves as absent
+// (refused) rather than lingering in the connect→discovery window.
+//
+// A server that still HOLDS a tool set is deliberately NOT stamped (astra r1
+// I1): the disconnect clears the marker but keeps the retained Tools (MCP-2094,
+// restored on reconnect for counts and listings), so an unstamped server with
+// tools is carrying the PREVIOUS connection's discovery result — and this
+// connection listed none of it. Stamping would certify names this connection
+// never served; wiping the set would break the lenient path's "never wipe on
+// a transient empty result" contract. It stays in the discovery window
+// (refusal says "retry") until a non-empty or authoritative pass replaces the
+// set. gens is the DiscoveryGenerations() capture taken before the list; a
+// server whose generation moved on is skipped.
+func (s *Supervisor) MarkServersToolsDiscovered(serverNames []string, gens map[string]DiscoveryCapture) {
+	if len(serverNames) == 0 {
+		return
+	}
 	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+
+	// The StateView is what identity resolution reads, and both sides clear
+	// the marker on every connection edge, so a server needs stamping when
+	// EITHER side lacks the marker. Both reads and both writes happen under
+	// stateMu so a connection event cannot interleave between them.
+	view := s.stateView.Snapshot()
+	currentSnapshot := s.snapshot.Load().(*ServerStateSnapshot)
+	newServers := make(map[string]*ServerState, len(currentSnapshot.Servers))
+	for name, state := range currentSnapshot.Servers {
+		newState := *state
+		newServers[name] = &newState
+	}
+	snapshotChanged := false
+	stampView := make([]string, 0, len(serverNames))
+	var skipped []string
+	for _, name := range serverNames {
+		// The generation and retained-set rules are decided on the retained
+		// Supervisor state; a server the snapshot does not hold (a unit
+		// fixture without reconcile) is judged on the StateView alone, as
+		// publishDiscoveredTools does.
+		if state, exists := newServers[name]; exists {
+			if gen, ok := gens[name]; !ok || gen.Generation != state.ConnectionGeneration {
+				skipped = append(skipped, name)
+				continue
+			}
+			if len(state.Tools) > 0 {
+				// Retained set from a previous connection: see the doc comment.
+				skipped = append(skipped, name)
+				continue
+			}
+			if !state.ToolsDiscovered || state.DiscoveryEpoch != gens[name].Epoch {
+				state.ToolsDiscovered = true
+				state.DiscoveryEpoch = gens[name].Epoch
+				snapshotChanged = true
+			}
+		}
+		if status, ok := view.Servers[name]; ok && status != nil && len(status.Tools) == 0 &&
+			(!status.ToolsDiscovered || status.DiscoveryEpoch != gens[name].Epoch) {
+			stampView = append(stampView, name)
+		}
+	}
+	if snapshotChanged {
+		s.snapshot.Store(&ServerStateSnapshot{
+			Servers:   newServers,
+			Timestamp: time.Now(),
+			Version:   currentSnapshot.Version + 1,
+		})
+		s.version++
+	}
+	for _, name := range stampView {
+		epoch := gens[name].Epoch
+		s.stateView.UpdateServer(name, func(status *stateview.ServerStatus) {
+			status.ToolsDiscovered = true
+			status.DiscoveryEpoch = epoch
+		})
+	}
+	if snapshotChanged || len(stampView) > 0 || len(skipped) > 0 {
+		s.logger.Debug("Stamped discovery completed for servers that listed no tools",
+			zap.Strings("servers", stampView), zap.Bool("snapshot_changed", snapshotChanged),
+			zap.Strings("skipped_retained_or_stale", skipped))
+	}
+}
+
+// publishDiscoveredTools writes a completed discovery result per server into
+// the Supervisor snapshot (source of truth) and the StateView, stamping
+// ToolsDiscovered on both so identity resolution can tell "discovery has not
+// run" from "discovery found nothing". Publication is bound to the connection
+// generation the result was captured under (gens): a server whose generation
+// has moved on since is skipped and returned — the result is the previous
+// connection's and must not land on the new one (astra r1 I2). Both the
+// snapshot and the StateView are written under stateMu, the same lock
+// updateSnapshotFromEvent holds across its own two-sided write, so a
+// disconnect cannot interleave between the two halves and resurrect a marker
+// the snapshot side just cleared.
+func (s *Supervisor) publishDiscoveredTools(toolsByServer map[string][]*config.ToolMetadata, gens map[string]DiscoveryCapture) (stale []string) {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
 	currentSnapshot := s.snapshot.Load().(*ServerStateSnapshot)
 
 	// Clone the snapshot
@@ -895,11 +1319,31 @@ func (s *Supervisor) RefreshToolsFromDiscovery(tools []*config.ToolMetadata) err
 	}
 
 	// Update tool counts and tools for servers with discovered tools
+	accepted := make(map[string][]*config.ToolMetadata, len(toolsByServer))
 	for serverName, serverTools := range toolsByServer {
-		if state, exists := newServers[serverName]; exists {
-			state.ToolCount = len(serverTools)
-			state.Tools = serverTools
+		captured := gens[serverName]
+		state, exists := newServers[serverName]
+		if !exists {
+			// A server the snapshot does not hold (removed from config, or a
+			// unit fixture without reconcile): the StateView is still written
+			// so listings stay consistent, exactly as before.
+			accepted[serverName] = serverTools
+			continue
 		}
+		if _, ok := gens[serverName]; !ok || captured.Generation != state.ConnectionGeneration {
+			s.logger.Debug("Dropping stale discovery result: the server's connection changed while it was captured",
+				zap.String("server", serverName),
+				zap.Uint64("captured_generation", captured.Generation),
+				zap.Uint64("current_generation", state.ConnectionGeneration),
+				zap.Bool("generation_supplied", ok))
+			stale = append(stale, serverName)
+			continue
+		}
+		state.ToolCount = len(serverTools)
+		state.Tools = serverTools
+		state.ToolsDiscovered = true
+		state.DiscoveryEpoch = captured.Epoch
+		accepted[serverName] = serverTools
 	}
 
 	newSnapshot := &ServerStateSnapshot{
@@ -910,29 +1354,27 @@ func (s *Supervisor) RefreshToolsFromDiscovery(tools []*config.ToolMetadata) err
 
 	s.snapshot.Store(newSnapshot)
 	s.version++
-	s.stateMu.Unlock()
 
-	// Update StateView for each server
-	for serverName, serverTools := range toolsByServer {
+	// Update StateView for each accepted server
+	for serverName, serverTools := range accepted {
+		epoch := gens[serverName].Epoch
 		s.stateView.UpdateServer(serverName, func(status *stateview.ServerStatus) {
 			// StateView mirrors the Supervisor snapshot (updated unconditionally
-			// above), so apply discovery results as last-writer-wins. A prior
-			// size-based guard skipped updates whenever the new set was smaller,
-			// which pinned StateView to a stale higher count when a server
-			// legitimately dropped tools — diverging from the snapshot and from
-			// the bleve index. Servers with zero discovered tools never reach
-			// this loop (they're absent from toolsByServer), so a size guard
-			// could not protect against empty/stale discoveries anyway (MCP-2094).
+			// above for every accepted server), so apply discovery results as
+			// last-writer-wins. A prior size-based guard skipped updates
+			// whenever the new set was smaller, which pinned StateView to a
+			// stale higher count when a server legitimately dropped tools —
+			// diverging from the snapshot and from the bleve index. Servers
+			// with zero discovered tools never reach this loop from the sweep
+			// (they're absent from toolsByServer), so a size guard could not
+			// protect against empty/stale discoveries anyway (MCP-2094).
 			status.ToolCount = len(serverTools)
 			status.Tools = toolInfosFromMetadata(serverTools)
+			status.ToolsDiscovered = true
+			status.DiscoveryEpoch = epoch
 		})
 	}
-
-	s.logger.Debug("Refreshed tools in Supervisor snapshot and StateView from discovery",
-		zap.Int("server_count", len(toolsByServer)),
-		zap.Int("total_tools", len(tools)))
-
-	return nil
+	return stale
 }
 
 // forwardUpstreamEvents forwards upstream events to supervisor listeners.
@@ -974,10 +1416,12 @@ func (s *Supervisor) updateSnapshotFromEvent(event Event) {
 	// we create a blocking chain that permanently stalls the reconciliation loop.
 	var toolCount int
 	var connInfo *types.ConnectionInfo
-	if actualState, err := s.upstream.GetServerState(event.ServerName); err == nil {
+	var liveEpoch int64
+	if actualState, err := s.upstream.GetServerState(event.ServerName); err == nil && actualState != nil {
 		toolCount = actualState.ToolCount
 		connInfo = actualState.ConnectionInfo
-	} else {
+		liveEpoch = actualState.ConnectionEpoch
+	} else if err != nil {
 		s.logger.Warn("Failed to get server state for tool count",
 			zap.String("server", event.ServerName),
 			zap.Error(err))
@@ -992,6 +1436,33 @@ func (s *Supervisor) updateSnapshotFromEvent(event Event) {
 		if connected, ok := event.Payload["connected"].(bool); ok {
 			state.Connected = connected
 			state.LastSeen = event.Timestamp
+			// The discovery-completed marker (Spec 105 FR-009, research D4)
+			// is per connection: the next connection needs its own discovery
+			// pass. It is cleared on BOTH edges (astra r1 I4) — on the
+			// disconnect, and again on the connect in case the disconnect
+			// event was dropped (actor_pool.emitEvent drops on a full
+			// channel): a connection has just been established, and the
+			// previous connection's result is not this one's. Discovery for
+			// this connection is kicked off from this very event
+			// (onServerConnectedCallback) and re-stamps it. It is cleared on
+			// the retained Supervisor state as well as on the StateView below
+			// — reconcile copies the retained state back into the StateView,
+			// and the reconnect branch restores the retained tool set from
+			// it, so a stale stamp here would resurrect "discovery completed"
+			// for a connection that has not discovered anything yet. The
+			// retained Tools themselves are kept (MCP-2094). The connection
+			// generation moves on every edge, so a discovery result captured
+			// under the previous connection is dropped at publish time
+			// (publishDiscoveredTools, astra r1 I2).
+			state.ToolsDiscovered = false
+			state.DiscoveryEpoch = 0
+			state.ConnectionGeneration++
+			// The live token this observation was made under (astra r2 C3):
+			// reconcile compares its own observation against it to detect
+			// an edge whose events were dropped.
+			if liveEpoch != 0 {
+				state.ConnectionEpoch = liveEpoch
+			}
 
 			// Update ConnectionInfo from pre-fetched server state
 			if connInfo != nil {
@@ -1001,6 +1472,10 @@ func (s *Supervisor) updateSnapshotFromEvent(event Event) {
 			// Update stateview
 			var classifiedCode string
 			s.stateView.UpdateServer(event.ServerName, func(status *stateview.ServerStatus) {
+				// Edge-trigger basis, read before any mutation — same
+				// contract as updateStateView above (MCP-2967).
+				prevCode, prevRetryCount, prevErrorTime := errorCodeEdgeBasis(status)
+
 				oldState := status.State
 				status.Connected = connected
 
@@ -1024,6 +1499,13 @@ func (s *Supervisor) updateSnapshotFromEvent(event Event) {
 				if connected {
 					t := event.Timestamp
 					status.ConnectedAt = &t
+					// A new connection has no completed discovery pass yet,
+					// whatever the StateView held (a dropped disconnect event
+					// leaves the previous stamp and tools in place; astra r1
+					// I4). The retained tools stay for counts and listings;
+					// only the marker is dropped.
+					status.ToolsDiscovered = false
+					status.DiscoveryEpoch = 0
 					// Repopulate the per-server tool set from the retained
 					// Supervisor snapshot so StateView stays the consistent
 					// source of truth across a reconnect/unquarantine. The
@@ -1040,6 +1522,14 @@ func (s *Supervisor) updateSnapshotFromEvent(event Event) {
 						if len(state.Tools) > 0 {
 							status.Tools = toolInfosFromMetadata(state.Tools)
 							status.ToolCount = len(state.Tools)
+							// The restored set is the PREVIOUS connection's
+							// discovery result, kept for counts and listings
+							// until discovery re-runs; the discovery-completed
+							// marker is not restored with it — it was cleared
+							// on both sides above, and this connection has not
+							// completed a pass yet (an unlisted name reads as
+							// "discovery not completed, retry", never as
+							// "stale name").
 						} else {
 							status.ToolCount = toolCount
 						}
@@ -1056,6 +1546,8 @@ func (s *Supervisor) updateSnapshotFromEvent(event Event) {
 					status.DisconnectedAt = &t
 					status.Tools = nil // Clear tools on disconnect
 					status.ToolCount = 0
+					status.ToolsDiscovered = false // the next connection needs its own discovery pass
+					status.DiscoveryEpoch = 0
 				}
 
 				// Update ConnectionInfo for immediate error propagation to UI
@@ -1080,8 +1572,12 @@ func (s *Supervisor) updateSnapshotFromEvent(event Event) {
 						// Spec 044 Phase H / Spec 080 FR-012: capture the
 						// classified code; delivered synchronously after the
 						// stateview lock is released (see notifyErrorCode).
+						// MCP-2967: edge-triggered, see shouldNotifyErrorCode.
 						if status.Diagnostic != nil {
-							classifiedCode = string(status.Diagnostic.Code)
+							code := string(status.Diagnostic.Code)
+							if shouldNotifyErrorCode(prevCode, code, prevRetryCount, connInfo.RetryCount, prevErrorTime, connInfo.LastRetryTime) {
+								classifiedCode = code
+							}
 						}
 
 						if !connInfo.LastRetryTime.IsZero() {
@@ -1092,6 +1588,7 @@ func (s *Supervisor) updateSnapshotFromEvent(event Event) {
 					// Note: We already cleared error above when connected=true
 					// Only set error from connInfo if it has one
 					status.RetryCount = connInfo.RetryCount
+					applyRetryStopped(status, connInfo)
 				}
 			})
 			s.notifyErrorCode(classifiedCode)

@@ -16,13 +16,22 @@ import (
 // record with a synthesized approved one.
 var ErrToolApprovalNotFound = errors.New("tool approval not found")
 
+// ErrUpstreamNotFound is returned by GetUpstream/GetUpstreamServer when no
+// record exists for the requested server name. Callers that decide policy from
+// the record MUST use errors.Is to tell it apart from a real read failure
+// (corrupt record, closed DB, mmap remap): "no such server" is a verdict the
+// caller can state, while an unreadable record means the caller knows nothing
+// and must fail closed rather than answer "not configured".
+var ErrUpstreamNotFound = errors.New("upstream not found")
+
 // Bucket names for bbolt database
 const (
 	UpstreamsBucket       = "upstreams"
 	ToolStatsBucket       = "toolstats"
 	ToolHashBucket        = "toolhash"
 	ToolApprovalBucket    = "tool_approvals"
-	OAuthTokenBucket      = "oauth_tokens" //nolint:gosec // bucket name, not a credential
+	PromptApprovalBucket  = "prompt_approvals" // spec 100: per-prompt rug-pull baseline
+	OAuthTokenBucket      = "oauth_tokens"     //nolint:gosec // bucket name, not a credential
 	OAuthCompletionBucket = "oauth_completion"
 	MetaBucket            = "meta"
 	CacheBucket           = "cache"
@@ -110,7 +119,28 @@ type OnboardingState struct {
 const (
 	SchemaVersionKey       = "schema"
 	DockerRecoveryStateKey = "docker_recovery_state"
+	// BaselineSweepDoneKey marks that the one-shot informational baseline scan
+	// sweep has already run on this installation. Presence of the record — not
+	// its contents — is what suppresses a re-run, so the sweep stays one-shot
+	// across restarts and upgrades.
+	BaselineSweepDoneKey = "baseline_sweep_done"
 )
+
+// BaselineSweepState records the outcome of the one-shot informational baseline
+// scan sweep (the post-upgrade catch-up that scans pre-existing servers which
+// have never been scanned). Stored in MetaBucket under BaselineSweepDoneKey.
+// Absence of the record means "the sweep has never completed here".
+type BaselineSweepState struct {
+	// Version is the mcpproxy build version that completed the sweep. Recorded
+	// for diagnostics; the sweep does not re-run on a version change.
+	Version string `json:"version,omitempty"`
+	// CompletedAt is when the sweep finished.
+	CompletedAt time.Time `json:"completed_at"`
+	// ServersScanned is how many servers the sweep actually scanned.
+	ServersScanned int `json:"servers_scanned"`
+	// Findings is the total number of findings the sweep's scans produced.
+	Findings int `json:"findings"`
+}
 
 // Current schema version
 const CurrentSchemaVersion = 3
@@ -170,6 +200,17 @@ type UpstreamRecord struct {
 	// persisted so the override survives a restart and a SaveConfiguration
 	// rebuild of the JSON server list.
 	ToonOutput string `json:"toon_output,omitempty"`
+	// Spec 093: per-server concurrency-limit overrides, persisted for the same
+	// reason as the interval overrides above — SaveConfiguration rebuilds the
+	// JSON server list from these records, so a REST/UI-set limit would be
+	// wiped on the next save without them. Tri-state: nil = inherit the
+	// per-server default set, 0 = opt out, positive = override.
+	MaxConcurrentRequests *int             `json:"max_concurrent_requests,omitempty"`
+	QueueSize             *int             `json:"queue_size,omitempty"`
+	QueueTimeout          *config.Duration `json:"queue_timeout,omitempty"`
+	// ExposePrompts is the per-server override for exposing upstream prompts
+	// through mcpproxy's aggregated prompts/list and prompts/get.
+	ExposePrompts *bool `json:"expose_prompts,omitempty"`
 }
 
 // ToolStatRecord represents tool usage statistics
@@ -251,6 +292,51 @@ type ToolApprovalRecord struct {
 	// "tpa.TPA-2026-0001.hidden_instruction" or "phrase.injection". Deduplicated,
 	// order-stable, capped at MaxToolHeldSignals.
 	HeldSignals []string `json:"held_signals,omitempty"`
+
+	// IdentityKeyed marks a record written by a Spec 105 (FR-009) binary,
+	// which keys every record by the tool's exact RAW upstream name. Every
+	// post-105 writer stamps it (internal/runtime/tool_quarantine.go
+	// saveToolApproval: the discovery producer, ApproveTools, BlockTools, the
+	// user toggle). A record WITHOUT the stamp was written by a pre-105
+	// binary, whose discovery producer filed a raw "ns:erase" under the
+	// COLLAPSED key "erase" — so only an unstamped record can be the collapsed
+	// sibling of a namespaced tool, and only unstamped siblings are consulted
+	// by the legacy carry-over in checkToolApprovals and the legacy
+	// re-admission in internal/server/tool_gate.go readToolApprovalRecord.
+	// The stamp bounds that migration logic to the upgrade: once a store has
+	// been rewritten by a post-105 binary, a sibling record is a genuine
+	// sibling and lends nothing to another raw name (FR-009: a record can
+	// neither inherit nor disturb the record of a sibling). Additive and
+	// omitempty: pre-105 records decode with it false.
+	IdentityKeyed bool `json:"identity_keyed,omitempty"`
+}
+
+// Restricts reports whether the record carries a fact that binds the tool
+// beyond a plain approval: a quarantine lock (pending / changed) or the
+// user's Disabled block. It is the shared reader rule for a pre-Spec-105
+// COLLAPSED record — a raw "ns:erase" that an older binary filed under
+// "erase": such a record may approve only the exact raw name it stores, but
+// its lock or block must keep binding the namespaced name it may have been
+// filed for while no exact record exists (internal/server/tool_gate.go
+// readToolApprovalRecord). The discovery producer
+// (internal/runtime/tool_quarantine.go checkToolApprovals) carries the
+// user's Disabled block onto the new exact record and, under an active gate,
+// adopts the lock with its evidence — only from an unstamped sibling
+// (IdentityKeyed) — and its end-of-pass stamping leaves a restricting orphan
+// unstamped so it can be consulted once when its tool reappears.
+func (r *ToolApprovalRecord) Restricts() bool {
+	if r == nil {
+		return false
+	}
+	if r.Disabled {
+		return true
+	}
+	switch r.Status {
+	case ToolApprovalStatusPending, ToolApprovalStatusChanged:
+		return true
+	default:
+		return false
+	}
 }
 
 // SetScanHold records the evidence of a trust_mode: scan hold on the record.
@@ -283,6 +369,57 @@ func (r *ToolApprovalRecord) ClearScanHold() {
 	r.HeldReason = ""
 	r.HeldVerdict = ""
 	r.HeldSignals = nil
+}
+
+// ErrPromptApprovalNotFound is returned by GetPromptApproval when no record
+// exists (wrapped so callers can errors.Is it). A real read/decode failure
+// returns a different error and MUST NOT be treated as "missing".
+var ErrPromptApprovalNotFound = errors.New("prompt approval not found")
+
+// PromptApprovalRecord is the per-(server, prompt) rug-pull baseline for
+// aggregated upstream prompts (spec 100). It is the prompt analogue of
+// ToolApprovalRecord, deliberately parallel — NOT a shared bucket — because the
+// server:tool and server:prompt key spaces would collide and the tool record
+// carries schema/scan fields prompts never use.
+//
+// It baselines ADVERTISED LIST METADATA ONLY (name + description + arguments);
+// get-time prompts/get message content is out of scope and not baselineable
+// here (spec 100 Non-Goals). Previous* fields are retained so a metadata revert
+// is detectable (server swaps a description back → auto re-approve).
+type PromptApprovalRecord struct {
+	ServerName          string    `json:"server_name"`
+	PromptName          string    `json:"prompt_name"`
+	ApprovedHash        string    `json:"approved_hash"`
+	CurrentHash         string    `json:"current_hash"`
+	HashSchemaVersion   uint64    `json:"hash_schema_version,omitempty"`
+	Status              string    `json:"status"` // "approved", "pending", "changed"
+	ApprovedAt          time.Time `json:"approved_at"`
+	ApprovedBy          string    `json:"approved_by"`
+	PreviousDescription string    `json:"previous_description,omitempty"`
+	CurrentDescription  string    `json:"current_description,omitempty"`
+	PreviousArguments   string    `json:"previous_arguments,omitempty"`
+	CurrentArguments    string    `json:"current_arguments,omitempty"`
+	Disabled            bool      `json:"disabled,omitempty"`
+}
+
+// PromptApprovalKey returns the storage key for a prompt approval record.
+func PromptApprovalKey(serverName, promptName string) string {
+	return serverName + ":" + promptName
+}
+
+// Key returns the storage key for this prompt approval record.
+func (r *PromptApprovalRecord) Key() string {
+	return PromptApprovalKey(r.ServerName, r.PromptName)
+}
+
+// MarshalBinary implements encoding.BinaryMarshaler
+func (r *PromptApprovalRecord) MarshalBinary() ([]byte, error) {
+	return json.Marshal(r)
+}
+
+// UnmarshalBinary implements encoding.BinaryUnmarshaler
+func (r *PromptApprovalRecord) UnmarshalBinary(data []byte) error {
+	return json.Unmarshal(data, r)
 }
 
 // ToolApprovalKey returns the storage key for a tool approval record.

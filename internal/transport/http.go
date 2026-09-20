@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/oauth"
 
 	"github.com/mark3labs/mcp-go/client"
 	"github.com/mark3labs/mcp-go/client/transport"
@@ -127,25 +128,41 @@ func NewEndpointDeprecatedError(url, message, migrationGuide, newEndpoint string
 
 // HTTPTransportConfig holds configuration for HTTP transport
 type HTTPTransportConfig struct {
-	URL         string
-	Headers     map[string]string
-	OAuthConfig *client.OAuthConfig
-	UseOAuth    bool
-	// BrokeredAuth, when set, injects a per-user resolved credential into the
-	// outbound headers, replacing any configured/inbound auth header (spec 074
-	// FR-016/FR-017). It is edition-neutral plain data so the server-edition
-	// credential broker can drive injection without this package importing it.
-	BrokeredAuth *BrokeredAuth
+	URL          string
+	Headers      map[string]string
+	OAuthConfig  *client.OAuthConfig
+	UseOAuth     bool
 	TraceEnabled bool // Enable detailed HTTP/SSE frame tracing
+	// RetryAfter, when set, receives the `Retry-After` hints observed on this
+	// upstream's rate-limited responses (#1040). mcp-go flattens non-2xx
+	// responses into strings, so a RoundTripper is the last place the header
+	// still exists. nil disables the wrapper entirely (unchanged behaviour).
+	RetryAfter *RetryAfterRecorder
 }
 
-// effectiveHeaders returns the outbound header set, applying brokered per-user
-// auth injection when configured (spec 074 FR-016/FR-017).
-func (cfg *HTTPTransportConfig) effectiveHeaders() map[string]string {
-	if cfg.BrokeredAuth == nil {
-		return cfg.Headers
+// upstreamRoundTripper composes the outbound transport wrappers for an upstream
+// HTTP/SSE client: frame tracing (opt-in) and the Retry-After recorder (#1040).
+// It always WRAPS the given base rather than replacing it, and it sits strictly
+// below mcp-go's OAuth handling — the OAuth authorize/token wrappers live above
+// this layer and are untouched.
+func (cfg *HTTPTransportConfig) upstreamRoundTripper(base http.RoundTripper, logger *zap.Logger) http.RoundTripper {
+	rt := base
+	if rt == nil {
+		rt = http.DefaultTransport
 	}
-	return EffectiveHeaders(cfg.Headers, cfg.BrokeredAuth)
+	if cfg.TraceEnabled {
+		rt = NewLoggingTransport(rt, logger)
+	}
+	if cfg.RetryAfter != nil {
+		rt = NewRetryAfterTransport(rt, cfg.RetryAfter, logger)
+	}
+	return rt
+}
+
+// needsCustomTransport reports whether this config requires us to hand mcp-go
+// our own *http.Client instead of letting it build the default one.
+func (cfg *HTTPTransportConfig) needsCustomTransport() bool {
+	return cfg.TraceEnabled || cfg.RetryAfter != nil
 }
 
 // CreateHTTPClient creates a new MCP client using HTTP transport
@@ -153,7 +170,7 @@ func CreateHTTPClient(cfg *HTTPTransportConfig) (*client.Client, error) {
 	logger := zap.L().Named("transport")
 
 	logger.Error("🚨 TRANSPORT HTTP CLIENT CREATION",
-		zap.String("url", cfg.URL),
+		zap.String("url", cfg.logSafeURL()),
 		zap.Bool("oauth_config_nil", cfg.OAuthConfig == nil),
 		zap.Bool("use_oauth", cfg.UseOAuth))
 
@@ -162,34 +179,34 @@ func CreateHTTPClient(cfg *HTTPTransportConfig) (*client.Client, error) {
 	}
 
 	logger.Debug("Creating HTTP client",
-		zap.String("url", cfg.URL),
+		zap.String("url", cfg.logSafeURL()),
 		zap.Bool("use_oauth", cfg.UseOAuth),
 		zap.Bool("has_oauth_config", cfg.OAuthConfig != nil))
 
 	if cfg.UseOAuth && cfg.OAuthConfig != nil {
 		// Use OAuth-enabled client with Dynamic Client Registration
 		logger.Info("Creating OAuth-enabled streamable HTTP client with Dynamic Client Registration",
-			zap.String("url", cfg.URL),
+			zap.String("url", cfg.logSafeURL()),
 			zap.String("redirect_uri", cfg.OAuthConfig.RedirectURI),
 			zap.Strings("scopes", cfg.OAuthConfig.Scopes),
 			zap.Bool("pkce_enabled", cfg.OAuthConfig.PKCEEnabled))
 
 		logger.Debug("OAuth config details",
 			zap.String("client_id", cfg.OAuthConfig.ClientID),
-			zap.String("client_secret", cfg.OAuthConfig.ClientSecret),
+			zap.Bool("has_client_secret", cfg.OAuthConfig.ClientSecret != ""),
 			zap.Any("token_store", cfg.OAuthConfig.TokenStore))
 
 		logger.Debug("🔧 About to create OAuth client with mcp-go library",
-			zap.String("url", cfg.URL),
+			zap.String("url", cfg.logSafeURL()),
 			zap.String("redirect_uri", cfg.OAuthConfig.RedirectURI))
 
 		logger.Info("Creating OAuth HTTP client with context-based timeout",
-			zap.String("url", cfg.URL),
+			zap.String("url", cfg.logSafeURL()),
 			zap.String("note", "Using 30-minute context timeout from tray"))
 
 		// Add detailed logging about the OAuth config and token store
 		logger.Info("🔍 OAuth HTTP client creation details",
-			zap.String("url", cfg.URL),
+			zap.String("url", cfg.logSafeURL()),
 			zap.String("redirect_uri", cfg.OAuthConfig.RedirectURI),
 			zap.Strings("scopes", cfg.OAuthConfig.Scopes),
 			zap.Bool("pkce_enabled", cfg.OAuthConfig.PKCEEnabled),
@@ -202,9 +219,33 @@ func CreateHTTPClient(cfg *HTTPTransportConfig) (*client.Client, error) {
 				zap.String("note", "Extra parameters will be injected into OAuth requests"))
 		}
 
-		client, err := client.NewOAuthStreamableHttpClient(cfg.URL, *cfg.OAuthConfig)
+		// mcp-go builds the OAuth client's transport itself; OAuthConfig.HTTPClient
+		// only covers the OAuth metadata/DCR/token requests, NOT the MCP requests.
+		// Passing our own basic client is therefore the only way the Retry-After
+		// recorder (#1040) sees a 429 on the MCP endpoint. No Timeout is set, to
+		// preserve mcp-go's default for this branch (OAuth flows rely on the
+		// caller's context deadline, which can be up to 30 minutes).
+		var oauthOpts []transport.StreamableHTTPCOption
+		if cfg.needsCustomTransport() {
+			oauthOpts = append(oauthOpts, transport.WithHTTPBasicClient(&http.Client{
+				Transport: cfg.upstreamRoundTripper(http.DefaultTransport, logger),
+			}))
+		}
+		// GH #1271: static headers ride along with the bearer. A declared-OAuth
+		// server whose non-credential headers (x-goog-user-project, …) used to
+		// be sent only by the headers strategy would otherwise lose them once
+		// OAuth wins the ladder. mcp-go sets Authorization from the token store
+		// AFTER these, so a stale static Authorization never wins.
+		if len(cfg.Headers) > 0 {
+			logger.Debug("Adding static headers to OAuth HTTP client", zap.Int("header_count", len(cfg.Headers)))
+			oauthOpts = append(oauthOpts, transport.WithHTTPHeaders(cfg.Headers))
+		}
+
+		client, err := client.NewOAuthStreamableHttpClient(cfg.URL, *cfg.OAuthConfig, oauthOpts...)
 		if err != nil {
-			logger.Error("Failed to create OAuth client", zap.Error(err))
+			// #1148 round 4: mcp-go builds this error from url.Parse, and
+			// *url.Error quotes the raw URL it was handed.
+			logger.Error("Failed to create OAuth client", logSafeErrorField(err))
 			return nil, fmt.Errorf("failed to create OAuth client: %w", err)
 		}
 
@@ -212,56 +253,44 @@ func CreateHTTPClient(cfg *HTTPTransportConfig) (*client.Client, error) {
 		return client, nil
 	}
 
-	logger.Debug("Creating regular HTTP client", zap.String("url", cfg.URL))
+	logger.Debug("Creating regular HTTP client", zap.String("url", cfg.logSafeURL()))
 
-	// Apply brokered per-user auth injection (spec 074): replaces any configured
-	// auth header with the resolved per-user credential and never forwards the
-	// inbound gateway/IdP token (FR-017).
-	headers := cfg.effectiveHeaders()
+	headers := cfg.Headers
 
-	// If tracing is enabled, create HTTP client with logging transport
-	if cfg.TraceEnabled {
-		logger.Info("🔍 HTTP TRACE MODE ENABLED - All HTTP traffic will be logged")
-		baseTransport := &http.Transport{
-			MaxIdleConns:          10,
-			IdleConnTimeout:       90 * time.Second,
-			ResponseHeaderTimeout: 30 * time.Second,
-		}
-		loggingTransport := NewLoggingTransport(baseTransport, logger)
-		httpClient := &http.Client{
-			Transport: loggingTransport,
-			Timeout:   180 * time.Second,
-		}
-
-		var httpTransport transport.Interface
-		var err error
-		if len(headers) > 0 {
-			httpTransport, err = transport.NewStreamableHTTP(cfg.URL,
-				transport.WithHTTPHeaders(headers),
-				transport.WithHTTPBasicClient(httpClient))
-		} else {
-			httpTransport, err = transport.NewStreamableHTTP(cfg.URL,
-				transport.WithHTTPBasicClient(httpClient))
-		}
-		if err != nil {
-			return nil, fmt.Errorf("failed to create HTTP transport with tracing: %w", err)
-		}
-		return client.NewClient(httpTransport), nil
-	}
-
-	// Use regular HTTP client
+	opts := []transport.StreamableHTTPCOption{}
 	if len(headers) > 0 {
 		logger.Debug("Adding HTTP headers", zap.Int("header_count", len(headers)))
-		httpTransport, err := transport.NewStreamableHTTP(cfg.URL,
-			transport.WithHTTPHeaders(headers))
-		if err != nil {
-			return nil, fmt.Errorf("failed to create HTTP transport: %w", err)
-		}
-		return client.NewClient(httpTransport), nil
+		opts = append(opts, transport.WithHTTPHeaders(headers))
 	}
 
-	httpTransport, err := transport.NewStreamableHTTP(cfg.URL,
-		transport.WithHTTPTimeout(180*time.Second)) // Increased timeout for HTTP connections
+	switch {
+	case cfg.needsCustomTransport():
+		// Timeout policy is preserved exactly as it was before #1040: the trace
+		// client and the header-less client carry a 180s request timeout, while
+		// the headers variant has always run on mcp-go's default (no timeout),
+		// which long-running tool calls depend on.
+		base := http.RoundTripper(http.DefaultTransport)
+		timeout := time.Duration(0)
+		if cfg.TraceEnabled {
+			logger.Info("🔍 HTTP TRACE MODE ENABLED - All HTTP traffic will be logged")
+			base = &http.Transport{
+				MaxIdleConns:          10,
+				IdleConnTimeout:       90 * time.Second,
+				ResponseHeaderTimeout: 30 * time.Second,
+			}
+			timeout = 180 * time.Second
+		} else if len(headers) == 0 {
+			timeout = 180 * time.Second
+		}
+		opts = append(opts, transport.WithHTTPBasicClient(&http.Client{
+			Transport: cfg.upstreamRoundTripper(base, logger),
+			Timeout:   timeout,
+		}))
+	case len(headers) == 0:
+		opts = append(opts, transport.WithHTTPTimeout(180*time.Second)) // Increased timeout for HTTP connections
+	}
+
+	httpTransport, err := transport.NewStreamableHTTP(cfg.URL, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create HTTP transport: %w", err)
 	}
@@ -277,30 +306,30 @@ func CreateSSEClient(cfg *HTTPTransportConfig) (*client.Client, error) {
 	}
 
 	logger.Debug("Creating SSE client",
-		zap.String("url", cfg.URL),
+		zap.String("url", cfg.logSafeURL()),
 		zap.Bool("use_oauth", cfg.UseOAuth),
 		zap.Bool("has_oauth_config", cfg.OAuthConfig != nil))
 
 	if cfg.UseOAuth && cfg.OAuthConfig != nil {
 		// Use OAuth-enabled SSE client with Dynamic Client Registration
 		logger.Info("Creating OAuth-enabled SSE client with Dynamic Client Registration",
-			zap.String("url", cfg.URL),
+			zap.String("url", cfg.logSafeURL()),
 			zap.String("redirect_uri", cfg.OAuthConfig.RedirectURI),
 			zap.Strings("scopes", cfg.OAuthConfig.Scopes),
 			zap.Bool("pkce_enabled", cfg.OAuthConfig.PKCEEnabled))
 
 		logger.Debug("OAuth SSE config details",
 			zap.String("client_id", cfg.OAuthConfig.ClientID),
-			zap.String("client_secret", cfg.OAuthConfig.ClientSecret),
+			zap.Bool("has_client_secret", cfg.OAuthConfig.ClientSecret != ""),
 			zap.Any("token_store", cfg.OAuthConfig.TokenStore))
 
 		logger.Info("Creating OAuth SSE client with context-based timeout",
-			zap.String("url", cfg.URL),
+			zap.String("url", cfg.logSafeURL()),
 			zap.String("note", "Using 30-minute context timeout from tray"))
 
 		// Add detailed logging about the OAuth config and token store
 		logger.Info("🔍 OAuth SSE client creation details",
-			zap.String("url", cfg.URL),
+			zap.String("url", cfg.logSafeURL()),
 			zap.String("redirect_uri", cfg.OAuthConfig.RedirectURI),
 			zap.Strings("scopes", cfg.OAuthConfig.Scopes),
 			zap.Bool("pkce_enabled", cfg.OAuthConfig.PKCEEnabled),
@@ -313,9 +342,26 @@ func CreateSSEClient(cfg *HTTPTransportConfig) (*client.Client, error) {
 				zap.String("note", "Extra parameters will be injected into OAuth requests"))
 		}
 
-		client, err := client.NewOAuthSSEClient(cfg.URL, *cfg.OAuthConfig)
+		// As in the streamable-HTTP OAuth branch: OAuthConfig.HTTPClient covers
+		// only the OAuth metadata/DCR/token calls, so the MCP requests need our
+		// own client for the Retry-After recorder to see a 429 (#1040). No
+		// Timeout — SSE streams are long-lived by design.
+		var oauthOpts []transport.ClientOption
+		if cfg.needsCustomTransport() {
+			oauthOpts = append(oauthOpts, client.WithHTTPClient(&http.Client{
+				Transport: cfg.upstreamRoundTripper(http.DefaultTransport, logger),
+			}))
+		}
+		// GH #1271: see the streamable-HTTP twin above.
+		if len(cfg.Headers) > 0 {
+			logger.Debug("Adding static headers to OAuth SSE client", zap.Int("header_count", len(cfg.Headers)))
+			oauthOpts = append(oauthOpts, client.WithHeaders(cfg.Headers))
+		}
+
+		client, err := client.NewOAuthSSEClient(cfg.URL, *cfg.OAuthConfig, oauthOpts...)
 		if err != nil {
-			logger.Error("Failed to create OAuth SSE client", zap.Error(err))
+			// #1148 round 4: see the streamable-HTTP twin above.
+			logger.Error("Failed to create OAuth SSE client", logSafeErrorField(err))
 			return nil, fmt.Errorf("failed to create OAuth SSE client: %w", err)
 		}
 
@@ -323,54 +369,9 @@ func CreateSSEClient(cfg *HTTPTransportConfig) (*client.Client, error) {
 		return client, nil
 	}
 
-	logger.Debug("Creating regular SSE client", zap.String("url", cfg.URL))
+	logger.Debug("Creating regular SSE client", zap.String("url", cfg.logSafeURL()))
 
-	// Apply brokered per-user auth injection (spec 074): replaces any configured
-	// auth header with the resolved per-user credential and never forwards the
-	// inbound gateway/IdP token (FR-017).
-	headers := cfg.effectiveHeaders()
-
-	// Use regular SSE client
-	if len(headers) > 0 {
-		logger.Debug("Adding SSE headers", zap.Int("header_count", len(headers)))
-		// Create custom HTTP client for SSE - NO Timeout field to allow indefinite streaming
-		// The Timeout field covers the entire request duration, which kills long-lived SSE streams
-		// Instead, we rely on IdleConnTimeout to detect dead connections
-		baseTransport := &http.Transport{
-			MaxIdleConns:        10,
-			IdleConnTimeout:     300 * time.Second, // 5 minutes idle before closing
-			DisableCompression:  false,
-			DisableKeepAlives:   false, // Enable keep-alives for SSE stability
-			MaxIdleConnsPerHost: 5,
-			// ResponseHeaderTimeout can be used to timeout initial connection, but not ongoing stream
-			ResponseHeaderTimeout: 30 * time.Second,
-		}
-
-		var transport http.RoundTripper = baseTransport
-		if cfg.TraceEnabled {
-			logger.Info("🔍 SSE TRACE MODE ENABLED - All HTTP traffic and SSE frames will be logged")
-			transport = NewLoggingTransport(baseTransport, logger)
-		}
-
-		httpClient := &http.Client{
-			Transport: transport,
-		}
-
-		logger.Info("Creating SSE MCP client with indefinite timeout for long-lived streams",
-			zap.String("url", cfg.URL),
-			zap.Duration("idle_timeout", 300*time.Second),
-			zap.Duration("header_timeout", 30*time.Second),
-			zap.Int("header_count", len(headers)),
-			zap.String("note", "Removed http.Client.Timeout to allow SSE streams longer than 3 minutes"))
-
-		sseClient, err := client.NewSSEMCPClient(cfg.URL,
-			client.WithHTTPClient(httpClient),
-			client.WithHeaders(headers))
-		if err != nil {
-			return nil, fmt.Errorf("failed to create SSE client: %w", err)
-		}
-		return sseClient, nil
-	}
+	headers := cfg.Headers
 
 	// Create custom HTTP client for SSE - NO Timeout field to allow indefinite streaming
 	// The Timeout field covers the entire request duration, which kills long-lived SSE streams
@@ -385,34 +386,41 @@ func CreateSSEClient(cfg *HTTPTransportConfig) (*client.Client, error) {
 		ResponseHeaderTimeout: 30 * time.Second,
 	}
 
-	var transport http.RoundTripper = baseTransport
 	if cfg.TraceEnabled {
 		logger.Info("🔍 SSE TRACE MODE ENABLED - All HTTP traffic and SSE frames will be logged")
-		transport = NewLoggingTransport(baseTransport, logger)
 	}
 
+	// Tracing and the Retry-After recorder (#1040) both wrap the base transport;
+	// the SSE-specific tuning above and the deliberately absent Client.Timeout
+	// are unchanged.
 	httpClient := &http.Client{
-		Transport: transport,
+		Transport: cfg.upstreamRoundTripper(baseTransport, logger),
 	}
 
 	logger.Info("Creating SSE MCP client with indefinite timeout for long-lived streams",
-		zap.String("url", cfg.URL),
+		zap.String("url", cfg.logSafeURL()),
 		zap.Duration("idle_timeout", 300*time.Second),
 		zap.Duration("header_timeout", 30*time.Second),
+		zap.Int("header_count", len(headers)),
 		zap.String("note", "Removed http.Client.Timeout to allow SSE streams longer than 3 minutes"))
 
 	// Enhanced trace-level debugging for SSE transport
 	if logger.Core().Enabled(zap.DebugLevel - 1) { // Trace level
 		logger.Debug("TRACE SSE TRANSPORT SETUP",
 			zap.String("transport_type", "sse"),
-			zap.String("url", cfg.URL),
+			zap.String("url", cfg.logSafeURL()),
 			zap.Duration("idle_timeout", 300*time.Second),
 			zap.Duration("response_header_timeout", 30*time.Second),
 			zap.String("debug_note", "SSE client will establish persistent connection for JSON-RPC over SSE with no overall timeout"))
 	}
 
-	sseClient, err := client.NewSSEMCPClient(cfg.URL,
-		client.WithHTTPClient(httpClient))
+	sseOpts := []transport.ClientOption{client.WithHTTPClient(httpClient)}
+	if len(headers) > 0 {
+		logger.Debug("Adding SSE headers", zap.Int("header_count", len(headers)))
+		sseOpts = append(sseOpts, client.WithHeaders(headers))
+	}
+
+	sseClient, err := client.NewSSEMCPClient(cfg.URL, sseOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create SSE client: %w", err)
 	}
@@ -448,4 +456,48 @@ func DetermineTransportType(serverConfig *config.ServerConfig) string {
 
 	// Default to stdio
 	return TransportStdio
+}
+
+// logSafeURL renders the configured upstream URL for a LOG FIELD, with its
+// credential-bearing query parameters and any userinfo password masked.
+//
+// Issue #1148 (round 2, finding 8): every HTTP/SSE client creation logged the
+// raw cfg.URL — at Error level on the streamable-HTTP path, so it fired on
+// every attempt regardless of log level — writing `?token=…` and
+// `https://user:pass@host` straight into main.log. internal/upstream/core
+// already routes its own connection logging through an identical helper
+// (Client.logSafeURL); this is the same fix for the transport layer, which the
+// first cut of #1148 missed.
+//
+// oauth.LogSafeURL leaves scheme, host, path and non-sensitive parameters
+// verbatim, so the log field stays as diagnosable as it was. Issue #1158
+// (review round 2, finding B6) moved it off the name-rule-only
+// RedactURLQueryParams: a credential under an unrecognised parameter name
+// survived that rule, and the sibling renderer in internal/oauth documents
+// exactly why the name rule alone is not enough.
+func (c *HTTPTransportConfig) logSafeURL() string {
+	if c == nil {
+		return ""
+	}
+	return oauth.LogSafeURL(c.URL)
+}
+
+// logSafeErrorField renders an error as a log field with any URL-embedded
+// credential removed.
+//
+// Issue #1148, round 3: masking the `url` FIELDS was only half of it — a
+// net/http error quotes the request URL inside its own message
+// (`Post "https://host/mcp?token=…": dial tcp …`), so the credential kept
+// reaching the log through zap.Error on the request-failure paths.
+//
+// #1158 (review round 2): upgraded from RedactSensitiveData to
+// ScrubUpstreamText, matching its twin in internal/upstream/core. An error
+// string has no enclosing key to judge it by, so the value-shaped detector has
+// to run as well — the name rule cannot see `?opaque=ghp_…`. The two helpers
+// are the same rule on the same class of text and had drifted apart.
+func logSafeErrorField(err error) zap.Field {
+	if err == nil {
+		return zap.Skip()
+	}
+	return zap.String("error", oauth.ScrubUpstreamText(err.Error()))
 }

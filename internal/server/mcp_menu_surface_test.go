@@ -112,9 +112,25 @@ func TestMenuSurface_ExactDeltaFromPreFeature(t *testing.T) {
 
 	// describe_tool is the ONLY addition, and only on the retrieve_tools-mode
 	// surfaces (FR-011: not code_execution, not direct).
+	//
+	// code_execution is the other addition, on default_server only: the
+	// pre-feature snapshot was captured with enable_code_execution=false and
+	// registerTools has always gated on the flag, so the default surface never
+	// carried the tool. Since v0.66.0 the flag ships ON, so the fixture
+	// (DefaultConfig) now registers the live tool there.
 	wantAdded := map[string][]string{
-		"default_server":      {"describe_tool"},
+		"default_server":      {"code_execution", "describe_tool"},
 		"call_tool_mode":      {"describe_tool"},
+		"code_execution_mode": {},
+	}
+	// Nothing is removed. The two routing-mode surfaces carried a "Code
+	// Execution (Disabled)" stub in the pre-feature snapshot; a disabled
+	// feature is no longer advertised at all (issue #1236), but with the flag
+	// on by default the same name is now the LIVE tool, so it is a
+	// modification (assertCodeExecutionLive), not a removal.
+	wantRemoved := map[string][]string{
+		"default_server":      {},
+		"call_tool_mode":      {},
 		"code_execution_mode": {},
 	}
 
@@ -123,23 +139,32 @@ func TestMenuSurface_ExactDeltaFromPreFeature(t *testing.T) {
 		t.Run(surface, func(t *testing.T) {
 			curTools := cur[surface]
 
-			// --- Name-set delta: exactly the expected additions, no removals.
-			var added []string
+			// --- Name-set delta: exactly the expected additions and removals.
+			var added, removed []string
 			for n := range curTools {
 				if _, ok := preTools[n]; !ok {
 					added = append(added, n)
 				}
 			}
+			for n := range preTools {
+				if _, ok := curTools[n]; !ok {
+					removed = append(removed, n)
+				}
+			}
 			sort.Strings(added)
+			sort.Strings(removed)
 			assert.Equal(t, wantAdded[surface], func() []string {
 				if added == nil {
 					return []string{}
 				}
 				return added
 			}(), "surface %s: only describe_tool may be added (FR-014/SC-007)", surface)
-			for n := range preTools {
-				assert.Contains(t, curTools, n, "surface %s: pre-feature tool %q must not be removed or renamed (FR-014)", surface, n)
-			}
+			assert.Equal(t, wantRemoved[surface], func() []string {
+				if removed == nil {
+					return []string{}
+				}
+				return removed
+			}(), "surface %s: only the disabled code_execution stub may be removed (issue #1236); nothing else may be removed or renamed (FR-014)", surface)
 
 			for _, name := range sortedNames(preTools) {
 				name := name
@@ -154,6 +179,12 @@ func TestMenuSurface_ExactDeltaFromPreFeature(t *testing.T) {
 					assertRetrieveToolsDelta(t, surface, preM, curM)
 				case callToolVariants[name]:
 					assertCallToolVariantDelta(t, surface, name, preM, curM)
+				case name == "quarantine_security":
+					assertQuarantineSecurityDelta(t, surface, preM, curM)
+				case name == "upstream_servers":
+					assertUpstreamServersDelta(t, surface, preM, curM)
+				case name == "code_execution":
+					assertCodeExecutionLive(t, surface, preM, curM)
 				default:
 					assert.Equal(t, preM, curM,
 						"surface %s: tool %q must be byte-identical to the pre-feature snapshot (SC-003)", surface, name)
@@ -163,48 +194,67 @@ func TestMenuSurface_ExactDeltaFromPreFeature(t *testing.T) {
 	}
 }
 
-// assertRetrieveToolsDelta: params delta is exactly {+detail}; every
-// pre-feature parameter is preserved unchanged; the description on the
-// retrieve_tools-mode surfaces is updated per FR-014 to reference compact
-// signatures + describe_tool.
+// Spec 094 FR-009 widens the controlled delta by exactly two things: the
+// default registration gains the three annotation-filter parameters it never
+// exposed (the discoverability gap the field report started from), and all
+// three descriptions gain the diagnostics mention plus one fixed caveat
+// sentence. Nothing else about the surface may move.
+
+// spec094FilterParams are the annotation-filter parameters every
+// retrieve_tools registration must now expose, from one shared helper.
+var spec094FilterParams = []string{"exclude_destructive", "exclude_open_world", "read_only_only"}
+
+// spec094WindowCaveat is the verbatim sentence every retrieve_tools
+// description must carry: diagnostics describe ONE call's candidate window,
+// not the whole catalog, so an agent never reads the counts as index-wide.
+const spec094WindowCaveat = "Filter diagnostics describe this call's candidate window, not the whole catalog."
+
+// addedRetrieveToolsParams is the exact allowed parameter delta per surface.
+// code_execution keeps no additions: describe_tool is absent there in v1 (so
+// no `detail`, spec 085 FR-011), and it already declared the filters.
+var addedRetrieveToolsParams = map[string][]string{
+	"default_server":      {"detail", "exclude_destructive", "exclude_open_world", "read_only_only"},
+	"call_tool_mode":      {"detail"},
+	"code_execution_mode": {},
+}
+
+// assertRetrieveToolsDelta: the parameter delta is exactly the surface's
+// entry in addedRetrieveToolsParams, every pre-feature parameter is preserved
+// unchanged, and the description carries the spec-094 diagnostics mention (all
+// surfaces) plus the spec-085 signatures/describe_tool text (retrieve_tools
+// surfaces only).
 func assertRetrieveToolsDelta(t *testing.T, surface string, preM, curM map[string]interface{}) {
 	t.Helper()
-
-	if surface == "code_execution_mode" {
-		// Spec §Out-of-scope / FR-011: the code_execution surface keeps its
-		// CURRENT shape in v1 — no describe_tool there, hence no detail param
-		// and no compact serialization. Byte-identical to pre-feature.
-		assert.Equal(t, preM, curM,
-			"surface %s: code_execution retrieve_tools must be byte-identical to pre-feature (no detail param — describe_tool is absent on this surface in v1)", surface)
-		return
-	}
 
 	preProps, curProps := schemaProps(preM), schemaProps(curM)
 	require.NotNil(t, curProps, "surface %s: retrieve_tools lost its inputSchema", surface)
 
-	// Exactly one added param: detail (enum compact|full, optional — FR-005).
+	var added []string
 	for p := range curProps {
 		if _, ok := preProps[p]; !ok {
-			assert.Equal(t, "detail", p,
-				"surface %s: the only added retrieve_tools parameter is 'detail' (SC-003)", surface)
+			added = append(added, p)
 		}
 	}
-	detail, ok := curProps["detail"].(map[string]interface{})
-	require.True(t, ok, "surface %s: retrieve_tools must gain the 'detail' parameter (FR-005)", surface)
-	assert.ElementsMatch(t, []interface{}{"compact", "full"}, detail["enum"],
-		"surface %s: detail enum is {compact, full}", surface)
+	sort.Strings(added)
+	if added == nil {
+		added = []string{}
+	}
+	assert.Equal(t, addedRetrieveToolsParams[surface], added,
+		"surface %s: exact retrieve_tools parameter delta (SC-003 / FR-009)", surface)
 
-	// All pre-feature params preserved byte-equal.
+	// All pre-feature params preserved byte-equal — including the filter
+	// params the routing surfaces already had, which must survive the move to
+	// the shared helper untouched.
 	for p, preSchema := range preProps {
 		assert.Equal(t, preSchema, curProps[p],
 			"surface %s: pre-feature retrieve_tools parameter %q must be preserved unchanged (SC-003)", surface, p)
 	}
 
-	// 'detail' must stay optional: the required list is unchanged.
+	// Added params stay optional: the required list is unchanged.
 	preSchema, _ := preM["inputSchema"].(map[string]interface{})
 	curSchema, _ := curM["inputSchema"].(map[string]interface{})
 	assert.Equal(t, preSchema["required"], curSchema["required"],
-		"surface %s: retrieve_tools required params unchanged (detail is optional)", surface)
+		"surface %s: retrieve_tools required params unchanged", surface)
 
 	// Annotations unchanged.
 	assert.Equal(t, preM["annotations"], curM["annotations"],
@@ -212,14 +262,198 @@ func assertRetrieveToolsDelta(t *testing.T, surface string, preM, curM map[strin
 
 	preDesc, _ := preM["description"].(string)
 	curDesc, _ := curM["description"].(string)
-	// FR-014: updated description referencing signatures + describe_tool.
-	// (code_execution_mode returned above: its whole definition is pre-feature.)
 	assert.NotEqual(t, preDesc, curDesc,
-		"surface %s: retrieve_tools description must be updated (FR-014)", surface)
+		"surface %s: retrieve_tools description must be updated", surface)
+	assert.Contains(t, curDesc, "filter_diagnostics",
+		"surface %s: retrieve_tools description must name the diagnostics block (FR-009)", surface)
+	assert.Contains(t, curDesc, spec094WindowCaveat,
+		"surface %s: retrieve_tools description must carry the candidate-window caveat verbatim (FR-009)", surface)
+
+	if surface == "code_execution_mode" {
+		// Spec 085 §Out-of-scope / FR-011: no describe_tool on this surface, so
+		// no detail param and no compact-signature prose.
+		assert.NotContains(t, curProps, "detail",
+			"surface %s: code_execution retrieve_tools must not expose detail (spec 085 FR-011)", surface)
+		return
+	}
+
+	detail, ok := curProps["detail"].(map[string]interface{})
+	require.True(t, ok, "surface %s: retrieve_tools must carry the 'detail' parameter (spec 085 FR-005)", surface)
+	assert.ElementsMatch(t, []interface{}{"compact", "full"}, detail["enum"],
+		"surface %s: detail enum is {compact, full}", surface)
+
+	// Spec 085 FR-014: description references signatures + describe_tool.
 	assert.Contains(t, curDesc, "describe_tool",
-		"surface %s: retrieve_tools description must reference describe_tool (FR-014)", surface)
+		"surface %s: retrieve_tools description must reference describe_tool (spec 085 FR-014)", surface)
 	assert.Contains(t, strings.ToLower(curDesc), "signature",
-		"surface %s: retrieve_tools description must reference compact signatures (FR-014)", surface)
+		"surface %s: retrieve_tools description must reference compact signatures (spec 085 FR-014)", surface)
+}
+
+// quarantineScanOperations are the operations that made TPA scanning reachable
+// from quarantine_security — the surface agents already use for held servers.
+var quarantineScanOperations = []string{"scan_server", "get_scan_report"}
+
+// schemaWithout copies a JSON-schema fragment minus the named keys, so a
+// comparison can freeze "everything except the parts this feature is allowed to
+// move". A nil fragment copies to an empty map, so a lost parameter compares
+// unequal to a present one instead of silently matching.
+func schemaWithout(schema map[string]interface{}, drop ...string) map[string]interface{} {
+	out := make(map[string]interface{}, len(schema))
+	for k, v := range schema {
+		out[k] = v
+	}
+	for _, k := range drop {
+		delete(out, k)
+	}
+	return out
+}
+
+// upstreamServersRedactionMarker is the verbatim marker the upstream_servers
+// description must carry. Issue #1146 made update/patch mask secret-bearing
+// values in the `changes` diff they return — an agent that reads the diff back
+// to verify what it wrote observes that, so the surface has to say so. The
+// literal is pinned here so the sentence cannot be silently dropped or reworded
+// into something an agent would miss.
+const upstreamServersRedactionMarker = "REDACTION (update/patch):"
+
+// assertUpstreamServersDelta: upstream_servers may change by EXACTLY its
+// description, which gains the redaction note above. No parameter may be added,
+// removed or altered — this is a documentation change over an existing
+// behaviour, not a new capability.
+func assertUpstreamServersDelta(t *testing.T, surface string, preM, curM map[string]interface{}) {
+	t.Helper()
+
+	assert.Equal(t, schemaWithout(preM, "description"), schemaWithout(curM, "description"),
+		"surface %s: only upstream_servers' description may move (issue #1146)", surface)
+
+	assert.Contains(t, curM["description"], upstreamServersRedactionMarker,
+		"surface %s: upstream_servers must document that update/patch mask secret values in the diff", surface)
+
+	preDesc, _ := preM["description"].(string)
+	curDesc, _ := curM["description"].(string)
+	assert.True(t, strings.HasPrefix(curDesc, preDesc),
+		"surface %s: the redaction note is APPENDED — no pre-feature prose may be rewritten", surface)
+}
+
+// assertQuarantineSecurityDelta: quarantine_security may grow the two scan
+// operations and the prose that documents them, and NOTHING else. In
+// particular it takes no new parameter — both operations reuse `name` — so the
+// parameter SET and every parameter schema except `operation` must be
+// byte-identical to the pre-feature snapshot.
+func assertQuarantineSecurityDelta(t *testing.T, surface string, preM, curM map[string]interface{}) {
+	t.Helper()
+
+	preProps, curProps := schemaProps(preM), schemaProps(curM)
+	require.NotNil(t, curProps, "surface %s: quarantine_security lost its inputSchema", surface)
+	assert.Equal(t, sortedKeys(preProps), sortedKeys(curProps),
+		"surface %s: the scan operations reuse existing parameters — none may be added", surface)
+
+	for p, preSchema := range preProps {
+		if p == "operation" {
+			continue
+		}
+		if p == "name" {
+			// `name` is now required for the scan ops too, so its description
+			// lists them; EVERY other key of its schema must be byte-equal.
+			// Comparing only `type` here would let a later regeneration slip a
+			// new `pattern`, `enum` or `default` onto the parameter unnoticed —
+			// the exact drift these frozen goldens exist to catch.
+			preName, _ := preSchema.(map[string]interface{})
+			curName, _ := curProps[p].(map[string]interface{})
+			require.NotNil(t, curName, "surface %s: quarantine_security lost its name parameter", surface)
+			assert.Equal(t, schemaWithout(preName, "description"), schemaWithout(curName, "description"),
+				"surface %s: only name's description may move — every other constraint is frozen", surface)
+			for _, op := range quarantineScanOperations {
+				assert.Contains(t, curName["description"], op,
+					"surface %s: name must document that %s requires it", surface, op)
+			}
+			continue
+		}
+		assert.Equal(t, preSchema, curProps[p],
+			"surface %s: pre-feature quarantine_security parameter %q must be preserved unchanged", surface, p)
+	}
+
+	// The operation enum grows by exactly the scan operations, appended after
+	// every pre-feature value in its original order.
+	preOp, _ := preProps["operation"].(map[string]interface{})
+	curOp, _ := curProps["operation"].(map[string]interface{})
+	require.NotNil(t, curOp, "surface %s: quarantine_security lost its operation parameter", surface)
+	preEnum, _ := preOp["enum"].([]interface{})
+	curEnum, _ := curOp["enum"].([]interface{})
+	wantEnum := append([]interface{}{}, preEnum...)
+	for _, op := range quarantineScanOperations {
+		wantEnum = append(wantEnum, op)
+	}
+	assert.Equal(t, wantEnum, curEnum,
+		"surface %s: the operation enum grows by exactly %v", surface, quarantineScanOperations)
+
+	// …and the REST of the operation schema is frozen. Checking only the enum
+	// would let `type` change, or a new constraint appear beside it, on the one
+	// parameter this feature is allowed to touch — the widest blind spot the
+	// helper could have.
+	assert.Equal(t, schemaWithout(preOp, "enum", "description"), schemaWithout(curOp, "enum", "description"),
+		"surface %s: apart from the enum and its prose, operation's schema is frozen", surface)
+
+	// Annotations and required list unchanged.
+	assert.Equal(t, preM["annotations"], curM["annotations"],
+		"surface %s: quarantine_security annotations unchanged", surface)
+	preSchema, _ := preM["inputSchema"].(map[string]interface{})
+	curSchema, _ := curM["inputSchema"].(map[string]interface{})
+	assert.Equal(t, preSchema["required"], curSchema["required"],
+		"surface %s: quarantine_security required params unchanged", surface)
+
+	// The tool description must actually advertise scanning — the discovery
+	// gap this change exists to close (the tool never mentioned scanning, so
+	// agents never found the scanner).
+	curDesc, _ := curM["description"].(string)
+	assert.Contains(t, strings.ToLower(curDesc), "scan",
+		"surface %s: quarantine_security description must mention scanning", surface)
+	for _, op := range quarantineScanOperations {
+		assert.Contains(t, curDesc, op,
+			"surface %s: quarantine_security description must name %s", surface, op)
+	}
+}
+
+// FR-009: the three registrations are built independently, which is exactly
+// how the default one drifted into omitting the filter parameters. They must
+// now come from one shared helper — asserted by deep-comparing the produced
+// schemas rather than by trusting the call sites.
+func TestMenuSurface_AnnotationFilterParamsShared(t *testing.T) {
+	proxy := createTestMCPProxyServer(t)
+	cur := currentSurface(t, proxy)
+
+	surfaces := []string{"default_server", "call_tool_mode", "code_execution_mode"}
+	var reference map[string]interface{}
+	referenceSurface := ""
+
+	for _, surface := range surfaces {
+		raw, ok := cur[surface]["retrieve_tools"]
+		require.True(t, ok, "surface %s: retrieve_tools must be registered", surface)
+		tool := asMap(t, raw)
+		props := schemaProps(tool)
+		require.NotNil(t, props, "surface %s: retrieve_tools lost its inputSchema", surface)
+
+		got := map[string]interface{}{}
+		for _, name := range spec094FilterParams {
+			schema, present := props[name]
+			require.True(t, present,
+				"surface %s: retrieve_tools must expose the %q filter (FR-009)", surface, name)
+			got[name] = schema
+		}
+		if reference == nil {
+			reference, referenceSurface = got, surface
+			continue
+		}
+		assert.Equal(t, reference, got,
+			"surface %s: annotation-filter schemas must be identical to %s — they come from one shared helper",
+			surface, referenceSurface)
+
+		desc, _ := tool["description"].(string)
+		assert.Contains(t, desc, "filter_diagnostics",
+			"surface %s: description must name the diagnostics block (FR-009)", surface)
+		assert.Contains(t, desc, spec094WindowCaveat,
+			"surface %s: description must carry the candidate-window caveat verbatim (FR-009)", surface)
+	}
 }
 
 // assertCallToolVariantDelta: only the tool description and the 'args'
@@ -273,4 +507,49 @@ func mustRemarshal(t *testing.T, m map[string]interface{}) json.RawMessage {
 	raw, err := json.Marshal(m)
 	require.NoError(t, err)
 	return raw
+}
+
+// assertCodeExecutionLive pins the one stub→live transition the v0.66.0
+// default flip introduces. The pre-feature snapshot holds the refusing
+// "Code Execution (Disabled)" stub (readOnly, a lone required `code`
+// parameter, a description telling the agent to enable the flag). With
+// enable_code_execution on by default the surface now carries the real tool,
+// so the checks are the live tool's contract, not byte-identity with a stub
+// that could never run: the stub's `code` parameter survives, the spec-097
+// `script` alternative is present with `code` no longer schema-required, the
+// annotations say what the tool really does, and the description no longer
+// claims the feature is disabled.
+func assertCodeExecutionLive(t *testing.T, surface string, preM, curM map[string]interface{}) {
+	t.Helper()
+
+	preDesc, _ := preM["description"].(string)
+	require.Contains(t, preDesc, "disabled",
+		"surface %s: the pre-feature baseline is expected to hold the disabled stub — if it moved, this delta helper is measuring the wrong thing", surface)
+
+	preProps, curProps := schemaProps(preM), schemaProps(curM)
+	require.NotNil(t, curProps, "surface %s: code_execution lost its inputSchema", surface)
+	for p := range preProps {
+		assert.Contains(t, curProps, p,
+			"surface %s: stub parameter %q must survive on the live tool", surface, p)
+	}
+	for _, p := range []string{"code", "script", "input", "language", "options"} {
+		assert.Contains(t, curProps, p,
+			"surface %s: live code_execution must expose %q", surface, p)
+	}
+
+	curSchema, _ := curM["inputSchema"].(map[string]interface{})
+	assert.Empty(t, curSchema["required"],
+		"surface %s: code must not be schema-required, or a script-only call is rejected before the handler can explain the rule (spec 097)", surface)
+
+	curAnn, _ := curM["annotations"].(map[string]interface{})
+	assert.Equal(t, "Code Execution", curAnn["title"],
+		"surface %s: live tool title", surface)
+	assert.Equal(t, false, curAnn["readOnlyHint"],
+		"surface %s: the live tool executes code and must not claim to be read-only", surface)
+
+	curDesc, _ := curM["description"].(string)
+	assert.NotContains(t, curDesc, "disabled",
+		"surface %s: the live description must not claim the feature is disabled", surface)
+	assert.Contains(t, curDesc, "script",
+		"surface %s: the live description must document stored scripts (spec 097 FR-008)", surface)
 }

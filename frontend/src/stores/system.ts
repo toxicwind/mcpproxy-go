@@ -1,14 +1,41 @@
 import { defineStore } from 'pinia'
-import { ref, computed } from 'vue'
+import { ref, computed, onScopeDispose } from 'vue'
 import type { StatusUpdate, Theme, Toast, InfoResponse, RoutingInfo } from '@/types'
 import api from '@/services/api'
+
+/** Pseudo-theme: follow the operating system's light/dark preference. */
+export const SYSTEM_THEME = 'system'
+/** The daisyUI themes `system` resolves to. */
+export const SYSTEM_LIGHT_THEME = 'corporate'
+export const SYSTEM_DARK_THEME = 'dark'
+export const THEME_STORAGE_KEY = 'mcpproxy-theme'
+
+/** `true` when the OS asks for a dark UI (false in environments without matchMedia). */
+export function prefersDarkColorScheme(): boolean {
+  if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return false
+  try {
+    return window.matchMedia('(prefers-color-scheme: dark)').matches
+  } catch {
+    return false
+  }
+}
+
+/** Map a stored selection to the daisyUI theme that should be applied. */
+export function resolveThemeName(selection: string): string {
+  if (selection !== SYSTEM_THEME) return selection
+  return prefersDarkColorScheme() ? SYSTEM_DARK_THEME : SYSTEM_LIGHT_THEME
+}
 
 export const useSystemStore = defineStore('system', () => {
   // State
   const status = ref<StatusUpdate | null>(null)
   const eventSource = ref<EventSource | null>(null)
   const connected = ref(false)
-  const currentTheme = ref<string>('corporate')
+  // The user's *selection*. `system` is not a daisyUI theme — it is a
+  // pseudo-theme that follows the OS `prefers-color-scheme` (UX audit F29).
+  const currentTheme = ref<string>(SYSTEM_THEME)
+  // The daisyUI theme actually applied to <html data-theme>.
+  const resolvedTheme = ref<string>(SYSTEM_LIGHT_THEME)
   const sidebarCollapsed = ref<boolean>(
     (() => {
       try {
@@ -24,8 +51,40 @@ export const useSystemStore = defineStore('system', () => {
   const checkingForUpdates = ref(false)
   const updateCheckedAt = ref<string | null>(null)
 
-  // Available themes
+  // Audit F28: with no API key the user saw three messages for one cause — the
+  // "Authentication Required" modal, a red inline load error behind it, and a
+  // "Connection Lost — Reconnecting" toast. While the modal owns the screen it
+  // owns the message too; the downstream surfaces read this flag and stay quiet.
+  const authRequired = ref(false)
+
+  // Bumped when a failed auth is repaired with a VALIDATED key (#1065). Views
+  // keep their load errors in component-local refs that nothing outside the
+  // component can reach, so signing in left the header re-authenticated while
+  // the view body kept a red "Invalid or missing API key" panel and zero rows
+  // until the user clicked Retry by hand. App.vue keys <router-view> on this,
+  // so a repaired auth remounts the current view: its error, loading state and
+  // data reset to their declared initial values and onMounted re-runs.
+  const authEpoch = ref(0)
+
+  function setAuthRequired(value: boolean) {
+    authRequired.value = value
+  }
+
+  // Clear the auth-required flag AND invalidate the views that failed while it
+  // was set. Only for paths that actually verified the new key -- a path that
+  // merely re-reads the key from disk must use setAuthRequired(false), or every
+  // view remounts onto a possibly-still-401 epoch.
+  function markAuthRecovered() {
+    if (authRequired.value) {
+      authEpoch.value++
+    }
+    authRequired.value = false
+  }
+
+  // Available themes. `system` leads the list and is the default: a user on a
+  // dark OS should not get a light UI on first run (UX audit F29).
   const themes: Theme[] = [
+    { name: SYSTEM_THEME, displayName: 'System', dark: false },
     { name: 'light', displayName: 'Light', dark: false },
     { name: 'dark', displayName: 'Dark', dark: true },
     { name: 'corporate', displayName: 'Corporate', dark: false },
@@ -80,9 +139,29 @@ export const useSystemStore = defineStore('system', () => {
   // command (empty when the channel has no safe command, FR-009).
   const installChannel = computed(() => info.value?.update?.install_channel ?? '')
   const updateCommand = computed(() => info.value?.update?.update_command ?? '')
+  // Spec 079 FR-002: the daemon-rendered "N releases / M weeks behind" clause.
+  // Empty against a daemon that predates it, or when the delta could not be
+  // resolved — surfaces then render their pre-delta wording.
+  const updateBehindSummary = computed(() => info.value?.update?.behind_summary ?? '')
 
-  // Routing mode
+  // Routing mode. This is the mode /mcp is ACTUALLY serving: a routing_mode
+  // change is written to disk but not adopted in memory until the core
+  // restarts, so the badge keeps naming reality and `pendingRoutingMode`
+  // carries the intent (see the ModeSwitcher).
   const routingMode = computed(() => routing.value?.routing_mode ?? status.value?.routing_mode ?? 'retrieve_tools')
+  const pendingRoutingMode = computed(() => routing.value?.pending_routing_mode ?? '')
+  const routingRestartRequired = computed(() => Boolean(routing.value?.restart_required))
+  // The two serialization axes (Spec 085 / Spec 102). The backend resolves them,
+  // so an unset value still arrives as "full" — the ?? here only covers a daemon
+  // that predates the fields.
+  const toolResponseMode = computed(() => routing.value?.tool_response_mode ?? 'full')
+  const directToolResponseMode = computed(() => routing.value?.direct_tool_response_mode ?? 'full')
+  // Spec 097/code-exec gate. The code-execution SURFACE has no tool-calling
+  // path other than the code_execution tool, which refuses while this is off,
+  // so the mode switcher warns before an operator restarts into it. Defaults to
+  // true against a daemon that predates the field: a missing field must not
+  // render a warning we cannot substantiate.
+  const codeExecutionEnabled = computed(() => routing.value?.code_execution_enabled ?? true)
 
   // Actions
   function connectEventSource() {
@@ -208,11 +287,15 @@ export const useSystemStore = defineStore('system', () => {
       }
     })
 
-    // Listen for activity events (tool calls, policy decisions, etc.)
+    // Listen for activity events (tool calls, policy decisions, etc.).
+    //
+    // These payloads carry the call's raw arguments and response, so they are
+    // NOT logged: `console.log(data)` printed whatever secret the call carried
+    // straight into the DevTools console, which is the same leak the activity
+    // drawer was fixed for (audit F13). Only parse failures are logged.
     es.addEventListener('activity.tool_call.started', (event) => {
       try {
         const data = JSON.parse(event.data)
-        console.log('SSE activity.tool_call.started event received:', data)
         // Extract payload - SSE wraps activity data in {payload: ..., timestamp: ...}
         const payload = data.payload || data
         window.dispatchEvent(new CustomEvent('mcpproxy:activity-started', { detail: payload }))
@@ -224,7 +307,6 @@ export const useSystemStore = defineStore('system', () => {
     es.addEventListener('activity.tool_call.completed', (event) => {
       try {
         const data = JSON.parse(event.data)
-        console.log('SSE activity.tool_call.completed event received:', data)
         // Extract payload - SSE wraps activity data in {payload: ..., timestamp: ...}
         const payload = data.payload || data
         window.dispatchEvent(new CustomEvent('mcpproxy:activity-completed', { detail: payload }))
@@ -236,7 +318,6 @@ export const useSystemStore = defineStore('system', () => {
     es.addEventListener('activity.policy_decision', (event) => {
       try {
         const data = JSON.parse(event.data)
-        console.log('SSE activity.policy_decision event received:', data)
         // Extract payload - SSE wraps activity data in {payload: ..., timestamp: ...}
         const payload = data.payload || data
         window.dispatchEvent(new CustomEvent('mcpproxy:activity-policy', { detail: payload }))
@@ -248,7 +329,6 @@ export const useSystemStore = defineStore('system', () => {
     es.addEventListener('activity', (event) => {
       try {
         const data = JSON.parse(event.data)
-        console.log('SSE activity event received:', data)
         // Extract payload - SSE wraps activity data in {payload: ..., timestamp: ...}
         const payload = data.payload || data
         window.dispatchEvent(new CustomEvent('mcpproxy:activity', { detail: payload }))
@@ -261,7 +341,6 @@ export const useSystemStore = defineStore('system', () => {
     es.addEventListener('activity.internal_tool_call.completed', (event) => {
       try {
         const data = JSON.parse(event.data)
-        console.log('SSE activity.internal_tool_call.completed event received:', data)
         const payload = data.payload || data
         window.dispatchEvent(new CustomEvent('mcpproxy:activity-completed', { detail: payload }))
       } catch (error) {
@@ -337,22 +416,73 @@ export const useSystemStore = defineStore('system', () => {
     connected.value = false
   }
 
+  /** Applies the resolved daisyUI theme to <html> without touching the selection. */
+  function applyResolvedTheme() {
+    const resolved = resolveThemeName(currentTheme.value)
+    resolvedTheme.value = resolved
+    if (typeof document !== 'undefined') {
+      document.documentElement.setAttribute('data-theme', resolved)
+    }
+  }
+
+  // While `system` is selected the UI has to follow the OS flipping between
+  // light and dark; an explicit choice ignores the media query entirely.
+  let colorSchemeQuery: MediaQueryList | null = null
+  function watchColorScheme() {
+    if (colorSchemeQuery) return
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return
+    try {
+      colorSchemeQuery = window.matchMedia('(prefers-color-scheme: dark)')
+    } catch {
+      return
+    }
+    const query = colorSchemeQuery
+    const onChange = () => {
+      if (currentTheme.value === SYSTEM_THEME) applyResolvedTheme()
+    }
+    const detach = () => {
+      if (typeof query.removeEventListener === 'function') {
+        query.removeEventListener('change', onChange)
+      } else if (typeof query.removeListener === 'function') {
+        query.removeListener(onChange)
+      }
+      colorSchemeQuery = null
+    }
+    if (typeof query.addEventListener === 'function') {
+      query.addEventListener('change', onChange)
+    } else if (typeof query.addListener === 'function') {
+      // Safari < 14
+      query.addListener(onChange)
+    }
+    // The store outlives most things, but HMR and tests dispose and recreate it;
+    // without this each incarnation would leave its listener behind.
+    onScopeDispose(detach)
+  }
+
   function setTheme(themeName: string) {
     const theme = themes.find(t => t.name === themeName)
-    if (theme) {
-      currentTheme.value = themeName
-      document.documentElement.setAttribute('data-theme', themeName)
-      localStorage.setItem('mcpproxy-theme', themeName)
+    if (!theme) return
+    currentTheme.value = themeName
+    applyResolvedTheme()
+    try {
+      localStorage.setItem(THEME_STORAGE_KEY, themeName)
+    } catch {
+      // localStorage unavailable (private browsing, etc.) — keep in-memory
     }
   }
 
   function loadTheme() {
-    const savedTheme = localStorage.getItem('mcpproxy-theme')
-    if (savedTheme && themes.find(t => t.name === savedTheme)) {
-      setTheme(savedTheme)
-    } else {
-      setTheme('corporate')
+    let savedTheme: string | null = null
+    try {
+      savedTheme = localStorage.getItem(THEME_STORAGE_KEY)
+    } catch {
+      savedTheme = null
     }
+    // No stored choice (or a theme that no longer exists) => follow the OS.
+    currentTheme.value =
+      savedTheme && themes.some(t => t.name === savedTheme) ? savedTheme : SYSTEM_THEME
+    applyResolvedTheme()
+    watchColorScheme()
   }
 
   function toggleSidebar() {
@@ -467,6 +597,39 @@ export const useSystemStore = defineStore('system', () => {
     }
   }
 
+  /**
+   * Persist one routing/serialization field and refresh the routing snapshot.
+   *
+   * PATCH (not a full apply) so nothing else in the config is round-tripped:
+   * the header switcher must never be able to rewrite a value the operator did
+   * not touch. Returns the apply result so the caller can distinguish "applied
+   * now" from "saved, needs a restart" — routing_mode is the only one of the
+   * three that takes the second path.
+   */
+  async function applyModeField(field: string, value: string) {
+    try {
+      const response = await api.patchConfig({ [field]: value })
+      if (!response.success || !response.data) {
+        const msg = response.error || 'Failed to apply the change'
+        addToast({ type: 'error', title: 'Could not change mode', message: msg })
+        return { ok: false as const, requiresRestart: false, error: msg }
+      }
+      // Refresh from the server rather than assuming: on the restart path the
+      // served mode deliberately does NOT change, and only /api/v1/routing
+      // knows what is now pending.
+      await fetchRouting()
+      return {
+        ok: true as const,
+        requiresRestart: Boolean(response.data.requires_restart),
+        restartReason: response.data.restart_reason || '',
+      }
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error)
+      addToast({ type: 'error', title: 'Could not change mode', message: msg })
+      return { ok: false as const, requiresRestart: false, error: msg }
+    }
+  }
+
   async function fetchRouting() {
     try {
       const response = await api.getRouting()
@@ -486,12 +649,15 @@ export const useSystemStore = defineStore('system', () => {
     status,
     connected,
     currentTheme,
+    resolvedTheme,
     toasts,
     themes,
     info,
     routing,
     checkingForUpdates,
     updateCheckedAt,
+    authRequired,
+    authEpoch,
 
     // Computed
     isRunning,
@@ -504,7 +670,13 @@ export const useSystemStore = defineStore('system', () => {
     latestVersion,
     installChannel,
     updateCommand,
+    updateBehindSummary,
     routingMode,
+    pendingRoutingMode,
+    routingRestartRequired,
+    toolResponseMode,
+    directToolResponseMode,
+    codeExecutionEnabled,
     sidebarCollapsed,
 
     // Actions
@@ -518,6 +690,9 @@ export const useSystemStore = defineStore('system', () => {
     clearToasts,
     fetchInfo,
     fetchRouting,
+    applyModeField,
     checkForUpdates,
+    setAuthRequired,
+    markAuthRecovered,
   }
 })

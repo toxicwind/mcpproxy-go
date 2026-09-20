@@ -14,10 +14,13 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/audit"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/auth"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/branding"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/cache"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/contracts"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/diagnostics"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/experiments"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/health"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/index"
@@ -26,9 +29,11 @@ import (
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/oauth"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/observability"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/outputvalidation"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/preflight"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/registries"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/reqcontext"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/runtime"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/runtime/stateview"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/security"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/server/tokens"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/shellwrap"
@@ -74,7 +79,10 @@ const (
 		"When 'code_execution' is exposed, you may instead orchestrate several discovered tools in a single step with JavaScript. " +
 		"When upstream tools are listed directly (named 'server__tool'), just call them by name. " +
 		"Do NOT use 'search_servers' to find existing tools — it searches EXTERNAL registries for adding NEW servers only. " +
-		"Use 'upstream_servers' with operation 'list' to see currently connected servers and their status."
+		"Use 'upstream_servers' with operation 'list' to see currently connected servers and their status. " +
+		// Discussion #948: carry the project links at the protocol level so an
+		// agent (and anyone reading its logs) can always find the project.
+		"ABOUT: MCPProxy homepage " + branding.Homepage + ", source " + branding.Repo + ", docs " + branding.Docs + "."
 
 	// Connection status constants
 	statusError                = "error"
@@ -143,6 +151,31 @@ type MCPProxyServer struct {
 	// production — telemetryRegistry() then resolves via mainServer.runtime.
 	telemetryRegOverride *telemetry.CounterRegistry
 
+	// preflightRecorder overrides the synchronous preflight activity write
+	// describe_tool check mode depends on (Spec 099 FR-013). Nil in production,
+	// where recordPreflightActivity resolves via mainServer.runtime; tests
+	// install one to observe the record — or to fail it — without standing up a
+	// whole Runtime (mirrors workSessionResolver).
+	preflightRecorder func(runtime.PreflightActivity) error
+
+	// profileIndexes is the slug → profile index cache set_profile consults
+	// when no mainServer stands behind this proxy (tests build a bare
+	// MCPProxyServer). In production profileIndexCurrent takes the main
+	// Server's warm index — the (index, snapshot) pair — so one index per
+	// config snapshot serves both the /mcp/p/<slug> gate and set_profile
+	// and no request builds one (Spec 105 FR-003/FR-004).
+	profileIndexes profileIndexCache
+
+	// preflightStateSource overrides the connection-state snapshot the
+	// preflight glue reads (Spec 099). Nil in production, where
+	// preflightSnapshot resolves it from the supervisor's StateView; tests
+	// install one so the cells that REQUIRE a live snapshot — the connection
+	// states, and the readable upstream annotations policy_filtered needs —
+	// are driven through the real glue and the real handler instead of around
+	// them (mirrors preflightRecorder). It returns exactly what
+	// preflightSnapshot returns: the state reader and the annotation lookup.
+	preflightStateSource func() (preflight.StateReader, func(serverName, toolName string) *config.ToolAnnotations, error)
+
 	// Routing mode MCP server instances (Spec 031)
 	// Each instance has different tools registered for its routing mode.
 	directServer   *mcpserver.MCPServer // Direct mode: upstream tools with serverName__toolName naming
@@ -163,12 +196,89 @@ type MCPProxyServer struct {
 	// Hooks shared across all routing mode servers
 	hooks *mcpserver.Hooks
 
-	// directToolPerms maps direct-mode tool names (server__tool) to the
-	// operation permission required to call them. It is populated with the
-	// direct-mode registry and used only to filter tools/list for scoped agent
-	// tokens; execution-time authorization remains authoritative.
-	directToolPermsMu sync.RWMutex
-	directToolPerms   map[string]string
+	// directCatalogPtr holds the immutable directCatalog snapshot (Spec 102
+	// FR-017): the single source for direct-surface listing, describe_tool
+	// resolution, signature lookup and pre-dispatch validation.
+	//
+	// It replaces the mutex-guarded directToolPerms map, which answered only one
+	// of those questions and could not distinguish "built and empty" from "not
+	// built yet" — a nil map and an empty map both missed, so a discovery filter
+	// keyed on it could not tell a denial from a startup race.
+	//
+	// An atomic pointer to an immutable value rather than an actor: the snapshot
+	// is written only by the routing-refresh goroutine and read on every direct
+	// tools/list, describe_tool and dispatch, and it never mutates after
+	// publication. This is the same read-mostly trade Spec 085 accepted for the
+	// signature cache, and it reduces the read path's lock scope to zero.
+	directCatalogPtr atomic.Pointer[directCatalog]
+
+	// Surface fingerprints: the content last actually registered on each tool
+	// surface, so a rebuild that would change nothing can be skipped instead of
+	// notifying every client. See mcp_surface_fingerprint.go.
+	//
+	// The direct pair is guarded by directRefreshMu, which every caller of
+	// refreshDirectModeToolsLocked already holds; the code-exec surface gets its
+	// own mutex because it has no such lock today.
+	directSurfaceToolsFP   string
+	directSurfaceRoutingFP string
+
+	codeExecRefreshMu sync.Mutex
+	codeExecSurfaceFP string
+	// codeExecPublishes counts rebuilds that actually re-registered, so the
+	// guard's effect is observable rather than only visible in the log.
+	codeExecPublishes atomic.Uint64
+
+	// The call-tool surface (/mcp in the default routing mode) gets the same
+	// guard: it is rebuilt on every config.reloaded, and an unguarded SetTools
+	// tells every client the tool set changed on every unrelated edit
+	// (issue #1236).
+	callToolRefreshMu sync.Mutex
+	callToolSurfaceFP string
+	callToolPublishes atomic.Uint64
+
+	directCatalogGeneration atomic.Uint64
+
+	// directRefreshMu serializes whole rebuilds so SetTools and the matching
+	// publishDirectCatalog cannot interleave with another rebuild's pair.
+	directRefreshMu sync.Mutex
+
+	// directRebuildPause, when non-nil, is invoked BETWEEN SetTools and the
+	// catalog publish. Nil in production; the only writer is a test.
+	//
+	// It exists because the SetTools-then-publish order is load-bearing (D13
+	// rule 1) and is otherwise untestable: once a rebuild completes, the
+	// registry and the catalog agree whichever order they landed in, so
+	// inverting them is invisible from outside. Without this seam the ordering
+	// would be asserted only by a comment — and the skew suite would have to
+	// keep staging the window by hand instead of observing the real publisher.
+	directRebuildPause func()
+
+	// dispatchGatePause, when non-nil, is invoked by the dispatch paths that
+	// run a live identity certification (handleCallToolVariant, the sandbox
+	// bridge upstreamToolCaller.CallTool) AFTER the shared gate has captured
+	// its ONE persisted server record and BEFORE that certification runs.
+	// Nil in production; the only writer is a test.
+	//
+	// It exists because the "one persisted record per dispatch" invariant
+	// (Spec 105 FR-009; codex r7 H1) is otherwise untestable: an operator's
+	// quarantine / disable that lands between the gate's read and the live
+	// certification is a window no fixture can stage from outside, and a
+	// second, independent read there answered the discovery-window body for
+	// a dispatch the gate's record had already decided.
+	dispatchGatePause func(serverName, toolName string)
+
+	// sandboxPreflightPause, when non-nil, is invoked by the sandbox's
+	// pre-authorization lookup (lookupToolGate, the jsruntime
+	// ToolGateLookup) AFTER it has captured the nested call's ONE persisted
+	// server record and BEFORE the sandbox authorizes and dispatches on it.
+	// Nil in production; the only writer is a test.
+	//
+	// It exists because the nested path's variant of the "one persisted
+	// record per dispatch" invariant (codex r9 I1) is otherwise untestable:
+	// the JavaScript preflight and the bridge's dispatch used to take two
+	// independent reads, and an operator's quarantine / disable landing
+	// between them answered a verdict neither read alone selects.
+	sandboxPreflightPause func(serverName, toolName string)
 
 	// Spec 049: in-memory only counter of retrieve_tools calls that opted into
 	// include_disabled. Never persisted (privacy, consistent with Spec 042).
@@ -177,6 +287,44 @@ type MCPProxyServer struct {
 	// MCP-32: observability manager for tool-call metrics + OTLP tracing. Nil
 	// when observability is disabled; all use sites must nil-guard.
 	observability *observability.Manager
+
+	// auditSink is the Spec 107 audit line writer (audit_funnel.go), copied
+	// from Server.auditSink at construction. nil = every funnel is a no-op
+	// (the personal-edition default and audit_log off).
+	auditSink audit.Sink
+
+	// Issue #969 (Phase 0): per-session note of the last retrieve_tools call
+	// that carried a spec-094 filter_diagnostics block, used to detect whether
+	// the agent then RELAXED a blamed filter. In-memory only, never persisted,
+	// and it holds no query text or tool identities — only the filter keys the
+	// block already named plus a timestamp. See preflight_telemetry.go.
+	filterDiagMu    sync.Mutex
+	filterDiagNotes map[string]filterDiagNote
+
+	// configFilePath is the ACTIVE configuration FILE this server belongs to,
+	// handed in at construction (Spec 097). It is the authority for anything
+	// derived from the config directory — today the stored-scripts directory.
+	// Empty in constructions that did not declare one; see
+	// activeConfigFilePath() for the fallback order.
+	configFilePath string
+
+	// warmedScriptsDir is the scripts directory whose stored-name index was
+	// last warmed (Spec 105 FR-012); scriptsDir re-warms when it moves.
+	warmedScriptsDir atomic.Pointer[string]
+}
+
+// MCPProxyOption customizes an MCPProxyServer at construction time.
+type MCPProxyOption func(*MCPProxyServer)
+
+// WithConfigFilePath declares the ACTIVE configuration FILE path this server
+// serves (Spec 097). Every surface that stands up an MCPProxyServer passes it:
+// the daemon from the runtime config service, the CLI's in-process server from
+// its own --config resolution. It must be the config FILE, never a directory
+// derived from --data-dir, which may be overridden after the file is chosen.
+func WithConfigFilePath(path string) MCPProxyOption {
+	return func(p *MCPProxyServer) {
+		p.configFilePath = path
+	}
 }
 
 // SetObservability wires the observability manager used to record tool-call
@@ -244,6 +392,7 @@ func NewMCPProxyServer(
 	debugSearch bool,
 	config *config.Config,
 	sigCache *toolsig.Cache,
+	opts ...MCPProxyOption,
 ) *MCPProxyServer {
 	// The production path passes the Runtime-owned cache (single owner,
 	// Spec 085 FR-008). Standalone constructions (CLI one-shots, tests) may
@@ -410,7 +559,7 @@ func NewMCPProxyServer(
 	// the default 50k chars up to the declared value (max 500k), so large
 	// upstream tool responses flow through inline instead of being spilled
 	// to disk as a 2KB preview. No-op when config is 0.
-	registerMaxResultSizeHook(hooks, config.MaxResultSizeChars)
+	registerMaxResultSizeHook(hooks, config.EffectiveMaxResultSizeChars())
 
 	// Create MCP server with capabilities and hooks
 	capabilities := []mcpserver.ServerOption{
@@ -487,11 +636,42 @@ func NewMCPProxyServer(
 		hooks:                hooks,
 	}
 
+	// Apply construction options before anything reads them (tool registration
+	// below already runs against the finished server).
+	for _, opt := range opts {
+		if opt != nil {
+			opt(proxy)
+		}
+	}
+
 	// Let the hooks (registered before the proxy existed) reach it.
 	proxyRef.Store(proxy)
 
+	// Build the stored-script index now that the scripts directory is known,
+	// so no scoped request ever lists it (Spec 105 FR-012).
+	scriptsDir := proxy.scriptsDir()
+	proxy.warmedScriptsDir.Store(&scriptsDir)
+	proxy.warmStoredScripts(scriptsDir)
+
 	// Register proxy tools for the default (retrieve_tools) server
 	proxy.registerTools(debugSearch)
+
+	// Attach the aggregated-prompt auth filter to the default retrieve_tools
+	// server. It closes over `proxy` (needed by resolveActiveProfile), which
+	// did not exist when mcpServer was constructed above; ServerOption is
+	// just func(*MCPServer), so invoking it here is identical to having
+	// passed it to NewMCPServer. Enforced on prompts/list AND prompts/get
+	// (PR #973 review, finding F1).
+	//
+	// Bound UNCONDITIONALLY, not under EnablePrompts: RefreshPrompts publishes
+	// from the LIVE config snapshot on every servers.changed / config.reloaded
+	// / prompts-changed event, and mcp-go registers the prompts capability
+	// implicitly on the first SetPrompts. A server built with prompts off and
+	// enabled at runtime would otherwise serve every upstream prompt with no
+	// scope filter and with the internal owner stamp on the wire (Spec 105
+	// FR-006, cross-review round 2). With no prompts registered the filter is
+	// never invoked, so binding it early changes nothing while prompts are off.
+	mcpserver.WithPromptFilter(proxy.filterAggregatedPromptsForAuth)(mcpServer)
 
 	// Register prompts if enabled
 	if config.EnablePrompts {
@@ -616,7 +796,14 @@ func (p *MCPProxyServer) recordRealToolCallSuccess() {
 
 // emitActivityEvent safely emits an activity event if runtime is available
 // source indicates how the call was triggered: "mcp", "cli", or "api"
-func (p *MCPProxyServer) emitActivityToolCallStarted(serverName, toolName, sessionID, requestID, source string, args map[string]any) {
+//
+// Spec 107 (FR-012): ctx is the request context carrying the audit.Attempt.
+// Every dispatch path emits Started after its last pre-dispatch gate and
+// before the upstream call, so this is where the attempt's `authz allow`
+// line is written — ahead of the upstream call, so a crash mid-call keeps
+// the authorization record (research.md D6).
+func (p *MCPProxyServer) emitActivityToolCallStarted(ctx context.Context, serverName, toolName, sessionID, requestID, source string, args map[string]any) {
+	p.auditAuthz(ctx, "allow", "")
 	if p.mainServer != nil && p.mainServer.runtime != nil {
 		p.mainServer.runtime.EmitActivityToolCallStarted(serverName, toolName, sessionID, requestID, source, args)
 	}
@@ -631,16 +818,134 @@ func (p *MCPProxyServer) emitActivityToolCallStarted(serverName, toolName, sessi
 // detectionText is the spec-084 pre-encoding detection scan input (FR-007b) —
 // empty when TOON is off or on non-call_tool_* paths (detector falls back to response)
 // toonDecisions are the spec-084 per-block encoding decisions (FR-010) — nil when the feature did not run
-func (p *MCPProxyServer) emitActivityToolCallCompleted(serverName, toolName, sessionID, requestID, source, status, errorMsg string, durationMs int64, arguments map[string]interface{}, response string, responseTruncated bool, toolVariant string, intent map[string]interface{}, contentTrust, profile string, requestBytes, responseBytes int, detectionText string, toonDecisions []toonenc.Decision) {
+// parentID is the correlation id of the code_execution whose sandbox issued this
+// sub-call (issue C) — empty for every top-level dispatch. It is the LAST
+// parameter on purpose: TestActivityCompletionNeverHardcodesSuccess pins the
+// position of `status` (index 6 since ctx became the first parameter, Spec
+// 107 FR-012), so new parameters have to go after it.
+//
+// ctx is the request context carrying the audit.Attempt (Spec 107): this is
+// the funnel every dispatched call completes through, so it writes the
+// attempt's ONE `tool_call` line — outcome from status, the bounded
+// error_class from the typed error the path noted (auditNoteError), never
+// from errorMsg. A post-dispatch output block already wrote the line as
+// outcome:blocked; the attempt's dedup makes this call a no-op then.
+func (p *MCPProxyServer) emitActivityToolCallCompleted(ctx context.Context, serverName, toolName, sessionID, requestID, source, status, errorMsg string, durationMs int64, arguments map[string]interface{}, response string, responseTruncated bool, toolVariant string, intent map[string]interface{}, contentTrust, profile string, requestBytes, responseBytes int, detectionText string, toonDecisions []toonenc.Decision, parentID string) {
+	p.auditToolCallFromStatus(ctx, status, durationMs, requestBytes, responseBytes)
 	if p.mainServer != nil && p.mainServer.runtime != nil {
-		p.mainServer.runtime.EmitActivityToolCallCompleted(serverName, toolName, sessionID, requestID, source, status, errorMsg, durationMs, arguments, response, responseTruncated, toolVariant, intent, contentTrust, profile, requestBytes, responseBytes, detectionText, toonOutputMetadata(toonDecisions))
+		p.mainServer.runtime.EmitActivityToolCallCompleted(serverName, toolName, sessionID, requestID, source, status, errorMsg, durationMs, arguments, response, responseTruncated, toolVariant, intent, contentTrust, profile, requestBytes, responseBytes, detectionText, toonOutputMetadata(toonDecisions), parentID)
 	}
 }
 
-func (p *MCPProxyServer) emitActivityPolicyDecision(serverName, toolName, sessionID, decision, reason string) {
-	if p.mainServer != nil && p.mainServer.runtime != nil {
-		p.mainServer.runtime.EmitActivityPolicyDecision(serverName, toolName, sessionID, decision, reason)
+// auditToolCallFromStatus maps an activity completion status onto the
+// tool_call outcome vocabulary and writes the line. A "blocked" completion
+// (the sandbox bridge's pre-dispatch policy refusal, emitSubCallRefused) is
+// an `authz deny` — the bridge wrote it before emitting — so only the
+// activity row is left to write here.
+func (p *MCPProxyServer) auditToolCallFromStatus(ctx context.Context, status string, durationMs int64, requestBytes, responseBytes int) {
+	if auditDispatchFromContext(ctx) == nil {
+		return
 	}
+	var reqBytes, respBytes *int
+	if requestBytes > 0 {
+		reqBytes = &requestBytes
+	}
+	if responseBytes > 0 {
+		respBytes = &responseBytes
+	}
+	switch status {
+	case storage.ActivityStatusSuccess:
+		p.auditToolCall(ctx, "success", "", "", durationMs, reqBytes, respBytes)
+	case storage.ActivityStatusError:
+		p.auditToolCall(ctx, "error", "", "", durationMs, reqBytes, respBytes)
+	case storage.ActivityStatusBlocked, storage.ActivityStatusRejected:
+		// Pre-dispatch refusals reach this funnel only from the sandbox
+		// bridge, which already wrote the authz deny; sheds are written by
+		// auditToolCallShed at the shed site. Nothing to add.
+	}
+}
+
+// emitActivityPolicyDecision is the single funnel every policy block, warning
+// and redaction leaves through.
+//
+// requestID must be the same id the rest of the dispatch reports, so the live
+// event and the record persisted from it are recognisably one thing. Gates that
+// fire before a handler would otherwise mint an id have to mint it earlier
+// rather than pass "" — see mintActivityRequestID.
+//
+// reasonKey is the STRUCTURED classification of this decision, declared by the
+// call site from the closed telemetry.BlockReason* enum (issue #969). `reason`
+// is operator-facing prose that embeds server and tool names and must never
+// reach telemetry; reasonKey is what the availability counters aggregate on, so
+// the classification comes from the gate that fired rather than from parsing
+// the message it wrote. A key outside the enum is folded into "other" by the
+// store.
+//
+// ctx is the request context carrying the audit.Attempt (Spec 107 FR-012).
+// A "blocked" decision at a pre-dispatch gate is the attempt's `authz deny`
+// line (reasonKey is the line's reason; the prose never reaches it); a
+// "blocked" output_sanitisation / output_schema decision is post-dispatch
+// and becomes the attempt's `tool_call outcome:blocked` line — never a
+// second authz (FR-043(j)). Warnings and redactions write no audit line.
+func (p *MCPProxyServer) emitActivityPolicyDecision(ctx context.Context, serverName, toolName, sessionID, requestID, decision, reason, reasonKey string) {
+	if decision == "blocked" {
+		if isPostDispatchBlockKey(reasonKey) {
+			p.auditToolCall(ctx, "blocked", reasonKey, "", auditDurationMs(ctx), nil, nil)
+		} else {
+			p.auditAuthz(ctx, "deny", reasonKey)
+		}
+	}
+	if p.mainServer != nil && p.mainServer.runtime != nil {
+		p.mainServer.runtime.EmitActivityPolicyDecision(serverName, toolName, sessionID, requestID, decision, reason)
+	}
+	// Issue #969 (Phase 0): availability baseline. Only outright blocks count —
+	// a warning or a redaction still delivered the call.
+	if decision == "blocked" {
+		p.recordAvailabilityBlock(reasonKey)
+	}
+}
+
+// activityRequestIDSeq disambiguates ids minted within the same nanosecond.
+// time.Now() is not guaranteed to advance between two goroutines reading it, so
+// two calls blocked at the same instant on the same tool would otherwise share
+// an id — and the tray, which collapses activity rows by request id, would show
+// two separate attempts as one.
+var activityRequestIDSeq atomic.Uint64
+
+// mintCorrelationIDAt builds "<nanos>-<part>-…-<seq>": the shape every call
+// path already emitted, with the counter appended. It is the ONLY place in the
+// package that turns the clock into an identifier — see
+// TestActivityIDsAreNeverMintedInline, which enforces that.
+//
+// The instant is a parameter because some records are keyed by when the work
+// started, not by when the id was needed.
+func mintCorrelationIDAt(at time.Time, parts ...string) string {
+	var b strings.Builder
+	b.WriteString(strconv.FormatInt(at.UnixNano(), 10))
+	for _, part := range parts {
+		b.WriteByte('-')
+		b.WriteString(part)
+	}
+	b.WriteByte('-')
+	b.WriteString(strconv.FormatUint(activityRequestIDSeq.Add(1), 10))
+	return b.String()
+}
+
+// mintCorrelationID is mintCorrelationIDAt for work starting now.
+func mintCorrelationID(parts ...string) string {
+	return mintCorrelationIDAt(time.Now(), parts...)
+}
+
+// mintActivityRequestID produces the correlation id shared by every activity
+// event of one dispatch. The nanosecond stamp and target keep the shape the
+// call paths already generated (and logs are grepped by); the counter suffix is
+// what actually guarantees uniqueness.
+//
+// Callers mint ONCE, above the earliest policy gate they can reach, and reuse
+// the value: minting per emit site would make two gates in one dispatch look
+// like two unrelated requests.
+func mintActivityRequestID(serverName, toolName string) string {
+	return mintCorrelationID(serverName, toolName)
 }
 
 // emitActivityInternalToolCall safely emits an internal tool call completion event (Spec 024)
@@ -648,10 +953,99 @@ func (p *MCPProxyServer) emitActivityPolicyDecision(serverName, toolName, sessio
 // targetServer and targetTool are used for call_tool_* handlers
 // arguments contains the input parameters, response contains the output
 // intent is the intent declaration metadata
+//
+// This is the whole-response form: the built-in returned to the agent exactly
+// the text it recorded. Handlers that SHAPE their text before returning it —
+// today only retrieve_tools, which is subject to tool_response_limit — must use
+// emitActivityInternalToolCallTruncated instead, so the record says so.
 func (p *MCPProxyServer) emitActivityInternalToolCall(internalToolName, targetServer, targetTool, toolVariant, sessionID, requestID, status, errorMsg string, durationMs int64, arguments map[string]interface{}, response interface{}, intent map[string]interface{}, contentTrust string) {
+	p.emitActivityInternalToolCallTruncated(internalToolName, targetServer, targetTool, toolVariant, sessionID, requestID, status, errorMsg, durationMs, arguments, response, intent, contentTrust, false)
+}
+
+// emitActivityInternalToolCallTruncated is emitActivityInternalToolCall for a
+// handler whose recorded response is LARGER than what the agent received,
+// mirroring the responseTruncated argument the non-internal path already
+// carries through emitActivityToolCallCompleted.
+//
+// Why the flag has to reach the record and not just the log (Spec 103): the
+// activity log deliberately stores the FULL pre-truncation retrieve_tools
+// response while the agent only ever consumed the cut text. A record that does
+// not say it was truncated is indistinguishable from a complete one, so anything
+// that recomputes cost from the log — the token benchmark's replay loader is the
+// motivating consumer — tokenizes text the agent never paid for and OVERSTATES
+// what mcpproxy cost. That is the one direction of error the benchmark exists to
+// prevent, and it is not detectable after the fact.
+//
+// The flag reaches the stored record through Runtime.EmitActivityInternalToolCallTruncated
+// (internal/runtime/event_bus.go), which carries "response_truncated" in the
+// event payload, and ActivityService.handleInternalToolCall, which reads it back
+// onto ActivityRecord.ResponseTruncated — the same two hops the non-internal
+// path has always used.
+func (p *MCPProxyServer) emitActivityInternalToolCallTruncated(internalToolName, targetServer, targetTool, toolVariant, sessionID, requestID, status, errorMsg string, durationMs int64, arguments map[string]interface{}, response interface{}, intent map[string]interface{}, contentTrust string, responseTruncated bool) {
 	if p.mainServer != nil && p.mainServer.runtime != nil {
-		p.mainServer.runtime.EmitActivityInternalToolCall(internalToolName, targetServer, targetTool, toolVariant, sessionID, requestID, status, errorMsg, durationMs, arguments, response, intent, contentTrust)
+		p.mainServer.runtime.EmitActivityInternalToolCallTruncated(internalToolName, targetServer, targetTool, toolVariant, sessionID, requestID, status, errorMsg, durationMs, arguments, response, intent, contentTrust, responseTruncated)
 	}
+}
+
+// emitActivityPromptGet safely emits an upstream prompts/get completion (F10).
+func (p *MCPProxyServer) emitActivityPromptGet(serverName, promptName, sessionID, requestID, status, errorMsg string, durationMs int64, arguments map[string]interface{}, response interface{}) {
+	if p.mainServer != nil && p.mainServer.runtime != nil {
+		p.mainServer.runtime.EmitActivityPromptGet(serverName, promptName, sessionID, requestID, status, errorMsg, durationMs, arguments, response)
+	}
+}
+
+// getPromptAggregated is the single getter passed to buildAggregatedServerPrompts.
+// It composes the three step-2 security layers around one upstream round-trip
+// (PR #973 review): F12 size caps are applied inside Manager.GetPrompt, then F2
+// sanitises the result, then F10 records an activity row. The request-id is
+// minted ONCE so F2's policy_decision row and F10's prompt_get row correlate
+// under `activity list --request-id`.
+func (p *MCPProxyServer) getPromptAggregated(ctx context.Context, name string, args map[string]string) (*mcp.GetPromptResult, error) {
+	start := time.Now()
+
+	var sessionID string
+	if sess := mcpserver.ClientSessionFromContext(ctx); sess != nil {
+		sessionID = sess.SessionID()
+	}
+	serverName, promptName, _ := strings.Cut(name, ":")
+	requestID := reqcontext.GetRequestID(ctx)
+	if requestID == "" {
+		requestID = mintCorrelationID("prompts_get", serverName, promptName)
+	}
+
+	// F12 size cap already applied inside Manager.GetPrompt.
+	result, err := p.upstreamManager.GetPrompt(ctx, name, args)
+
+	// F2: sanitise the result (redact/strip/spotlight, or block on critical
+	// secret). Pass the SHARED requestID so the policy_decision row joins the
+	// prompt_get row below.
+	if err == nil && result != nil {
+		if sanitised, blocked := p.applyPromptResultSanitisation(ctx, serverName, promptName, requestID, result); blocked {
+			result, err = nil, fmt.Errorf("prompt output blocked by sanitisation policy")
+		} else {
+			result = sanitised
+		}
+	}
+
+	// F10: record the POST-sanitise outcome (a block is logged as an error row).
+	status, errMsg := storage.ActivityStatusSuccess, ""
+	var response interface{}
+	if err != nil {
+		status, errMsg = storage.ActivityStatusError, err.Error()
+	} else {
+		response = result
+	}
+	var argsForRecord map[string]interface{}
+	if len(args) > 0 {
+		argsForRecord = make(map[string]interface{}, len(args))
+		for k, v := range args {
+			argsForRecord[k] = v
+		}
+	}
+	p.emitActivityPromptGet(serverName, promptName, sessionID, requestID, status, errMsg,
+		time.Since(start).Milliseconds(), argsForRecord, response)
+
+	return result, err
 }
 
 // buildCallToolVariantTool constructs the mcp.Tool definition for a single
@@ -737,6 +1131,40 @@ func buildCallToolVariantTool(variant string) mcp.Tool {
 	return mcp.NewTool(variant, allOpts...)
 }
 
+// callToolMetaKeys are call_tool_read/write/destructive's own top-level
+// parameters, as registered by buildCallToolVariantTool above — never part
+// of the upstream tool's own arguments.
+var callToolMetaKeys = map[string]struct{}{
+	"name":                    {},
+	"args":                    {},
+	"args_json":               {},
+	"intent_data_sensitivity": {},
+	"intent_reason":           {},
+}
+
+// flattenedCallToolArgs recovers upstream-tool arguments a caller placed as
+// top-level siblings of 'name' instead of nesting them under 'args' (#1317):
+// e.g. {"name": "server:tool", "url": "..."} instead of the documented
+// {"name": "server:tool", "args": {"url": "..."}}. Without this, such a call
+// silently dispatches with zero arguments — for a tool with a required
+// property, the pre-dispatch validator then reports that property as
+// "missing" even though the caller supplied it, just not where the schema
+// expects it. Returns nil when nothing beyond the known meta keys is
+// present, so a well-formed call is never second-guessed.
+func flattenedCallToolArgs(rawArguments map[string]interface{}) map[string]interface{} {
+	var flattened map[string]interface{}
+	for k, v := range rawArguments {
+		if _, known := callToolMetaKeys[k]; known {
+			continue
+		}
+		if flattened == nil {
+			flattened = make(map[string]interface{})
+		}
+		flattened[k] = v
+	}
+	return flattened
+}
+
 // retrieveToolsDetailOption returns the per-call serialization override
 // parameter (Spec 085 FR-005) shared by every retrieve_tools registration —
 // the default server and both routing-mode builders — so the schema never
@@ -749,11 +1177,41 @@ func retrieveToolsDetailOption() mcp.ToolOption {
 	)
 }
 
+// retrieveToolsAnnotationFilterOptions returns the annotation-based safety
+// filters (Spec 035 F4) shared by every retrieve_tools registration — the
+// default server and both routing-mode builders — so the schema cannot drift
+// between surfaces. Spec 094 FR-009: the two routing builders used to declare
+// these independently and the default registration omitted them entirely, so
+// agents on the default surface could not discover filters the handler had
+// always honored. That gap is how the field report's confusion started.
+func retrieveToolsAnnotationFilterOptions() []mcp.ToolOption {
+	return []mcp.ToolOption{
+		mcp.WithBoolean("read_only_only",
+			mcp.Description("Only return tools with readOnlyHint=true. Use to self-restrict to safe read operations."),
+		),
+		mcp.WithBoolean("exclude_destructive",
+			mcp.Description("Exclude tools with destructiveHint=true or unset (MCP default is destructive). Use to avoid destructive operations."),
+		),
+		mcp.WithBoolean("exclude_open_world",
+			mcp.Description("Exclude tools with openWorldHint=true or unset (MCP default is open-world). Use to restrict to local/sandboxed tools."),
+		),
+	}
+}
+
+// retrieveToolsDiagnosticsNote is appended verbatim to all three
+// retrieve_tools descriptions (Spec 094 FR-009). The closing sentence is the
+// load-bearing one: the counts describe the ranked window THIS call searched,
+// so an agent must not read them as a statement about the whole catalog.
+const retrieveToolsDiagnosticsNote = " ANNOTATION FILTERS: read_only_only, exclude_destructive and exclude_open_world self-restrict discovery. " +
+	"When they withhold tools that matched your query, the response carries a 'filter_diagnostics' block with per-filter counts " +
+	"(split into missing upstream annotations vs. explicitly unsafe ones) and one suggestion; it is absent when nothing was withheld. " +
+	"Filter diagnostics describe this call's candidate window, not the whole catalog."
+
 // registerTools registers all proxy tools with the MCP server
 func (p *MCPProxyServer) registerTools(_ bool) {
 	// retrieve_tools - THE PRIMARY TOOL FOR DISCOVERING TOOLS - Enhanced with clear instructions
-	retrieveToolsTool := mcp.NewTool("retrieve_tools",
-		mcp.WithDescription("🔍 CALL THIS FIRST to discover relevant tools! This is the primary tool discovery mechanism that searches across ALL upstream MCP servers using intelligent BM25 full-text search. Always use this before attempting to call any specific tools. Use natural language to describe what you want to accomplish (e.g., 'create GitHub repository', 'query database', 'weather forecast'). Results include 'annotations' (tool behavior hints like destructiveHint) and 'call_with' recommendation indicating which tool variant to use (call_tool_read/write/destructive). Then use the recommended variant with an 'intent' parameter. Compact mode returns one-line signatures ('sig': '*'=required, '~'=lossy) with first-sentence 'desc'; call describe_tool for full schemas. NOTE: Quarantined servers are excluded from search results for security. Use 'quarantine_security' tool to examine and manage quarantined servers. TO ADD NEW SERVERS: Use 'list_registries' then 'search_servers' to find and add new MCP servers."),
+	retrieveToolsOpts := []mcp.ToolOption{
+		mcp.WithDescription("🔍 CALL THIS FIRST to discover relevant tools! This is the primary tool discovery mechanism that searches across ALL upstream MCP servers using intelligent BM25 full-text search. Always use this before attempting to call any specific tools. Use natural language to describe what you want to accomplish (e.g., 'create GitHub repository', 'query database', 'weather forecast'). Results include 'annotations' (tool behavior hints like destructiveHint) and 'call_with' recommendation indicating which tool variant to use (call_tool_read/write/destructive). Then use the recommended variant with an 'intent' parameter. Compact mode returns one-line signatures ('sig': '*'=required, '~'=lossy) with first-sentence 'desc'; call describe_tool for full schemas. NOTE: Quarantined servers are excluded from search results for security. Use 'quarantine_security' tool to examine and manage quarantined servers. TO ADD NEW SERVERS: Use 'list_registries' then 'search_servers' to find and add new MCP servers." + retrieveToolsDiagnosticsNote),
 		mcp.WithTitleAnnotation("Retrieve Tools"),
 		mcp.WithReadOnlyHintAnnotation(true),
 		mcp.WithDestructiveHintAnnotation(false),
@@ -781,7 +1239,9 @@ func (p *MCPProxyServer) registerTools(_ bool) {
 			mcp.Description("Set true to also surface tools that exist but are currently locked by config, user, or quarantine (default: false). Returns a 'disabled' list (name/server/description/status) plus a 'remediation' map; callable results are unaffected and listed first."),
 		),
 		retrieveToolsDetailOption(),
-	)
+	}
+	retrieveToolsOpts = append(retrieveToolsOpts, retrieveToolsAnnotationFilterOptions()...)
+	retrieveToolsTool := mcp.NewTool("retrieve_tools", retrieveToolsOpts...)
 	p.server.AddTool(retrieveToolsTool, p.handleRetrieveTools)
 
 	// describe_tool — Spec 085 (US2, FR-011): the progressive-disclosure second
@@ -825,30 +1285,14 @@ func (p *MCPProxyServer) registerTools(_ bool) {
 	)
 	p.server.AddTool(readCacheTool, p.handleReadCache)
 
-	// code_execution - JavaScript/TypeScript code execution for multi-tool orchestration (feature-flagged)
-	if p.config.EnableCodeExecution {
-		codeExecutionTool := mcp.NewTool("code_execution",
-			mcp.WithDescription("Execute JavaScript or TypeScript code that orchestrates multiple upstream MCP tools in a single request. Use this when you need to combine results from 2+ tools, implement conditional logic, loops, or data transformations that would require multiple round-trips otherwise.\n\n**When to use**: Multi-step workflows with data transformation, conditional logic, error handling, or iterating over results.\n**When NOT to use**: Single tool calls (use call_tool directly), long-running operations (>2 minutes).\n\n**Available in code**:\n- `input` global: Your input data passed via the 'input' parameter\n- `call_tool(serverName, toolName, args)`: Call upstream tools (returns {ok, result} or {ok, error})\n- Modern JavaScript (ES2020+): arrow functions, const/let, template literals, destructuring, classes, for-of, optional chaining (?.), nullish coalescing (??), spread/rest, Promises, Symbols, Map/Set, Proxy/Reflect (no require(), filesystem, or network access)\n\n**TypeScript support**: Set `language: \"typescript\"` to write TypeScript code with type annotations, interfaces, enums, and generics. Types are automatically stripped before execution.\n\n**Important runtime rules**:\n- `call_tool` is strictly SYNCHRONOUS. Do not use `await`.\n- Upstream tools usually return an MCP content array. To parse JSON results: `const data = JSON.parse(res.result.content[0].text);`\n- The last evaluated expression in your script is automatically returned as the final output.\n\n**Security**: Sandboxed execution with timeout enforcement. Respects existing quarantine and server restrictions."),
-			mcp.WithTitleAnnotation("Code Execution"),
-			mcp.WithDestructiveHintAnnotation(true),
-			mcp.WithReadOnlyHintAnnotation(false),
-			mcp.WithOpenWorldHintAnnotation(true),
-			mcp.WithString("code",
-				mcp.Required(),
-				mcp.Description("JavaScript or TypeScript source code (ES2020+) to execute. Supports modern syntax: arrow functions, const/let, template literals, destructuring, optional chaining, nullish coalescing. Use `input` to access input data and `call_tool(serverName, toolName, args)` to invoke upstream tools. call_tool is SYNCHRONOUS — do not use await. Return value is the last evaluated expression and must be JSON-serializable. Example: `const res = call_tool('github', 'get_user', {username: input.username}); const data = JSON.parse(res.result.content[0].text); ({user: data, timestamp: Date.now()})`"),
-			),
-			mcp.WithString("language",
-				mcp.Description("Source code language. When set to 'typescript', the code is automatically transpiled to JavaScript before execution. Type annotations are stripped, enums and namespaces are converted to JavaScript equivalents. Default: 'javascript'."),
-				mcp.Enum("javascript", "typescript"),
-			),
-			mcp.WithObject("input",
-				mcp.Description("Input data accessible as global `input` variable in code (default: {})"),
-			),
-			mcp.WithObject("options",
-				mcp.Description("Execution options: timeout_ms (1-600000, default: 120000), max_tool_calls (>= 0, 0=unlimited), allowed_servers (array of server names, empty=all allowed)"),
-			),
-		)
-		p.server.AddTool(codeExecutionTool, p.handleCodeExecution)
+	// code_execution - JavaScript/TypeScript code execution for multi-tool
+	// orchestration (feature-flagged). One definition for every surface:
+	// buildCodeExecutionTool returns the live tool when enable_code_execution
+	// is on and nothing at all when it is off (issue #1236 — a disabled
+	// feature is not advertised). A runtime flip is applied in place by
+	// RefreshCodeExecutionAvailability.
+	for _, st := range p.buildCodeExecutionTool() {
+		p.server.AddTool(st.Tool, st.Handler)
 	}
 
 	// Management tools (shared across routing modes)
@@ -867,7 +1311,7 @@ func (p *MCPProxyServer) buildManagementTools() []mcpserver.ServerTool {
 	var tools []mcpserver.ServerTool
 	{
 		upstreamServersTool := mcp.NewTool("upstream_servers",
-			mcp.WithDescription("Manage upstream MCP servers - add, remove, update, and list servers. Includes Docker isolation configuration and connection status monitoring. SECURITY: Newly added servers are automatically quarantined to prevent Tool Poisoning Attacks (TPAs). Use 'quarantine_security' tool to review and manage quarantined servers. NOTE: Unquarantining servers is only available through manual config editing or system tray UI for security.\n\nDocker Isolation: Use 'isolation_json' parameter to configure per-server Docker images, CPU/memory limits, and network isolation. Example: {\"enabled\": true, \"image\": \"node:20\", \"network_mode\": \"bridge\"}.\n\nSMART PATCHING (update/patch): Uses deep merge - only specify fields you want to change. Omitted fields are PRESERVED, not removed. Examples:\n- Enable server: {\"operation\": \"patch\", \"name\": \"my-server\", \"enabled\": true} - only enabled changes\n- Enable isolation: {\"operation\": \"patch\", \"name\": \"my-server\", \"isolation_json\": \"{\\\"enabled\\\": true}\"} - enables isolation with defaults\n- Update image: {\"operation\": \"patch\", \"name\": \"my-server\", \"isolation_json\": \"{\\\"image\\\": \\\"python:3.12\\\"}\"} - other isolation fields preserved\n- Add env var: env_json merges with existing vars\n- Replace args: args_json replaces entirely (arrays not merged)\n- Remove field: use 'null' (e.g., isolation_json: \"null\" removes isolation)"),
+			mcp.WithDescription("Manage upstream MCP servers - add, remove, update, and list servers. Includes Docker isolation configuration and connection status monitoring. SECURITY: Newly added servers are automatically quarantined to prevent Tool Poisoning Attacks (TPAs). Use 'quarantine_security' tool to review and manage quarantined servers. NOTE: Unquarantining servers is only available through manual config editing or system tray UI for security.\n\nDocker Isolation: Use 'isolation_json' parameter to configure per-server Docker images, CPU/memory limits, and network isolation. Example: {\"enabled\": true, \"image\": \"node:20\", \"network_mode\": \"bridge\"}.\n\nSMART PATCHING (update/patch): Uses deep merge - only specify fields you want to change. Omitted fields are PRESERVED, not removed. Examples:\n- Enable server: {\"operation\": \"patch\", \"name\": \"my-server\", \"enabled\": true} - only enabled changes\n- Enable isolation: {\"operation\": \"patch\", \"name\": \"my-server\", \"isolation_json\": \"{\\\"enabled\\\": true}\"} - enables isolation with defaults\n- Update image: {\"operation\": \"patch\", \"name\": \"my-server\", \"isolation_json\": \"{\\\"image\\\": \\\"python:3.12\\\"}\"} - other isolation fields preserved\n- Add env var: env_json merges with existing vars\n- Replace args: args_json replaces entirely (arrays not merged)\n- Remove field: use 'null' (e.g., isolation_json: \"null\" removes isolation)\n\nREDACTION (update/patch): the returned 'changes' diff keeps every field PATH exact, but MASKS values under secret-bearing keys (env vars, headers, oauth secrets, credential-shaped argv tokens) in both this response and the activity log. Non-secret values round-trip unchanged; do not read a masked value back as what was stored."),
 			mcp.WithTitleAnnotation("Upstream Servers"),
 			mcp.WithDestructiveHintAnnotation(true),
 			mcp.WithReadOnlyHintAnnotation(false),
@@ -924,6 +1368,9 @@ func (p *MCPProxyServer) buildManagementTools() []mcpserver.ServerTool {
 				mcp.Description("Per-server trust tier governing new-server admission AND tool-change approval (spec 086): 'auto' = approve without scanning; 'scan' = auto-approve only when the fast offline TPA scan is green, else hold for review; 'manual' = human reviews every change. Empty → manual (secure default). Used with add/update/patch."),
 				mcp.Enum("auto", "scan", "manual"),
 			),
+			mcp.WithBoolean("expose_prompts",
+				mcp.Description("Per-server prompt-aggregation override (F9): true = include this server's MCP prompts in mcpproxy's aggregated prompts/list; false = exclude them regardless of capability. Omit to leave unchanged (patch) / inherit the default (aggregate if advertised). Only meaningful when aggregate_upstream_prompts is enabled globally. Used with add/update/patch."),
+			),
 		)
 		tools = append(tools, mcpserver.ServerTool{Tool: upstreamServersTool, Handler: p.handleUpstreamServers})
 	}
@@ -931,21 +1378,24 @@ func (p *MCPProxyServer) buildManagementTools() []mcpserver.ServerTool {
 	// quarantine_security - Security quarantine management
 	{
 		quarantineSecurityTool := mcp.NewTool("quarantine_security",
-			mcp.WithDescription("Security quarantine management for MCP servers and tools. Review and manage quarantined servers and tools to prevent Tool Poisoning Attacks (TPAs). Supports server-level quarantine and tool-level approval for individual tool description/schema changes. NOTE: Unquarantining servers is only available through manual config editing or system tray UI for security."),
+			mcp.WithDescription("Security quarantine management AND TPA scanning for MCP servers and tools. Review and manage quarantined servers and tools to prevent Tool Poisoning Attacks (TPAs), and scan a server for them: 'scan_server' runs the always-on offline baseline scan (in-process, no Docker required) and 'get_scan_report' returns the latest verdict and findings. Every listing/inspection response also carries a one-line scan status, so an unscanned server is visible as unscanned. Supports server-level quarantine and tool-level approval for individual tool description/schema changes. NOTE: Unquarantining servers is only available through manual config editing or system tray UI for security."),
 			mcp.WithTitleAnnotation("Quarantine Security"),
 			mcp.WithDestructiveHintAnnotation(true),
 			mcp.WithReadOnlyHintAnnotation(false),
 			mcp.WithOpenWorldHintAnnotation(false),
 			mcp.WithString("operation",
 				mcp.Required(),
-				mcp.Description("Security operation: list_quarantined, inspect_quarantined, quarantine_server, inspect_tools, approve_tool, approve_all_tools, block_tool, block_all_tools, enable_tool, disable_tool. 'block_tool'/'block_all_tools' atomically approve AND disable a tool (acknowledge it but keep it hidden) — all-or-nothing so a tool is never left approved+enabled."),
-				mcp.Enum("list_quarantined", "inspect_quarantined", "quarantine_server", "inspect_tools", "approve_tool", "approve_all_tools", "block_tool", "block_all_tools", "enable_tool", "disable_tool"),
+				mcp.Description("Security operation: list_quarantined, inspect_quarantined, quarantine_server, inspect_tools, approve_tool, approve_all_tools, block_tool, block_all_tools, enable_tool, disable_tool, inspect_prompts, approve_prompt, approve_all_prompts, scan_server, get_scan_report. 'block_tool'/'block_all_tools' atomically approve AND disable a tool (acknowledge it but keep it hidden) — all-or-nothing so a tool is never left approved+enabled. The prompt operations (spec 100) manage aggregated upstream prompts held by the metadata rug-pull baseline: a prompt whose advertised metadata changed since approval is withheld from prompts/list until approved. 'scan_server' starts the offline TPA baseline scan for one server (no Docker needed) and returns the verdict once it settles, or a job id to poll; 'get_scan_report' returns that server's latest verdict, counts and findings."),
+				mcp.Enum("list_quarantined", "inspect_quarantined", "quarantine_server", "inspect_tools", "approve_tool", "approve_all_tools", "block_tool", "block_all_tools", "enable_tool", "disable_tool", "inspect_prompts", "approve_prompt", "approve_all_prompts", "scan_server", "get_scan_report"),
 			),
 			mcp.WithString("name",
-				mcp.Description("Server name (required for inspect_quarantined, quarantine_server, inspect_tools, approve_tool, approve_all_tools, block_tool, block_all_tools)"),
+				mcp.Description("Server name (required for inspect_quarantined, quarantine_server, inspect_tools, approve_tool, approve_all_tools, block_tool, block_all_tools, approve_prompt, approve_all_prompts, scan_server, get_scan_report)"),
 			),
 			mcp.WithString("tool_name",
 				mcp.Description("Tool name (required for approve_tool and block_tool operations)"),
+			),
+			mcp.WithString("prompt_name",
+				mcp.Description("Prompt name (required for approve_prompt; spec 100)"),
 			),
 		)
 		tools = append(tools, mcpserver.ServerTool{Tool: quarantineSecurityTool, Handler: p.handleQuarantineSecurity})
@@ -995,29 +1445,30 @@ func (p *MCPProxyServer) buildManagementTools() []mcpserver.ServerTool {
 func (p *MCPProxyServer) registerPrompts() {
 	p.logger.Info("Registering prompts capability")
 
-	// setup-new-mcp-server - Guided workflow for adding MCP servers
-	p.server.AddPrompt(
-		mcp.NewPrompt("setup-new-mcp-server",
-			mcp.WithPromptDescription("Add a new MCP server to mcpproxy. Guides you through configuration for stdio or HTTP servers."),
-			mcp.WithArgument("server_type",
-				mcp.ArgumentDescription("Server type: 'stdio' (local command) or 'http' (remote URL)"),
-			),
-		),
-		p.handleSetupServerPrompt,
-	)
-
-	// troubleshoot-mcp-server - Help with connection issues
-	p.server.AddPrompt(
-		mcp.NewPrompt("troubleshoot-mcp-server",
-			mcp.WithPromptDescription("Diagnose and fix connection issues with MCP servers."),
-			mcp.WithArgument("server_name",
-				mcp.ArgumentDescription("Name of the server experiencing issues"),
-			),
-		),
-		p.handleTroubleshootPrompt,
-	)
+	p.server.AddPrompt(setupServerPrompt(), p.handleSetupServerPrompt)
+	p.server.AddPrompt(troubleshootServerPrompt(), p.handleTroubleshootPrompt)
 
 	p.logger.Info("Prompts registered successfully", zap.Int("count", 2))
+}
+
+// setupServerPrompt describes the built-in setup-new-mcp-server prompt.
+func setupServerPrompt() mcp.Prompt {
+	return mcp.NewPrompt("setup-new-mcp-server",
+		mcp.WithPromptDescription("Add a new MCP server to mcpproxy. Guides you through configuration for stdio or HTTP servers."),
+		mcp.WithArgument("server_type",
+			mcp.ArgumentDescription("Server type: 'stdio' (local command) or 'http' (remote URL)"),
+		),
+	)
+}
+
+// troubleshootServerPrompt describes the built-in troubleshoot-mcp-server prompt.
+func troubleshootServerPrompt() mcp.Prompt {
+	return mcp.NewPrompt("troubleshoot-mcp-server",
+		mcp.WithPromptDescription("Diagnose and fix connection issues with MCP servers."),
+		mcp.WithArgument("server_name",
+			mcp.ArgumentDescription("Name of the server experiencing issues"),
+		),
+	)
 }
 
 // handleSetupServerPrompt handles the setup-new-mcp-server prompt
@@ -1122,7 +1573,7 @@ func (p *MCPProxyServer) handleSearchServers(ctx context.Context, request mcp.Ca
 	if sess := mcpserver.ClientSessionFromContext(ctx); sess != nil {
 		sessionID = sess.SessionID()
 	}
-	requestID := fmt.Sprintf("%d-search_servers", time.Now().UnixNano())
+	requestID := mintCorrelationID("search_servers")
 
 	registry, err := request.RequireString("registry")
 	if err != nil {
@@ -1221,7 +1672,7 @@ func (p *MCPProxyServer) handleListRegistries(ctx context.Context, _ mcp.CallToo
 	if sess := mcpserver.ClientSessionFromContext(ctx); sess != nil {
 		sessionID = sess.SessionID()
 	}
-	requestID := fmt.Sprintf("%d-list_registries", time.Now().UnixNano())
+	requestID := mintCorrelationID("list_registries")
 
 	registriesList := []map[string]interface{}{}
 	allRegistries := registries.ListRegistries()
@@ -1231,9 +1682,10 @@ func (p *MCPProxyServer) handleListRegistries(ctx context.Context, _ mcp.CallToo
 			"id":          reg.ID,
 			"name":        reg.Name,
 			"description": reg.Description,
-			"url":         reg.URL,
-			"tags":        reg.Tags,
-			"count":       reg.Count,
+			// Issue #1148, round 8: same shared rule as every other URL door.
+			"url":   liveRedaction.URLValue(reg.URL),
+			"tags":  reg.Tags,
+			"count": reg.Count,
 			// MCP-866: provenance/trust so an agent can tell official from
 			// user-added third-party sources.
 			"provenance": reg.Provenance,
@@ -1298,7 +1750,7 @@ func (p *MCPProxyServer) handleRetrieveToolsWithMode(ctx context.Context, reques
 	if sess := mcpserver.ClientSessionFromContext(ctx); sess != nil {
 		sessionID = sess.SessionID()
 	}
-	requestID := fmt.Sprintf("%d-retrieve_tools", time.Now().UnixNano())
+	requestID := mintCorrelationID("retrieve_tools")
 
 	query, err := request.RequireString("query")
 	if err != nil {
@@ -1334,6 +1786,20 @@ func (p *MCPProxyServer) handleRetrieveToolsWithMode(ctx context.Context, reques
 	readOnlyOnly := request.GetBool("read_only_only", false)
 	excludeDestructive := request.GetBool("exclude_destructive", false)
 	excludeOpenWorld := request.GetBool("exclude_open_world", false)
+
+	// Issue #969 (Phase 0): filter-diagnostics FOLLOW-THROUGH. If the previous
+	// retrieve_tools call in this session was handed a spec-094 diagnostics
+	// block, this call counts as "followed" when it dropped or relaxed at least
+	// one of the filters that block blamed. The note is consumed either way, so
+	// one block can be followed at most once. Evaluated here — before this call
+	// can write a note of its own. The lookup itself is an in-memory map read
+	// under a dedicated mutex; only the rare positive result reaches the
+	// counter store, whose write shares the cost profile of the activation
+	// counters this handler already bumps unconditionally above.
+	if p.consumeFilterDiagFollowUp(sessionID,
+		activeFilterKeys(readOnlyOnly, excludeDestructive, excludeOpenWorld), startTime) {
+		p.recordFilterDiagnosticsFollowed()
+	}
 
 	// Build arguments map for activity logging (Spec 024)
 	args := map[string]interface{}{
@@ -1373,9 +1839,23 @@ func (p *MCPProxyServer) handleRetrieveToolsWithMode(ctx context.Context, reques
 	// servers' tools, so switching costs no re-index. The shared index remains
 	// the allow-all fallback; profileScope still post-filters as defense in depth
 	// (and covers the fallback path below).
-	profileName, profileScope := p.resolveActiveProfile(ctx)
+	//
+	// A deny-all scope (an empty profile, or the scope a stale agent-token pin
+	// resolves to) deliberately skips ForProfile: that call lazily CREATES and
+	// caches an on-disk per-profile index, so honoring it would let a request
+	// that is allowed to see nothing leave a new index directory behind — for a
+	// profile that may no longer exist. The post-filter below returns the same
+	// empty result set from the shared index.
+	profileName, profileScope, profileIdx := p.resolveActiveProfileWithIndex(ctx)
+	// Spec 104 FR-016a: the cache stamp is the authorization THIS search runs
+	// under, captured now rather than re-resolved when the response is cut.
+	// The index/snapshot pair is threaded through too (Spec 105 PR D review
+	// round 17 MUST-FIX): cacheAuthorizationWith derives the stamped
+	// ProfileServers from this exact pair, never a second, independently
+	// resolved one.
+	producer := p.cacheAuthorizationWith(ctx, profileName, profileScope, profileIdx)
 	searchIndex := p.index
-	if profileName != "" {
+	if profileName != "" && !profileScope.DeniesAll() {
 		if pIdx, perr := p.index.ForProfile(profileName); perr == nil && pIdx != nil {
 			searchIndex = pIdx
 		} else if perr != nil {
@@ -1426,7 +1906,11 @@ func (p *MCPProxyServer) handleRetrieveToolsWithMode(ctx context.Context, reques
 	droppedCount := 0
 	for _, result := range results {
 		serverName := result.Tool.ServerName
-		toolName := result.Tool.Name
+		// The RAW tool name, derived from the index hit exactly once (Spec 105
+		// FR-009): the index reads identity back from the docID, so a raw
+		// "a:erase" on server "a" (canonical "a:a:erase") is gated below as
+		// itself rather than as the suffix sibling "erase".
+		toolName := config.RawToolName(result.Tool)
 		if serverName == "" {
 			// Fallback: try to extract from "server:tool" format
 			if parts := strings.SplitN(result.Tool.Name, ":", 2); len(parts) == 2 {
@@ -1510,7 +1994,12 @@ func (p *MCPProxyServer) handleRetrieveToolsWithMode(ctx context.Context, reques
 
 	// Spec 035 F4: Resolve annotations for each result and apply annotation-based filtering
 	// before building the MCP tool response. This allows agents to self-restrict discovery.
+	//
+	// Spec 094: the same pass records WHY each candidate was withheld, so a
+	// caller can tell "no such tool" from "withheld by a filter, and here is
+	// the remediation". filterDiag stays nil unless a filter was active.
 	annotationFilterActive := readOnlyOnly || excludeDestructive || excludeOpenWorld
+	var filterDiag *filterDiagnostics
 	if annotationFilterActive {
 		var annotatedResults []annotatedSearchResult
 		for i, result := range results {
@@ -1534,7 +2023,8 @@ func (p *MCPProxyServer) handleRetrieveToolsWithMode(ctx context.Context, reques
 			})
 		}
 
-		filtered := filterByAnnotations(annotatedResults, readOnlyOnly, excludeDestructive, excludeOpenWorld)
+		filtered, diag := filterByAnnotationsWithDiagnostics(annotatedResults, readOnlyOnly, excludeDestructive, excludeOpenWorld)
+		filterDiag = diag
 		var filteredResults []*config.SearchResult
 		for _, ar := range filtered {
 			filteredResults = append(filteredResults, results[ar.resultIndex])
@@ -1550,7 +2040,9 @@ func (p *MCPProxyServer) handleRetrieveToolsWithMode(ctx context.Context, reques
 	// ranked order of `results` is already final here — the mode selects
 	// serialization only (FR-007).
 	entryOpts := toolEntryOpts{includeStats: includeStats}
-	var mcpTools []map[string]interface{}
+	// Issue #953: must be non-nil so zero matches serialize as [] — strict MCP
+	// clients crash iterating a null tools array.
+	mcpTools := make([]map[string]interface{}, 0, len(results))
 	for _, result := range results {
 		mcpTools = append(mcpTools, p.buildToolEntry(result, responseMode, entryOpts))
 	}
@@ -1596,6 +2088,14 @@ func (p *MCPProxyServer) handleRetrieveToolsWithMode(ctx context.Context, reques
 		"usage_instructions": usageInstructions,
 	}
 
+	// Spec 094 (FR-001): explain the annotation filters only when they actually
+	// withheld something. On the happy path — no filters, or filters that
+	// omitted nothing — the key is absent and the response stays byte-identical
+	// to the pre-feature one.
+	if filterDiag != nil && filterDiag.OmittedTotal >= 1 {
+		response["filter_diagnostics"] = filterDiag
+	}
+
 	// Spec 085 (FR-009): compact responses carry one deterministic hint line
 	// explaining the lossy marker and the describe_tool second stage. Full
 	// mode stays byte-identical (FR-006) — no hint key at all.
@@ -1632,6 +2132,17 @@ func (p *MCPProxyServer) handleRetrieveToolsWithMode(ctx context.Context, reques
 		response["notice"] = fmt.Sprintf(
 			"%d relevant tool(s) exist but are locked; retry with include_disabled:true for details and remediation.",
 			droppedCount)
+	}
+
+	// Issue #969 (Phase 0): silent-unavailability baseline. droppedCount is the
+	// authoritative tally of locked/quarantined matches this response withheld
+	// (index hits that failed the visibility gate, plus the quarantined
+	// second-pass entries) — out-of-scope servers are excluded upstream, so this
+	// counts only tools the caller could have had. Without include_disabled the
+	// caller never sees them, which is exactly the invisibility preflight exists
+	// to remove. One increment per response, never per tool.
+	if !includeDisabled && droppedCount > 0 {
+		p.recordDiscoveryOmission()
 	}
 
 	// Spec 035 F2: Session risk analysis — analyze all connected servers' tool annotations
@@ -1692,10 +2203,68 @@ func (p *MCPProxyServer) handleRetrieveToolsWithMode(ctx context.Context, reques
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to serialize results: %v", err)), nil
 	}
 
-	// Emit success event with args and response (Spec 024)
-	p.emitActivityInternalToolCall("retrieve_tools", "", "", "", sessionID, requestID, "success", "", time.Since(startTime).Milliseconds(), activityArgs, response, nil, "")
+	// A discovery response is a tool response like any other: enforce
+	// tool_response_limit and park the full payload behind a read_cache key.
+	// The record path is PINNED to "tools" rather than inferred: the banner
+	// promises tool entries, and the inference heuristic prefers the array with
+	// the most elements — which here can be the Spec 049 "disabled" list (it
+	// can outnumber the callable results) or, with ≤2 results, an array nested
+	// inside a tool's input schema. Pinning is what makes paginableUnits =
+	// len(mcpTools) the right guard too: it counts units of the same array the
+	// key pages, so the single-record short-circuit (0 or 1 entries: nothing to
+	// subdivide, text flows through unchanged) applies to the right array.
+	// `args` (not activityArgs) is the cache-key derivation input.
+	text := string(jsonResult)
+	var wasTruncated bool
+	if routingMode != config.RoutingModeCodeExecution {
+		// The code-execution surface does not register read_cache (see
+		// buildCodeExecModeTools), so a banner there would point the agent
+		// at an unavailable tool — the same reasoning that pins it to full mode.
+		text, wasTruncated = maybeTruncateAndCacheTextPinned(
+			text,
+			"retrieve_tools",
+			args,
+			len(mcpTools),
+			"tools",
+			p.currentTruncator(),
+			p.cacheStoreAs(producer),
+			p.logger,
+		)
+	}
+	if wasTruncated {
+		p.logger.Info("retrieve_tools output exceeded the response limit and was truncated",
+			zap.String("query", query),
+			zap.Int("tools", len(mcpTools)),
+			zap.Int("full_bytes", len(jsonResult)),
+		)
+	}
 
-	return mcp.NewToolResultText(string(jsonResult)), nil
+	// Issue #969 (Phase 0): baseline engagement counters. Hooked HERE, after
+	// truncation, rather than at the attach site: tool_response_limit can cut
+	// the block back out of the payload (SimpleTruncate is a plain tail cut),
+	// and a block the agent never received is neither an emission to count nor
+	// something a later call can "follow". `emitted` is the denominator the
+	// followed/emitted ratio divides by, so overcounting it would silently
+	// understate engagement — the one number these counters exist to measure.
+	// Counts only; the note is in-memory and identity-free.
+	//
+	// The note is stamped with DELIVERY time (now), not the request's start
+	// time: overlapping calls in one session can finish out of order, so start
+	// time would order the notes wrongly, and a follow-up can only react to a
+	// block that had already reached the agent.
+	if filterDiag != nil && filterDiag.OmittedTotal >= 1 && filterDiagnosticsSurvived(text, wasTruncated) {
+		p.recordFilterDiagnosticsEmitted(filterDiag)
+		p.noteFilterDiagnostics(sessionID, filterDiag, time.Now())
+	}
+
+	// Emit success event with args and response (Spec 024). The FULL response
+	// goes to the activity log — truncation only shapes what the agent sees
+	// (same order handleReadCache uses). Which is exactly why wasTruncated has
+	// to travel with it: the stored response is not what the agent paid for, and
+	// nothing downstream can tell the two apart without the flag (Spec 103).
+	p.emitActivityInternalToolCallTruncated("retrieve_tools", "", "", "", sessionID, requestID, "success", "", time.Since(startTime).Milliseconds(), activityArgs, response, nil, "", wasTruncated)
+
+	return mcp.NewToolResultText(text), nil
 }
 
 // handleCallToolRead implements the call_tool_read functionality (Spec 018)
@@ -1746,15 +2315,20 @@ func (p *MCPProxyServer) handleCallToolVariant(ctx context.Context, request mcp.
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Missing required parameter 'name': %v", err)), nil
 	}
+	// Whitespace is never significant in a canonical id; case is (every gate
+	// below keys on the exact name), so padding is trimmed and nothing else.
+	toolName = strings.TrimSpace(toolName)
 
-	// Parse server and tool name early for activity logging
+	// Parse server and tool name early for activity logging, through the same
+	// splitServerTool the describe_tool path uses: it trims EACH segment, so
+	// "github: create_issue" resolves exactly like "github:create_issue"
+	// instead of missing every exact-name gate below and being dispatched
+	// upstream padded. The canonical id is rebuilt from the trimmed segments
+	// so the validator cache key and every message see the normalized form.
 	var serverName, actualToolName string
-	if strings.Contains(toolName, ":") {
-		parts := strings.SplitN(toolName, ":", 2)
-		if len(parts) == 2 {
-			serverName = parts[0]
-			actualToolName = parts[1]
-		}
+	if parsedServer, parsedTool, ok := splitServerTool(toolName); ok {
+		serverName, actualToolName = parsedServer, parsedTool
+		toolName = parsedServer + ":" + parsedTool
 	}
 
 	// Helper to get session ID for activity logging
@@ -1763,6 +2337,94 @@ func (p *MCPProxyServer) handleCallToolVariant(ctx context.Context, request mcp.
 			return sess.SessionID()
 		}
 		return ""
+	}
+
+	// Mint the activity request id HERE, above the first policy gate, not at
+	// the point the upstream call is prepared. Intent extraction and intent
+	// validation below can both block, and a block emitted before the id exists
+	// is an activity record nothing can be correlated with. serverName and
+	// actualToolName may still be empty for a malformed tool name; the
+	// timestamp alone keeps the id unique.
+	requestID := mintActivityRequestID(serverName, actualToolName)
+
+	// Get optional args parameter - handle both new JSON string format and
+	// legacy object format. Parsed HERE, above the first gate, because the
+	// audit attempt below hashes the arguments (Spec 107 FR-015); a parse
+	// failure is still answered at the same point it always was (after the
+	// intent gates), so the refusal order is unchanged.
+	var args map[string]interface{}
+	var argsErrMsg string
+	if argsJSON := request.GetString("args_json", ""); argsJSON != "" {
+		if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+			args = nil
+			argsErrMsg = fmt.Sprintf("Invalid args_json format: %v", err)
+		}
+	}
+
+	// Fallback to legacy object format for backward compatibility. An empty
+	// args_json ("{}", "null") decodes without error to a nil/zero-length
+	// map, which must not win over a populated 'args' object supplied
+	// alongside it (#1317) — only args_json actually contributing a key
+	// counts as "provided", hence len() rather than a nil check.
+	if len(args) == 0 && argsErrMsg == "" && request.Params.Arguments != nil {
+		if argumentsMap, ok := request.Params.Arguments.(map[string]interface{}); ok {
+			if argsParam, ok := argumentsMap["args"]; ok {
+				if argsMap, ok := argsParam.(map[string]interface{}); ok {
+					args = argsMap
+				}
+			}
+			// #1317: some callers place the upstream tool's own parameters as
+			// top-level siblings of 'name' instead of nesting them under
+			// 'args' as the schema documents. Recover them as a last resort,
+			// only when neither 'args' nor 'args_json' produced anything, so
+			// a correctly-nested call is never second-guessed.
+			if len(args) == 0 {
+				if flattened := flattenedCallToolArgs(argumentsMap); len(flattened) > 0 {
+					args = flattened
+				}
+			}
+		}
+	}
+
+	// Spec 057 / Profiles v2: the active profile (token pin > URL > session
+	// set_profile). Resolved once, up here, because the audit attempt stamps
+	// it; the profile-scope GATE itself still runs below, after the intent
+	// gates, exactly where it always did. WithIndex (not plain
+	// resolveActiveProfile — a pure wrapper around this that discards the
+	// index) so the SAME (name, scope, idx) triple resolved here also feeds
+	// cacheAuthorizationWith's caller-intersected ProfileServers stamp below
+	// (Spec 105 PR D review round 17) — one resolution for the whole call,
+	// never a second, independent one that could pair a decision made
+	// against this snapshot with an index built from a later one.
+	profileSlug, profileScope, profileIdx := p.resolveActiveProfileWithIndex(ctx)
+
+	// Spec 107 T103: the audit attempt, installed BEFORE the first gate so
+	// every refusal below — the intent gates included — writes its `authz
+	// deny` line from it. Surface is the variant, or `rest` when the call
+	// entered through /api/v1/tools/call (the mount decides, never a header).
+	{
+		auditSurface := toolVariant
+		if meta, ok := reqcontext.GetRequestMeta(ctx); ok && meta.Mount == reqcontext.MountAPI {
+			auditSurface = auditSurfaceREST
+		}
+		var auditClientName, auditClientVersion string
+		if sid := getSessionID(); sid != "" {
+			if sessInfo := p.sessionStore.GetSession(sid); sessInfo != nil {
+				auditClientName, auditClientVersion = sessInfo.ClientName, sessInfo.ClientVersion
+			}
+		}
+		ctx = p.installAuditAttempt(ctx, auditAttemptSpec{
+			RequestID:     requestID,
+			SessionID:     getSessionID(),
+			Server:        serverName,
+			Tool:          actualToolName,
+			Operation:     contracts.ToolVariantToOperationType[toolVariant],
+			Surface:       auditSurface,
+			ClientName:    auditClientName,
+			ClientVersion: auditClientVersion,
+			Profile:       profileSlug,
+			Args:          args,
+		})
 	}
 
 	// Extract intent (optional - operation_type is inferred from tool variant)
@@ -1778,7 +2440,7 @@ func (p *MCPProxyServer) handleCallToolVariant(ctx context.Context, request mcp.
 		if logTool == "" {
 			logTool = toolName
 		}
-		p.emitActivityPolicyDecision(logServer, logTool, getSessionID(), "blocked", errMsg)
+		p.emitActivityPolicyDecision(ctx, logServer, logTool, getSessionID(), requestID, "blocked", errMsg, telemetry.BlockReasonIntentInvalid)
 		return mcp.NewToolResultError(errMsg), nil
 	}
 
@@ -1794,27 +2456,26 @@ func (p *MCPProxyServer) handleCallToolVariant(ctx context.Context, request mcp.
 		if logTool == "" {
 			logTool = toolName
 		}
-		p.emitActivityPolicyDecision(logServer, logTool, getSessionID(), "blocked", "Intent validation failed")
+		p.emitActivityPolicyDecision(ctx, logServer, logTool, getSessionID(), requestID, "blocked", "Intent validation failed", telemetry.BlockReasonIntentRejected)
 		return errResult, nil
 	}
 
-	// Get optional args parameter - handle both new JSON string format and legacy object format
-	var args map[string]interface{}
-	if argsJSON := request.GetString("args_json", ""); argsJSON != "" {
-		if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("Invalid args_json format: %v", err)), nil
-		}
-	}
-
-	// Fallback to legacy object format for backward compatibility
-	if args == nil && request.Params.Arguments != nil {
-		if argumentsMap, ok := request.Params.Arguments.(map[string]interface{}); ok {
-			if argsParam, ok := argumentsMap["args"]; ok {
-				if argsMap, ok := argsParam.(map[string]interface{}); ok {
-					args = argsMap
-				}
-			}
-		}
+	// Arguments were parsed above the first gate (audit attempt); a parse
+	// failure is answered here, where it always was (pre-Spec-107 behaviour:
+	// this has always short-circuited before the profile/token-scope/
+	// target-tier/quarantine/callability gates below, and that response
+	// order is unchanged here). The attempt already exists on ctx, so this
+	// still owes the count invariant its line — but as an `authz deny`, not
+	// an `authz allow` + `tool_call error`: those gates never ran, so FR-012
+	// ("allow after last gate") forbids recording this dispatch as
+	// authorized (round-2 cross-review finding, PR-D — round-1's fix wrote
+	// `allow` here, which would let an out-of-scope or quarantined target
+	// submitted with malformed args_json be recorded as authorized even
+	// though authorization was never completed). "other" is the correct
+	// reason: malformed args_json is not one of FR-012's named gates.
+	if argsErrMsg != "" {
+		p.auditAuthz(ctx, "deny", telemetry.BlockReasonOther)
+		return mcp.NewToolResultError(argsErrMsg), nil
 	}
 
 	// Handle upstream tools via upstream manager (requires server:tool format)
@@ -1830,18 +2491,74 @@ func (p *MCPProxyServer) handleCallToolVariant(ctx context.Context, request mcp.
 	// Spec 057 / Profiles v2: profile filter — runs independently of agent-scope
 	// so that unauthenticated /mcp/p/<slug> connections (AdminContext) are still
 	// filtered, and so a base /mcp session that ran set_profile is bounded too.
-	if _, profileScope := p.resolveActiveProfile(ctx); profileScope != nil && !profileScope.Allows(serverName) {
+	// The same resolution (taken once, above the intent gates, for the audit
+	// attempt) is the read_cache producer stamp (Spec 104 FR-016a), captured
+	// here — at authorization time, before the upstream call — so a profile
+	// deleted or narrowed while the call is in flight cannot re-stamp a
+	// response that was authorized under the wider scope. profileIdx is the
+	// same index that (name, scope) triple was resolved against (see above),
+	// never re-derived here — cacheAuthorizationWith's caller-intersected
+	// ProfileServers stamp needs it (Spec 105 PR D review round 17).
+	producer := p.cacheAuthorizationWith(ctx, profileSlug, profileScope, profileIdx)
+	if profileScope != nil && !profileScope.Allows(serverName) {
 		errMsg := fmt.Sprintf("server '%s' is not in profile '%s'", serverName, profileScope.Name)
-		p.emitActivityPolicyDecision(serverName, actualToolName, getSessionID(), "blocked", errMsg)
+		p.emitActivityPolicyDecision(ctx, serverName, actualToolName, getSessionID(), requestID, "blocked", errMsg, telemetry.BlockReasonProfileScope)
 		return mcp.NewToolResultError(errMsg), nil
 	}
 
-	// Spec 028: Enforce agent token scope restrictions
-	if authCtx := auth.AuthContextFromContext(ctx); authCtx != nil && !authCtx.IsAdmin() {
+	// Spec 098 FR-002: ONE evaluation of the shared policy gates — server
+	// quarantine, tool-level quarantine (Spec 032) and callability — through
+	// the same classifier the preflight evaluator uses, so a tool dispatch
+	// refuses can never preflight as `ready`. It is a pure read, taken HERE,
+	// above every gate that consumes it, and it carries the target's
+	// registration identity resolved against the SAME persisted record its
+	// quarantined / disabled verdicts are decided from (codex r6 G1): the
+	// identity gate, the target-tier gate, the intent validation and the
+	// server-level verdicts below all answer from this one read, so the tier
+	// a token was authorized against, the annotations the variant is
+	// validated against and the server state the identity refusal defers to
+	// can never come from two different snapshots (Spec 105 FR-009). It is
+	// also the dispatch's ONLY persisted read (codex r7 H1): the live
+	// certification further down hydrates from gate.serverConfig rather
+	// than re-reading storage, so an operator's write that lands after this
+	// point owns the NEXT dispatch, not a second verdict for this one.
+	// Found=false means the proxy holds no metadata for the pair (server
+	// unknown, tool undiscovered, or no runtime). The pair was split from the
+	// canonical id above, so it is read EXACTLY: a raw name that starts with
+	// the server's own prefix must not be normalized again. The response
+	// SELECTION further down keeps the long-standing dispatch order
+	// (quarantine → approval lock → generic block).
+	gate := p.evaluateExactToolGate(serverName, actualToolName)
+	identity := gate.identity
+	annotations, annotationsFound := identity.Annotations, identity.Found
+	// Spec 107 (round-2 cross-review finding, PR-D): the attempt was stamped
+	// with the caller-chosen variant's operation before this point, the
+	// earliest the target's real tier is known; correct it now so every
+	// line from here on (including a deny below) reports the tool's actual
+	// tier rather than the door the caller happened to use. Only when the
+	// tool's annotations were actually found: tierForAnnotations' !found
+	// fallback is "destructive" for AUTHORIZATION purposes (deny by
+	// default), which would misrepresent an unresolved/nonexistent target
+	// as maximally risky on the audit line rather than simply "unknown to
+	// the proxy" — the variant remains the best available signal there.
+	if annotationsFound {
+		auditSetOperation(ctx, tierForAnnotations(annotations, annotationsFound))
+	}
+	if p.dispatchGatePause != nil {
+		p.dispatchGatePause(serverName, actualToolName)
+	}
+
+	// Spec 028: Enforce agent token scope restrictions. The server-scope and
+	// variant-permission gates run before the identity gate so a scoped
+	// caller learns nothing about a server outside its scope from the shape
+	// of the refusal.
+	authCtx := auth.AuthContextFromContext(ctx)
+	scopedCaller := authCtx != nil && !authCtx.IsAdmin()
+	if scopedCaller {
 		// Check server scope
 		if !authCtx.CanAccessServer(serverName) {
 			errMsg := fmt.Sprintf("Server '%s' is not in scope for this agent token", serverName)
-			p.emitActivityPolicyDecision(serverName, actualToolName, getSessionID(), "blocked", errMsg)
+			p.emitActivityPolicyDecision(ctx, serverName, actualToolName, getSessionID(), requestID, "blocked", errMsg, telemetry.BlockReasonTokenScope)
 			return mcp.NewToolResultError(errMsg), nil
 		}
 		// Check permission scope — map tool variant to required permission
@@ -1856,7 +2573,62 @@ func (p *MCPProxyServer) handleCallToolVariant(ctx context.Context, request mcp.
 		}
 		if requiredPerm != "" && !authCtx.HasPermission(requiredPerm) {
 			errMsg := fmt.Sprintf("Insufficient permissions: '%s' requires '%s' permission", toolVariant, requiredPerm)
-			p.emitActivityPolicyDecision(serverName, actualToolName, getSessionID(), "blocked", errMsg)
+			p.emitActivityPolicyDecision(ctx, serverName, actualToolName, getSessionID(), requestID, "blocked", errMsg, telemetry.BlockReasonTokenPermission)
+			return mcp.NewToolResultError(errMsg), nil
+		}
+	}
+
+	// Spec 105 FR-009 (research D4): a name the discovery snapshot of a KNOWN,
+	// CONNECTED server with a POPULATED snapshot does not contain has no
+	// resolvable registration identity, so no permission tier can be
+	// established for it. It is refused with the insufficient-permission body
+	// and zero upstream calls for EVERY caller — administrators included (spec
+	// Edge Case (2), SC-005's named exception): an unverified name must never
+	// reach an upstream on anyone's behalf. Two cases are deliberately NOT
+	// this condition and fall through to the verdicts that always owned them:
+	// a server the snapshot does not hold (server-existence handling below),
+	// and a server whose snapshot is not authoritative because it is
+	// quarantined, disabled, disconnected or still connecting (the shared
+	// gate's quarantine/disabled answers and the not-connected /
+	// reconnect_on_use handling further down, in their pre-105 order).
+	// "Quarantined" and "disabled" are the PERSISTED record's word here, the
+	// same read gate.serverQuarantined() / gate.callable() answer from (codex
+	// r6 G1), so this refusal — which runs first, ahead of the scoped
+	// target-tier gate that must stay ahead of the quarantine verdict — can
+	// be true only when that read cannot answer quarantined or disabled, and
+	// an operator's write that the StateView has not caught up with yet
+	// answers the server-level verdict for every name on the server alike.
+	if identity.Unresolved() {
+		errMsg := unresolvedToolIdentityMessage(serverName, actualToolName, identity.DiscoveryDone)
+		p.logger.Debug("handleCallToolVariant: refusing unresolved tool identity",
+			zap.String("server_name", serverName),
+			zap.String("tool_name", actualToolName),
+			zap.Bool("scoped_caller", scopedCaller))
+		// Logged as tool_not_callable, not token_permission: the refusal is
+		// about the TOOL's identity, not the caller's grant — it fires for
+		// administrators too, and the token_permission bucket would misreport
+		// an identity failure as a scope problem. The telemetry reason enum is
+		// closed (internal/telemetry/preflight_counters.go, the anonymity
+		// contract), so the closest existing non-token member is reused
+		// rather than widening it.
+		p.emitActivityPolicyDecision(ctx, serverName, actualToolName, getSessionID(), requestID, "blocked", errMsg, telemetry.BlockReasonToolNotCallable)
+		return mcp.NewToolResultError(errMsg), nil
+	}
+
+	if scopedCaller {
+		// Spec 104 FR-016f / Spec 105 FR-009: the variant is the CALLER's
+		// choice, so it is not the tier that matters. Authorize against the
+		// TARGET tool's annotation-derived tier, through the same classifier
+		// direct mode and code execution use (lookupToolPermission), and do
+		// it before intent validation so that a token lacking the tier is
+		// refused on permission grounds whether or not strict server
+		// validation would have let the variant mismatch through. A read-only
+		// token could otherwise drive a write tool via call_tool_read
+		// (always) and a destructive one (strict off).
+		targetPerm := tierForAnnotations(annotations, annotationsFound)
+		if targetPerm != "" && !authCtx.HasPermission(targetPerm) {
+			errMsg := fmt.Sprintf("Permission denied: token does not have '%s' permission required for tool '%s:%s'", targetPerm, serverName, actualToolName)
+			p.emitActivityPolicyDecision(ctx, serverName, actualToolName, getSessionID(), requestID, "blocked", errMsg, telemetry.BlockReasonTokenPermission)
 			return mcp.NewToolResultError(errMsg), nil
 		}
 	}
@@ -1866,9 +2638,6 @@ func (p *MCPProxyServer) handleCallToolVariant(ctx context.Context, request mcp.
 		zap.String("tool_name", toolName),
 		zap.String("server_name", serverName),
 		zap.String("intent_operation", intent.OperationType))
-
-	// Look up tool annotations from StateView for server annotation validation
-	annotations := p.lookupToolAnnotations(serverName, actualToolName)
 
 	// Spec 035: Determine content trust level based on openWorldHint annotation
 	contentTrust := contracts.ContentTrustForTool(annotations)
@@ -1883,7 +2652,7 @@ func (p *MCPProxyServer) handleCallToolVariant(ctx context.Context, request mcp.
 	if errResult := p.validateIntentAgainstServer(intent, toolVariant, serverName, actualToolName, annotations); errResult != nil {
 		// Record activity error for server annotation mismatch
 		reason := fmt.Sprintf("Intent rejected: tool variant '%s' conflicts with server annotations for %s:%s", toolVariant, serverName, actualToolName)
-		p.emitActivityPolicyDecision(serverName, actualToolName, getSessionID(), "blocked", reason)
+		p.emitActivityPolicyDecision(ctx, serverName, actualToolName, getSessionID(), requestID, "blocked", reason, telemetry.BlockReasonIntentRejected)
 		return errResult, nil
 	}
 
@@ -1910,63 +2679,57 @@ func (p *MCPProxyServer) handleCallToolVariant(ctx context.Context, request mcp.
 		}
 	}
 
-	// Generate requestID for activity tracking
-	requestID := fmt.Sprintf("%d-%s-%s", time.Now().UnixNano(), serverName, actualToolName)
+	// requestID was minted above the first policy gate, near the top of this
+	// handler — every activity event below shares that one value.
 
-	// Spec 057 FR-011 / Profiles v2: effective profile slug (token pin > URL >
-	// session set_profile) tagged on every activity record (success AND error
-	// paths) at top-level metadata["profile"].
-	profileSlug, _ := p.resolveActiveProfile(ctx)
+	// Spec 057 FR-011 / Profiles v2: profileSlug (resolved above with the
+	// profile filter; token pin > URL > session set_profile) is tagged on every
+	// activity record (success AND error paths) at top-level metadata["profile"].
 
 	// Spec 028: Inject auth identity into a separate copy for activity logging only.
 	// The original args must not be mutated — upstream servers reject unknown fields
 	// (e.g. FastMCP's Pydantic validate_call). See #322.
 	activityArgs := injectAuthMetadata(ctx, args)
 
-	// Check if server is quarantined before calling tool
-	serverConfig, err := p.storage.GetUpstreamServer(serverName)
-	if err == nil && serverConfig.Quarantined {
+	// The shared policy gates, from the ONE evaluation taken above the
+	// identity gate (Spec 098 FR-002; codex r6 G1). The response SELECTION
+	// keeps the long-standing dispatch order (quarantine → approval lock →
+	// generic block).
+	if gate.serverQuarantined() {
 		p.logger.Debug("handleCallToolVariant: server is quarantined",
 			zap.String("server_name", serverName))
 
 		// Emit policy decision event for quarantine block
-		p.emitActivityPolicyDecision(serverName, actualToolName, getSessionID(), "blocked", "Server is quarantined for security review")
+		p.emitActivityPolicyDecision(ctx, serverName, actualToolName, getSessionID(), requestID, "blocked", "Server is quarantined for security review", telemetry.BlockReasonServerQuarantined)
 
 		// Server is in quarantine - return security warning with tool analysis
 		return p.handleQuarantinedToolCall(ctx, serverName, actualToolName, activityArgs), nil
 	}
 
-	// Check tool-level quarantine (Spec 032) - only if server is not quarantined
-	if p.config.IsQuarantineEnabled() {
-		if serverConfig != nil && !serverConfig.IsQuarantineSkipped() {
-			if approval, approvalErr := p.storage.GetToolApproval(serverName, actualToolName); approvalErr == nil {
-				if approval.Status == storage.ToolApprovalStatusPending {
-					p.logger.Debug("handleCallToolVariant: tool is pending approval (quarantined)",
-						zap.String("server_name", serverName),
-						zap.String("tool_name", actualToolName))
+	switch gate.lockStatus {
+	case storage.ToolApprovalStatusPending:
+		p.logger.Debug("handleCallToolVariant: tool is pending approval (quarantined)",
+			zap.String("server_name", serverName),
+			zap.String("tool_name", actualToolName))
 
-					p.emitActivityPolicyDecision(serverName, actualToolName, getSessionID(), "blocked",
-						"Tool is pending approval (new unapproved tool)")
+		p.emitActivityPolicyDecision(ctx, serverName, actualToolName, getSessionID(), requestID, "blocked",
+			"Tool is pending approval (new unapproved tool)", telemetry.BlockReasonToolPendingApproval)
 
-					return toolPendingApprovalResult(serverName, actualToolName, approval), nil
-				}
-				if approval.Status == storage.ToolApprovalStatusChanged {
-					p.logger.Debug("handleCallToolVariant: tool description changed (quarantined)",
-						zap.String("server_name", serverName),
-						zap.String("tool_name", actualToolName))
+		return toolPendingApprovalResult(serverName, actualToolName, gate.approval), nil
+	case storage.ToolApprovalStatusChanged:
+		p.logger.Debug("handleCallToolVariant: tool description changed (quarantined)",
+			zap.String("server_name", serverName),
+			zap.String("tool_name", actualToolName))
 
-					p.emitActivityPolicyDecision(serverName, actualToolName, getSessionID(), "blocked",
-						"Tool description/schema changed since last approval")
+		p.emitActivityPolicyDecision(ctx, serverName, actualToolName, getSessionID(), requestID, "blocked",
+			"Tool description/schema changed since last approval", telemetry.BlockReasonToolChanged)
 
-					return toolChangedApprovalResult(serverName, actualToolName, approval), nil
-				}
-			}
-		}
+		return toolChangedApprovalResult(serverName, actualToolName, gate.approval), nil
 	}
 
-	if !p.isToolCallable(serverName, actualToolName) {
-		errMsg := p.blockedToolMessage(serverName, actualToolName)
-		p.emitActivityPolicyDecision(serverName, actualToolName, sessionID, "blocked", errMsg)
+	if !gate.callable() {
+		errMsg := gate.blockedMessage()
+		p.emitActivityPolicyDecision(ctx, serverName, actualToolName, sessionID, requestID, "blocked", errMsg, telemetry.BlockReasonToolNotCallable)
 		return mcp.NewToolResultError(errMsg), nil
 	}
 
@@ -1990,13 +2753,15 @@ func (p *MCPProxyServer) handleCallToolVariant(ctx context.Context, request mcp.
 				intentMap = intent.ToMap()
 			}
 			errMsg := fmt.Sprintf("invalid arguments for %s: %s", toolName, detail)
-			p.emitActivityToolCallStarted(serverName, actualToolName, sessionID, requestID, activitySource, activityArgs)
-			p.emitActivityToolCallCompleted(serverName, actualToolName, sessionID, requestID, activitySource, "error", errMsg, 0, activityArgs, errMsg, false, toolVariant, intentMap, contentTrust, profileSlug, 0, 0, "", nil)
+			auditNoteErrorClass(ctx, audit.ErrorClassValidation)
+			p.emitActivityToolCallStarted(ctx, serverName, actualToolName, sessionID, requestID, activitySource, activityArgs)
+			p.emitActivityToolCallCompleted(ctx, serverName, actualToolName, sessionID, requestID, activitySource, "error", errMsg, 0, activityArgs, errMsg, false, toolVariant, intentMap, contentTrust, profileSlug, 0, 0, "", nil, "")
 			return invalidParamsErrorResult(toolName, meta.ParamsJSON, detail), nil
 		}
 	}
 
 	// Check connection status before attempting tool call to prevent hanging
+	var certified toolIdentity
 	if client, exists := p.upstreamManager.GetClient(serverName); exists {
 		if !client.IsConnected() {
 			state := client.GetState()
@@ -2011,10 +2776,42 @@ func (p *MCPProxyServer) handleCallToolVariant(ctx context.Context, request mcp.
 			if intent != nil {
 				intentMap = intent.ToMap()
 			}
-			p.emitActivityToolCallStarted(serverName, actualToolName, sessionID, requestID, activitySource, activityArgs)
-			p.emitActivityToolCallCompleted(serverName, actualToolName, sessionID, requestID, activitySource, "error", errMsg, 0, activityArgs, errMsg, false, toolVariant, intentMap, contentTrust, profileSlug, 0, 0, "", nil)
+			auditNoteErrorClass(ctx, audit.ErrorClassUpstreamUnavailable)
+			p.emitActivityToolCallStarted(ctx, serverName, actualToolName, sessionID, requestID, activitySource, activityArgs)
+			p.emitActivityToolCallCompleted(ctx, serverName, actualToolName, sessionID, requestID, activitySource, "error", errMsg, 0, activityArgs, errMsg, false, toolVariant, intentMap, contentTrust, profileSlug, 0, 0, "", nil, "")
 			return mcp.NewToolResultError(errMsg), nil
 		}
+		// Spec 105 FR-009 (research D4), astra r1 I3: the identity gate
+		// above deferred because the StateView read the server as not
+		// connected, yet the live client IS connected — the connected event
+		// is still in flight or was dropped. The not-connected verdict the
+		// deferral relied on did not fire, so re-read the snapshot and refuse
+		// anything short of a CERTIFIED name here, with zero upstream calls
+		// — an unlisted name, and equally a name the not-hydrated snapshot
+		// still lists from the previous generation's retained set (codex r4
+		// E1). The tier gate already ran with the destructive fallback (the
+		// strictest tier), so no re-check is needed for scoped callers. The
+		// re-read also runs for a HYDRATED snapshot (astra r2 C3): the live
+		// client found connected here is the authority on which connection
+		// the snapshot's stamp describes, so a name certified by a previous
+		// connection is refused with the discovery-window body. The re-read
+		// covers the StateView and the live client only: the persisted
+		// record is the ONE the gate captured above (codex r7 H1), so an
+		// operator's write since then cannot turn the gate's admission into
+		// an identity refusal — it owns the next dispatch, whose gate reads
+		// it.
+		live, errMsg, refuse := p.liveIdentityRefusal(gate.serverConfig, serverName, actualToolName, identity, client)
+		if refuse {
+			p.logger.Debug("handleCallToolVariant: refusing unresolved tool identity (live client connected, snapshot stale)",
+				zap.String("server_name", serverName),
+				zap.String("tool_name", actualToolName))
+			p.emitActivityPolicyDecision(ctx, serverName, actualToolName, sessionID, requestID, "blocked", errMsg, telemetry.BlockReasonToolNotCallable)
+			return mcp.NewToolResultError(errMsg), nil
+		}
+		// The dispatch below is pinned to the generation this check
+		// certified (codex r3 D2): the managed client re-checks it after
+		// the admission queue and immediately before the transport.
+		certified = live
 	} else {
 		// Get list of available servers for helpful error message
 		availableServers := p.upstreamManager.GetAllServerNames()
@@ -2036,20 +2833,21 @@ func (p *MCPProxyServer) handleCallToolVariant(ctx context.Context, request mcp.
 		if intent != nil {
 			intentMap = intent.ToMap()
 		}
-		p.emitActivityToolCallStarted(serverName, actualToolName, sessionID, requestID, activitySource, activityArgs)
-		p.emitActivityToolCallCompleted(serverName, actualToolName, sessionID, requestID, activitySource, "error", errMsg, 0, activityArgs, errMsg, false, toolVariant, intentMap, contentTrust, profileSlug, 0, 0, "", nil)
+		auditNoteErrorClass(ctx, audit.ErrorClassUpstreamUnavailable)
+		p.emitActivityToolCallStarted(ctx, serverName, actualToolName, sessionID, requestID, activitySource, activityArgs)
+		p.emitActivityToolCallCompleted(ctx, serverName, actualToolName, sessionID, requestID, activitySource, "error", errMsg, 0, activityArgs, errMsg, false, toolVariant, intentMap, contentTrust, profileSlug, 0, 0, "", nil, "")
 		return mcp.NewToolResultError(errMsg), nil
 	}
 
 	// Emit activity started event with determined source
-	p.emitActivityToolCallStarted(serverName, actualToolName, sessionID, requestID, activitySource, activityArgs)
+	p.emitActivityToolCallStarted(ctx, serverName, actualToolName, sessionID, requestID, activitySource, activityArgs)
 
 	// Call tool via upstream manager — use original args without auth metadata.
 	// MCP-32: wrap with an OTLP span (tool call + upstream hop) and record
 	// tool-call latency/outcome metrics. No-ops when observability is disabled.
 	callCtx, toolSpan := p.startToolCallSpan(ctx, serverName, actualToolName, profileSlug)
 	startTime := time.Now()
-	result, err := p.upstreamManager.CallTool(callCtx, toolName, args)
+	result, err := p.dispatchOnEpoch(callCtx, certified, toolName, args)
 	duration := time.Since(startTime)
 	p.finishToolCall(toolSpan, serverName, actualToolName, duration, err)
 
@@ -2084,15 +2882,16 @@ func (p *MCPProxyServer) handleCallToolVariant(ctx context.Context, request mcp.
 		}
 	}
 
-	// Derive server ID safely (serverConfig may be nil if storage lookup failed)
+	// Derive server ID safely (the gate's server record is nil when the storage
+	// lookup failed)
 	var serverID string
-	if serverConfig != nil {
-		serverID = storage.GenerateServerID(serverConfig)
+	if gate.serverConfig != nil {
+		serverID = storage.GenerateServerID(gate.serverConfig)
 	}
 
 	// Record tool call for history (even if error)
 	toolCallRecord := &storage.ToolCallRecord{
-		ID:               fmt.Sprintf("%d-%s", time.Now().UnixNano(), actualToolName),
+		ID:               mintCorrelationID(actualToolName),
 		ServerID:         serverID,
 		ServerName:       serverName,
 		ToolName:         actualToolName,
@@ -2112,6 +2911,66 @@ func (p *MCPProxyServer) handleCallToolVariant(ctx context.Context, request mcp.
 	}
 
 	if err != nil {
+		// Spec 093 FR-010/FR-011: a concurrency-limiter shed is not an upstream
+		// failure. It answers with a retry-friendly isError result (never a
+		// protocol error), preserves its typed identity for the REST 429 mapping,
+		// and is NOT recorded here — the limiter's origin-independent seam already
+		// wrote the "rejected" activity record (FR-012), so emitting an "error"
+		// record too would double-count the same call.
+		if limitErr, isShed := asShed(err); isShed {
+			shedMsg := shedMessage(limitErr)
+			toolCallRecord.Error = shedMsg
+			if storeErr := p.storage.RecordToolCall(toolCallRecord); storeErr != nil {
+				p.logger.Warn("Failed to record shed tool call", zap.Error(storeErr))
+			}
+			p.logger.Info("Tool call shed by concurrency limiter",
+				zap.String("server", serverName),
+				zap.String("tool", actualToolName),
+				zap.String("scope", string(limitErr.Scope)),
+				zap.String("reason", string(limitErr.Reason)),
+				zap.Int("limit", limitErr.Limit))
+			recordShed(ctx, limitErr)
+			// Spec 107: the shed is this attempt's tool_call (outcome
+			// rejected) — the limiter runs after every gate, so never a
+			// second authz (research.md D6).
+			p.auditToolCallShed(ctx, limitErr, duration.Milliseconds())
+
+			var shedIntentMap map[string]interface{}
+			if intent != nil {
+				shedIntentMap = intent.ToMap()
+			}
+			internalToolName := "call_tool_" + intent.OperationType
+			p.emitActivityInternalToolCall(internalToolName, serverName, actualToolName, toolVariant, sessionID, requestID, storage.ActivityStatusRejected, shedMsg, time.Since(internalStartTime).Milliseconds(), activityArgs, nil, shedIntentMap, "")
+
+			return shedToolResult(limitErr), nil
+		}
+
+		// Spec 105 FR-009 (codex r3 D2): the connection generation moved
+		// between the identity check above and the transport, so the
+		// managed client refused to send. Nothing reached the upstream; the
+		// answer is the same discovery-window refusal the pre-dispatch gate
+		// gives a name whose generation is not certified, in the same
+		// telemetry bucket, with the started record closed as an error so
+		// the activity funnel sees the call end.
+		if errors.Is(err, managed.ErrConnectionGenerationChanged) {
+			errMsg := unresolvedToolIdentityMessage(serverName, actualToolName, false)
+			toolCallRecord.Error = errMsg
+			if storeErr := p.storage.RecordToolCall(toolCallRecord); storeErr != nil {
+				p.logger.Warn("Failed to record refused tool call", zap.Error(storeErr))
+			}
+			p.logger.Debug("handleCallToolVariant: refusing dispatch, connection generation changed since the identity was certified",
+				zap.String("server_name", serverName),
+				zap.String("tool_name", actualToolName))
+			var intentMap map[string]interface{}
+			if intent != nil {
+				intentMap = intent.ToMap()
+			}
+			auditNoteErrorClass(ctx, audit.ErrorClassUpstreamUnavailable)
+			p.emitActivityToolCallCompleted(ctx, serverName, actualToolName, sessionID, requestID, activitySource, "error", errMsg, duration.Milliseconds(), activityArgs, "", false, toolVariant, intentMap, contentTrust, profileSlug, 0, 0, "", nil, "")
+			p.emitActivityPolicyDecision(ctx, serverName, actualToolName, sessionID, requestID, "blocked", errMsg, telemetry.BlockReasonToolNotCallable)
+			return mcp.NewToolResultError(errMsg), nil
+		}
+
 		// Record error in tool call history
 		toolCallRecord.Error = err.Error()
 
@@ -2139,7 +2998,8 @@ func (p *MCPProxyServer) handleCallToolVariant(ctx context.Context, request mcp.
 		if intent != nil {
 			intentMap = intent.ToMap()
 		}
-		p.emitActivityToolCallCompleted(serverName, actualToolName, sessionID, requestID, activitySource, "error", err.Error(), duration.Milliseconds(), activityArgs, "", false, toolVariant, intentMap, contentTrust, profileSlug, 0, 0, "", nil)
+		auditNoteError(ctx, err)
+		p.emitActivityToolCallCompleted(ctx, serverName, actualToolName, sessionID, requestID, activitySource, "error", err.Error(), duration.Milliseconds(), activityArgs, "", false, toolVariant, intentMap, contentTrust, profileSlug, 0, 0, "", nil, "")
 
 		// Spec 024: Emit internal tool call event for error
 		internalToolName := "call_tool_" + intent.OperationType // e.g., "call_tool_read"
@@ -2154,8 +3014,19 @@ func (p *MCPProxyServer) handleCallToolVariant(ctx context.Context, request mcp.
 	// activation flag means "succeeded", not merely "attempted".
 	p.recordRealToolCallSuccess()
 
-	// Record successful response
+	// Issue #935: the transport hop succeeded, but the upstream may still have
+	// ANSWERED "this failed" via isError:true (bad argument value, unknown
+	// tool, server-side validation). Classify here — before encodeToonBlocks /
+	// spotlighting mutate the result in place — so the recorded message is the
+	// upstream's own words. This governs the ACTIVITY RECORD ONLY; the result
+	// itself is still forwarded to the caller verbatim below.
+	activityStatus, activityErrMsg := activityStatusForResult(result)
+
+	// Record the response. An isError answer is still a response — it is stored
+	// as one, with the upstream's explanation mirrored into Error so the tool
+	// call history agrees with the activity log.
 	toolCallRecord.Response = result
+	toolCallRecord.Error = activityErrMsg
 
 	// Count output tokens for successful response
 	if tokenMetrics != nil && p.mainServer != nil && p.mainServer.runtime != nil {
@@ -2188,7 +3059,7 @@ func (p *MCPProxyServer) handleCallToolVariant(ctx context.Context, request mcp.
 	// forwardContentResult truncates/caches it, so the read_cache store never
 	// holds an unredacted secret and a blocked response is never cached. A
 	// non-nil result means the call was blocked.
-	if blockResult := p.applyOutputSanitisation(ctx, serverName, actualToolName, contentTrust, result); blockResult != nil {
+	if blockResult := p.applyOutputSanitisation(ctx, serverName, actualToolName, requestID, contentTrust, result); blockResult != nil {
 		return blockResult, nil
 	}
 
@@ -2210,12 +3081,12 @@ func (p *MCPProxyServer) handleCallToolVariant(ctx context.Context, request mcp.
 		toonDetectionText, toonDecisions = p.encodeToonBlocks(serverName, actualToolName, contentTrust, args, ctr)
 	}
 
-	forwarded, response, wasTruncated := forwardContentResult(result, p.currentTruncator(), p.cacheManager, p.logger, toolName, args)
+	forwarded, response, wasTruncated := forwardContentResult(result, p.currentTruncator(), p.cacheStoreAs(producer), p.logger, toolName, args)
 
 	// Spec 056: output-schema validation. Strict mode blocks a violating result
 	// (returns an error); warn mode forwards unchanged after recording a
 	// policy_decision. No-op when disabled / no schema / error result.
-	if blockResult := p.applyOutputValidation(ctx, serverName, actualToolName, forwarded); blockResult != nil {
+	if blockResult := p.applyOutputValidation(ctx, serverName, actualToolName, requestID, forwarded); blockResult != nil {
 		return blockResult, nil
 	}
 
@@ -2258,11 +3129,14 @@ func (p *MCPProxyServer) handleCallToolVariant(ctx context.Context, request mcp.
 	if intent != nil {
 		intentMap = intent.ToMap()
 	}
-	p.emitActivityToolCallCompleted(serverName, actualToolName, sessionID, requestID, activitySource, "success", "", duration.Milliseconds(), activityArgs, response, responseTruncated, toolVariant, intentMap, contentTrust, profileSlug, activityRequestBytes, activityResponseBytes, toonDetectionText, toonDecisions)
+	p.emitActivityToolCallCompleted(ctx, serverName, actualToolName, sessionID, requestID, activitySource, activityStatus, activityErrMsg, duration.Milliseconds(), activityArgs, response, responseTruncated, toolVariant, intentMap, contentTrust, profileSlug, activityRequestBytes, activityResponseBytes, toonDetectionText, toonDecisions, "")
 
-	// Spec 024: Emit internal tool call event for success
+	// Spec 024: Emit internal tool call event. It carries the SAME classification
+	// as the tool_call record above (issue #935) — the two describe one dispatch,
+	// and a "success" wrapper around a failed call is exactly what made the
+	// failure invisible.
 	internalToolName := "call_tool_" + intent.OperationType // e.g., "call_tool_read"
-	p.emitActivityInternalToolCall(internalToolName, serverName, actualToolName, toolVariant, sessionID, requestID, "success", "", time.Since(internalStartTime).Milliseconds(), activityArgs, result, intentMap, "")
+	p.emitActivityInternalToolCall(internalToolName, serverName, actualToolName, toolVariant, sessionID, requestID, activityStatus, activityErrMsg, time.Since(internalStartTime).Milliseconds(), activityArgs, result, intentMap, "")
 
 	return forwarded, nil
 }
@@ -2393,19 +3267,22 @@ func (p *MCPProxyServer) handleCallTool(ctx context.Context, request mcp.CallToo
 	}
 
 	// Generate requestID for activity tracking
-	requestID := fmt.Sprintf("%d-%s-%s", time.Now().UnixNano(), serverName, actualToolName)
+	requestID := mintActivityRequestID(serverName, actualToolName)
 
 	// Spec 028: Inject auth identity into activity metadata (separate copy for logging only)
 	activityArgs := injectAuthMetadata(ctx, args)
 
-	// Check if server is quarantined before calling tool
-	serverConfig, err := p.storage.GetUpstreamServer(serverName)
-	if err == nil && serverConfig.Quarantined {
+	// Shared policy gates (Spec 098 FR-002), same primitive as every other
+	// dispatch path, on the pair split above (never re-normalized).
+	gate := p.evaluateExactToolGate(serverName, actualToolName)
+	serverConfig := gate.serverConfig
+
+	if gate.serverQuarantined() {
 		p.logger.Debug("handleCallTool: server is quarantined",
 			zap.String("server_name", serverName))
 
 		// Emit policy decision event for quarantine block
-		p.emitActivityPolicyDecision(serverName, actualToolName, sessionID, "blocked", "Server is quarantined for security review")
+		p.emitActivityPolicyDecision(ctx, serverName, actualToolName, sessionID, requestID, "blocked", "Server is quarantined for security review", telemetry.BlockReasonServerQuarantined)
 
 		// Server is in quarantine - return security warning with tool analysis
 		return p.handleQuarantinedToolCall(ctx, serverName, actualToolName, args), nil
@@ -2414,11 +3291,26 @@ func (p *MCPProxyServer) handleCallTool(ctx context.Context, request mcp.CallToo
 	p.logger.Debug("handleCallTool: checking connection status",
 		zap.String("server_name", serverName))
 
-	if !p.isToolCallable(serverName, actualToolName) {
-		errMsg := p.blockedToolMessage(serverName, actualToolName)
-		p.emitActivityPolicyDecision(serverName, actualToolName, sessionID, "blocked", errMsg)
+	switch gate.lockStatus {
+	case storage.ToolApprovalStatusPending:
+		p.emitActivityPolicyDecision(ctx, serverName, actualToolName, sessionID, requestID, "blocked",
+			"Tool is pending approval (new unapproved tool)", telemetry.BlockReasonToolPendingApproval)
+		return toolPendingApprovalResult(serverName, actualToolName, gate.approval), nil
+	case storage.ToolApprovalStatusChanged:
+		p.emitActivityPolicyDecision(ctx, serverName, actualToolName, sessionID, requestID, "blocked",
+			"Tool description/schema changed since last approval", telemetry.BlockReasonToolChanged)
+		return toolChangedApprovalResult(serverName, actualToolName, gate.approval), nil
+	}
+
+	if !gate.callable() {
+		errMsg := gate.blockedMessage()
+		p.emitActivityPolicyDecision(ctx, serverName, actualToolName, sessionID, requestID, "blocked", errMsg, telemetry.BlockReasonToolNotCallable)
 		return mcp.NewToolResultError(errMsg), nil
 	}
+
+	// Spec 104 FR-016a: read_cache producer stamp, captured before the
+	// upstream call (see handleCallToolVariant for why not at truncation time).
+	producer := p.cacheAuthorization(ctx)
 
 	// Check connection status before attempting tool call to prevent hanging
 	if client, exists := p.upstreamManager.GetClient(serverName); exists {
@@ -2436,8 +3328,8 @@ func (p *MCPProxyServer) handleCallTool(ctx context.Context, request mcp.CallToo
 				errMsg = fmt.Sprintf("Server '%s' is not connected (state: %s) - use 'upstream_servers' tool to check server configuration", serverName, state.String())
 			}
 			// Log the early failure to activity (Spec 024)
-			p.emitActivityToolCallStarted(serverName, actualToolName, sessionID, requestID, activitySource, activityArgs)
-			p.emitActivityToolCallCompleted(serverName, actualToolName, sessionID, requestID, activitySource, "error", errMsg, 0, activityArgs, errMsg, false, "", nil, "", "", 0, 0, "", nil)
+			p.emitActivityToolCallStarted(ctx, serverName, actualToolName, sessionID, requestID, activitySource, activityArgs)
+			p.emitActivityToolCallCompleted(ctx, serverName, actualToolName, sessionID, requestID, activitySource, "error", errMsg, 0, activityArgs, errMsg, false, "", nil, "", "", 0, 0, "", nil, "")
 			return mcp.NewToolResultError(errMsg), nil
 		}
 	} else {
@@ -2445,8 +3337,8 @@ func (p *MCPProxyServer) handleCallTool(ctx context.Context, request mcp.CallToo
 			zap.String("server_name", serverName))
 		errMsg := fmt.Sprintf("No client found for server: %s", serverName)
 		// Log the early failure to activity (Spec 024)
-		p.emitActivityToolCallStarted(serverName, actualToolName, sessionID, requestID, activitySource, activityArgs)
-		p.emitActivityToolCallCompleted(serverName, actualToolName, sessionID, requestID, activitySource, "error", errMsg, 0, activityArgs, errMsg, false, "", nil, "", "", 0, 0, "", nil)
+		p.emitActivityToolCallStarted(ctx, serverName, actualToolName, sessionID, requestID, activitySource, activityArgs)
+		p.emitActivityToolCallCompleted(ctx, serverName, actualToolName, sessionID, requestID, activitySource, "error", errMsg, 0, activityArgs, errMsg, false, "", nil, "", "", 0, 0, "", nil, "")
 		return mcp.NewToolResultError(errMsg), nil
 	}
 
@@ -2455,7 +3347,7 @@ func (p *MCPProxyServer) handleCallTool(ctx context.Context, request mcp.CallToo
 		zap.String("server_name", serverName))
 
 	// Emit activity started event with determined source
-	p.emitActivityToolCallStarted(serverName, actualToolName, sessionID, requestID, activitySource, activityArgs)
+	p.emitActivityToolCallStarted(ctx, serverName, actualToolName, sessionID, requestID, activitySource, activityArgs)
 
 	// Call tool via upstream manager with circuit breaker pattern
 	startTime := time.Now()
@@ -2502,7 +3394,7 @@ func (p *MCPProxyServer) handleCallTool(ctx context.Context, request mcp.CallToo
 
 	// Record tool call for history (even if error)
 	toolCallRecord := &storage.ToolCallRecord{
-		ID:               fmt.Sprintf("%d-%s", time.Now().UnixNano(), actualToolName),
+		ID:               mintCorrelationID(actualToolName),
 		ServerID:         serverID,
 		ServerName:       serverName,
 		ToolName:         actualToolName,
@@ -2538,6 +3430,19 @@ func (p *MCPProxyServer) handleCallTool(ctx context.Context, request mcp.CallToo
 	contentTrust := contracts.ContentTrustForTool(toolCallRecord.Annotations)
 
 	if err != nil {
+		// Spec 093 FR-010: same shed semantics on the legacy path — a retry-
+		// friendly isError result, typed identity preserved for REST, and no
+		// duplicate activity record (the limiter seam already wrote "rejected").
+		if limitErr, isShed := asShed(err); isShed {
+			shedMsg := shedMessage(limitErr)
+			toolCallRecord.Error = shedMsg
+			if storeErr := p.storage.RecordToolCall(toolCallRecord); storeErr != nil {
+				p.logger.Warn("Failed to record shed tool call", zap.Error(storeErr))
+			}
+			recordShed(ctx, limitErr)
+			return shedToolResult(limitErr), nil
+		}
+
 		// Record error in tool call history
 		toolCallRecord.Error = err.Error()
 
@@ -2569,13 +3474,19 @@ func (p *MCPProxyServer) handleCallTool(ctx context.Context, request mcp.CallToo
 		}
 
 		// Emit activity completed event for error with determined source (legacy - no intent)
-		p.emitActivityToolCallCompleted(serverName, actualToolName, sessionID, requestID, activitySource, "error", err.Error(), duration.Milliseconds(), activityArgs, "", false, "", nil, "", "", 0, 0, "", nil)
+		p.emitActivityToolCallCompleted(ctx, serverName, actualToolName, sessionID, requestID, activitySource, "error", err.Error(), duration.Milliseconds(), activityArgs, "", false, "", nil, "", "", 0, 0, "", nil, "")
 
 		return p.createDetailedErrorResponse(err, serverName, actualToolName), nil
 	}
 
-	// Record successful response
+	// Issue #935: an upstream that answered isError:true failed, even though the
+	// transport hop did not. Classified before the result is truncated/forwarded.
+	activityStatus, activityErrMsg := activityStatusForResult(result)
+
+	// Record the response (an isError answer is still a response; its
+	// explanation is mirrored into Error so history agrees with activity).
 	toolCallRecord.Response = result
+	toolCallRecord.Error = activityErrMsg
 
 	// Count output tokens for successful response
 	if tokenMetrics != nil && p.mainServer != nil && p.mainServer.runtime != nil {
@@ -2608,7 +3519,7 @@ func (p *MCPProxyServer) handleCallTool(ctx context.Context, request mcp.CallToo
 	// forwardContentResult truncates/caches it, so the read_cache store never
 	// holds an unredacted secret and a blocked response is never cached. A
 	// non-nil result means the call was blocked.
-	if blockResult := p.applyOutputSanitisation(ctx, serverName, actualToolName, contentTrust, result); blockResult != nil {
+	if blockResult := p.applyOutputSanitisation(ctx, serverName, actualToolName, requestID, contentTrust, result); blockResult != nil {
 		return blockResult, nil
 	}
 
@@ -2616,12 +3527,12 @@ func (p *MCPProxyServer) handleCallTool(ctx context.Context, request mcp.CallToo
 	legacyResponseBytes := rawByteSize(result)
 	legacyRequestBytes := rawByteSize(activityArgs)
 
-	forwarded, response, wasTruncated := forwardContentResult(result, p.currentTruncator(), p.cacheManager, p.logger, toolName, args)
+	forwarded, response, wasTruncated := forwardContentResult(result, p.currentTruncator(), p.cacheStoreAs(producer), p.logger, toolName, args)
 
 	// Spec 056: output-schema validation. Strict mode blocks a violating result
 	// (returns an error); warn mode forwards unchanged after recording a
 	// policy_decision. No-op when disabled / no schema / error result.
-	if blockResult := p.applyOutputValidation(ctx, serverName, actualToolName, forwarded); blockResult != nil {
+	if blockResult := p.applyOutputValidation(ctx, serverName, actualToolName, requestID, forwarded); blockResult != nil {
 		return blockResult, nil
 	}
 
@@ -2656,9 +3567,10 @@ func (p *MCPProxyServer) handleCallTool(ctx context.Context, request mcp.CallToo
 		p.sessionStore.UpdateSessionStats(sessionID, tokenMetrics.TotalTokens)
 	}
 
-	// Emit activity completed event for success with determined source (legacy - no intent)
+	// Emit activity completed event with determined source (legacy - no intent).
+	// Status comes from the upstream result, not from err alone (issue #935).
 	responseTruncated := tokenMetrics != nil && tokenMetrics.WasTruncated
-	p.emitActivityToolCallCompleted(serverName, actualToolName, sessionID, requestID, activitySource, "success", "", duration.Milliseconds(), activityArgs, response, responseTruncated, "", nil, "", "", legacyRequestBytes, legacyResponseBytes, "", nil)
+	p.emitActivityToolCallCompleted(ctx, serverName, actualToolName, sessionID, requestID, activitySource, activityStatus, activityErrMsg, duration.Milliseconds(), activityArgs, response, responseTruncated, "", nil, "", "", legacyRequestBytes, legacyResponseBytes, "", nil, "")
 
 	return forwarded, nil
 }
@@ -2770,12 +3682,17 @@ func (p *MCPProxyServer) handleAddServerFromRegistry(ctx context.Context, reques
 
 	// Slim, stable projection mirroring the REST AddedServerSummary so every
 	// surface reports the persisted server identically.
+	// Issue #1148: URL and Args are the two credential-bearing fields of this
+	// summary (a registry entry can carry `?token=…`, and a user-supplied arg
+	// vector routinely carries `--api-key …`). Source them from the redacted
+	// view so the echo cannot republish what the caller just configured.
+	registryView := redactedServerView(cfg, liveRedaction)
 	summary := contracts.AddedServerSummary{
 		Name:        cfg.Name,
 		Protocol:    cfg.Protocol,
-		Command:     cfg.Command,
-		Args:        cfg.Args,
-		URL:         cfg.URL,
+		Command:     viewString(registryView, "command", cfg.Command),
+		Args:        redactedArgs(cfg.Args, liveRedaction),
+		URL:         viewString(registryView, "url", cfg.URL),
 		Enabled:     cfg.Enabled,
 		Quarantined: cfg.Quarantined,
 	}
@@ -2800,32 +3717,38 @@ func (p *MCPProxyServer) handleUpstreamServers(ctx context.Context, request mcp.
 	if sess := mcpserver.ClientSessionFromContext(ctx); sess != nil {
 		sessionID = sess.SessionID()
 	}
-	requestID := fmt.Sprintf("%d-upstream_servers", time.Now().UnixNano())
+	requestID := mintCorrelationID("upstream_servers")
 
 	operation, err := request.RequireString("operation")
 	if err != nil {
-		p.emitActivityInternalToolCall("upstream_servers", "", "", "", sessionID, requestID, "error", err.Error(), time.Since(startTime).Milliseconds(), nil, nil, nil, "")
+		// No operation resolved, so nothing acted on the caller's `name`:
+		// activityTargetServer leaves the row unattributed rather than letting
+		// a malformed request stamp itself onto a server.
+		p.emitActivityInternalToolCall("upstream_servers", activityTargetServer(request, ""), "", "", sessionID, requestID, "error", err.Error(), time.Since(startTime).Milliseconds(), activityArgsFromRequest(request), nil, nil, "")
 		return mcp.NewToolResultError(fmt.Sprintf("Missing required parameter 'operation': %v", err)), nil
 	}
 
-	// Build arguments map for activity logging (Spec 024)
-	args := map[string]interface{}{
-		"operation": operation,
-	}
-	if name := request.GetString("name", ""); name != "" {
-		args["name"] = name
-	}
+	// Issue #1146: the resolved server name must reach every emit site, or the
+	// Activity Log Server column renders "-" and --server filtering misses the
+	// mutation entirely. Resolved from the operation as well as the parameter,
+	// so only operations that actually act on `name` are attributed to it.
+	targetServer := activityTargetServer(request, operation)
+
+	// Build arguments map for activity logging (Spec 024). Issue #1146: record
+	// the FULL redacted argument set, not just {operation, name} — see
+	// mcp_activity_args.go for the redaction policy.
+	args := activityArgsFromRequest(request)
 
 	// Security checks
 	if p.config.ReadOnlyMode {
 		if operation != operationList {
-			p.emitActivityInternalToolCall("upstream_servers", "", "", "", sessionID, requestID, "error", "Operation not allowed in read-only mode", time.Since(startTime).Milliseconds(), args, nil, nil, "")
+			p.emitActivityInternalToolCall("upstream_servers", targetServer, "", "", sessionID, requestID, "error", "Operation not allowed in read-only mode", time.Since(startTime).Milliseconds(), args, nil, nil, "")
 			return mcp.NewToolResultError("Operation not allowed in read-only mode"), nil
 		}
 	}
 
 	if p.config.DisableManagement {
-		p.emitActivityInternalToolCall("upstream_servers", "", "", "", sessionID, requestID, "error", "Server management is disabled for security", time.Since(startTime).Milliseconds(), args, nil, nil, "")
+		p.emitActivityInternalToolCall("upstream_servers", targetServer, "", "", sessionID, requestID, "error", "Server management is disabled for security", time.Since(startTime).Milliseconds(), args, nil, nil, "")
 		return mcp.NewToolResultError("Server management is disabled for security"), nil
 	}
 
@@ -2836,12 +3759,12 @@ func (p *MCPProxyServer) handleUpstreamServers(ctx context.Context, request mcp.
 		// must honor the same AllowServerAdd gate — otherwise the "Let agents add
 		// servers" setting is bypassable by registry reference (MCP-800 finding 1).
 		if !p.config.AllowServerAdd {
-			p.emitActivityInternalToolCall("upstream_servers", "", "", "", sessionID, requestID, "error", "Adding servers is not allowed", time.Since(startTime).Milliseconds(), args, nil, nil, "")
+			p.emitActivityInternalToolCall("upstream_servers", targetServer, "", "", sessionID, requestID, "error", "Adding servers is not allowed", time.Since(startTime).Milliseconds(), args, nil, nil, "")
 			return mcp.NewToolResultError("Adding servers is not allowed"), nil
 		}
 	case operationRemove:
 		if !p.config.AllowServerRemove {
-			p.emitActivityInternalToolCall("upstream_servers", "", "", "", sessionID, requestID, "error", "Removing servers is not allowed", time.Since(startTime).Milliseconds(), args, nil, nil, "")
+			p.emitActivityInternalToolCall("upstream_servers", targetServer, "", "", sessionID, requestID, "error", "Removing servers is not allowed", time.Since(startTime).Milliseconds(), args, nil, nil, "")
 			return mcp.NewToolResultError("Removing servers is not allowed"), nil
 		}
 	}
@@ -2852,13 +3775,17 @@ func (p *MCPProxyServer) handleUpstreamServers(ctx context.Context, request mcp.
 	// /api/v1/servers handlers, so the two can never drift (issues #877/#878).
 	if authCtx := auth.AuthContextFromContext(ctx); !auth.AuthorizeServerOp(authCtx, operation) {
 		errMsg := fmt.Sprintf("Agent tokens cannot perform '%s' operations on upstream servers", operation)
-		p.emitActivityInternalToolCall("upstream_servers", "", "", "", sessionID, requestID, "error", errMsg, time.Since(startTime).Milliseconds(), args, nil, nil, "")
+		p.emitActivityInternalToolCall("upstream_servers", targetServer, "", "", sessionID, requestID, "error", errMsg, time.Since(startTime).Milliseconds(), args, nil, nil, "")
 		return mcp.NewToolResultError(errMsg), nil
 	}
 
 	// Execute operation and track result
 	var result *mcp.CallToolResult
 	var opErr error
+	// Issue #1146: update/patch resolve a before/after diff that the raw
+	// request cannot express (deep merge, `null` means remove). Capture it so
+	// the activity record says what actually CHANGED, not just what was asked.
+	var configDiff *config.ConfigDiff
 
 	switch operation {
 	case operationList:
@@ -2868,9 +3795,9 @@ func (p *MCPProxyServer) handleUpstreamServers(ctx context.Context, request mcp.
 	case operationRemove:
 		result, opErr = p.handleRemoveUpstream(ctx, request)
 	case "update":
-		result, opErr = p.handleUpdateUpstream(ctx, request)
+		result, configDiff, opErr = p.handleUpdateUpstream(ctx, request)
 	case "patch":
-		result, opErr = p.handlePatchUpstream(ctx, request)
+		result, configDiff, opErr = p.handlePatchUpstream(ctx, request)
 	case "tail_log":
 		result, opErr = p.handleTailLog(ctx, request)
 	case "enable":
@@ -2884,7 +3811,7 @@ func (p *MCPProxyServer) handleUpstreamServers(ctx context.Context, request mcp.
 	case "add_from_registry":
 		result, opErr = p.handleAddServerFromRegistry(ctx, request)
 	default:
-		p.emitActivityInternalToolCall("upstream_servers", "", "", "", sessionID, requestID, "error", fmt.Sprintf("Unknown operation: %s", operation), time.Since(startTime).Milliseconds(), args, nil, nil, "")
+		p.emitActivityInternalToolCall("upstream_servers", targetServer, "", "", sessionID, requestID, "error", fmt.Sprintf("Unknown operation: %s", operation), time.Since(startTime).Milliseconds(), args, nil, nil, "")
 		return mcp.NewToolResultError(fmt.Sprintf("Unknown operation: %s", operation)), nil
 	}
 
@@ -2896,18 +3823,35 @@ func (p *MCPProxyServer) handleUpstreamServers(ctx context.Context, request mcp.
 		}
 	}
 
+	// Issue #1146: record the resolved diff alongside the raw request, and
+	// attribute add_from_registry rows to the name the registry resolved.
+	if redacted := redactedConfigDiff(configDiff); redacted != nil {
+		if args == nil {
+			args = make(map[string]interface{}, 1)
+		}
+		args["config_diff"] = redacted
+	}
+	if targetServer == "" && operation == "add_from_registry" {
+		targetServer = serverNameFromRegistryResult(responseText)
+	}
+
 	// Spec 024: Emit activity event based on result with args and response
 	if opErr != nil {
-		p.emitActivityInternalToolCall("upstream_servers", "", "", "", sessionID, requestID, "error", opErr.Error(), time.Since(startTime).Milliseconds(), args, nil, nil, "")
+		p.emitActivityInternalToolCall("upstream_servers", targetServer, "", "", sessionID, requestID, "error", opErr.Error(), time.Since(startTime).Milliseconds(), args, nil, nil, "")
 	} else if result != nil && result.IsError {
 		// Extract error message from result if available
 		errMsg := "operation failed"
 		if responseText != "" {
 			errMsg = responseText
 		}
-		p.emitActivityInternalToolCall("upstream_servers", "", "", "", sessionID, requestID, "error", errMsg, time.Since(startTime).Milliseconds(), args, nil, nil, "")
+		p.emitActivityInternalToolCall("upstream_servers", targetServer, "", "", sessionID, requestID, "error", scrubUpstreamTextForAudit(errMsg), time.Since(startTime).Milliseconds(), args, nil, nil, "")
 	} else {
-		p.emitActivityInternalToolCall("upstream_servers", "", "", "", sessionID, requestID, "success", "", time.Since(startTime).Milliseconds(), args, responseText, nil, "")
+		// Issue #1148: the activity store persists in BBolt, streams over SSE
+		// and is exported by `mcpproxy activity list`, so the response is
+		// re-rendered under the AUDIT policy (a fixed marker carrying neither
+		// the secret's length nor its trailing bytes). One net here covers
+		// every current and future operation of this built-in.
+		p.emitActivityInternalToolCall("upstream_servers", targetServer, "", "", sessionID, requestID, "success", "", time.Since(startTime).Milliseconds(), args, redactBuiltinResponseForActivity(responseText), nil, "")
 	}
 
 	return result, opErr
@@ -2924,37 +3868,38 @@ func (p *MCPProxyServer) handleQuarantineSecurity(ctx context.Context, request m
 	if sess := mcpserver.ClientSessionFromContext(ctx); sess != nil {
 		sessionID = sess.SessionID()
 	}
-	requestID := fmt.Sprintf("%d-quarantine_security", time.Now().UnixNano())
+	requestID := mintCorrelationID("quarantine_security")
 
 	operation, err := request.RequireString("operation")
 	if err != nil {
-		p.emitActivityInternalToolCall("quarantine_security", "", "", "", sessionID, requestID, "error", err.Error(), time.Since(startTime).Milliseconds(), nil, nil, nil, "")
+		p.emitActivityInternalToolCall("quarantine_security", activityTargetServer(request, ""), "", "", sessionID, requestID, "error", err.Error(), time.Since(startTime).Milliseconds(), activityArgsFromRequest(request), nil, nil, "")
 		return mcp.NewToolResultError(fmt.Sprintf("Missing required parameter 'operation': %v", err)), nil
 	}
 
-	// Build arguments map for activity logging (Spec 024)
-	args := map[string]interface{}{
-		"operation": operation,
-	}
-	if name := request.GetString("name", ""); name != "" {
-		args["name"] = name
-	}
+	// Issue #1146: see handleUpstreamServers — the resolved server name must
+	// reach every emit site, including the pre-gate denials.
+	targetServer := activityTargetServer(request, operation)
+
+	// Build arguments map for activity logging (Spec 024). Issue #1146: the full
+	// redacted argument set — this also picks up prompt_name, which the old
+	// hand-rolled builder never recorded.
+	args := activityArgsFromRequest(request)
 
 	// Spec 028: Agent tokens cannot perform quarantine operations
 	if authCtx := auth.AuthContextFromContext(ctx); authCtx != nil && !authCtx.IsAdmin() {
 		errMsg := "Agent tokens cannot perform quarantine security operations"
-		p.emitActivityInternalToolCall("quarantine_security", "", "", "", sessionID, requestID, "error", errMsg, time.Since(startTime).Milliseconds(), args, nil, nil, "")
+		p.emitActivityInternalToolCall("quarantine_security", targetServer, "", "", sessionID, requestID, "error", errMsg, time.Since(startTime).Milliseconds(), args, nil, nil, "")
 		return mcp.NewToolResultError(errMsg), nil
 	}
 
 	// Security checks
 	if p.config.ReadOnlyMode {
-		p.emitActivityInternalToolCall("quarantine_security", "", "", "", sessionID, requestID, "error", "Quarantine operations not allowed in read-only mode", time.Since(startTime).Milliseconds(), args, nil, nil, "")
+		p.emitActivityInternalToolCall("quarantine_security", targetServer, "", "", sessionID, requestID, "error", "Quarantine operations not allowed in read-only mode", time.Since(startTime).Milliseconds(), args, nil, nil, "")
 		return mcp.NewToolResultError("Quarantine operations not allowed in read-only mode"), nil
 	}
 
 	if p.config.DisableManagement {
-		p.emitActivityInternalToolCall("quarantine_security", "", "", "", sessionID, requestID, "error", "Server management is disabled for security", time.Since(startTime).Milliseconds(), args, nil, nil, "")
+		p.emitActivityInternalToolCall("quarantine_security", targetServer, "", "", sessionID, requestID, "error", "Server management is disabled for security", time.Since(startTime).Milliseconds(), args, nil, nil, "")
 		return mcp.NewToolResultError("Server management is disabled for security"), nil
 	}
 
@@ -2962,19 +3907,21 @@ func (p *MCPProxyServer) handleQuarantineSecurity(ctx context.Context, request m
 	var result *mcp.CallToolResult
 	var opErr error
 
-	if toolNameArg := request.GetString("tool_name", ""); toolNameArg != "" {
-		args["tool_name"] = toolNameArg
-	}
-
 	switch operation {
 	case "list_quarantined":
 		result, opErr = p.handleListQuarantinedUpstreams(ctx)
 	case "inspect_quarantined":
 		result, opErr = p.handleInspectQuarantinedTools(ctx, request)
-	case "quarantine":
+	// "quarantine_server" is the name advertised in the operation enum;
+	// "quarantine" is the historical spelling kept working for older agents.
+	case "quarantine_server", "quarantine":
 		result, opErr = p.handleQuarantineUpstream(ctx, request)
 	case "inspect_tools":
-		result, opErr = p.handleInspectToolApprovals(request)
+		result, opErr = p.handleInspectToolApprovals(ctx, request)
+	case "scan_server":
+		result, opErr = p.handleScanServer(ctx, request)
+	case "get_scan_report":
+		result, opErr = p.handleGetScanReport(ctx, request)
 	case "approve_tool":
 		result, opErr = p.handleApproveToolByName(request)
 	case "approve_all_tools":
@@ -2987,8 +3934,14 @@ func (p *MCPProxyServer) handleQuarantineSecurity(ctx context.Context, request m
 		result, opErr = p.handleSetToolEnabledByName(request, true)
 	case "disable_tool":
 		result, opErr = p.handleSetToolEnabledByName(request, false)
+	case "inspect_prompts":
+		result, opErr = p.handleInspectPromptApprovals(request)
+	case "approve_prompt":
+		result, opErr = p.handleApprovePromptByName(request)
+	case "approve_all_prompts":
+		result, opErr = p.handleApproveAllPromptsByServer(request)
 	default:
-		p.emitActivityInternalToolCall("quarantine_security", "", "", "", sessionID, requestID, "error", fmt.Sprintf("Unknown quarantine operation: %s", operation), time.Since(startTime).Milliseconds(), args, nil, nil, "")
+		p.emitActivityInternalToolCall("quarantine_security", targetServer, "", "", sessionID, requestID, "error", fmt.Sprintf("Unknown quarantine operation: %s", operation), time.Since(startTime).Milliseconds(), args, nil, nil, "")
 		return mcp.NewToolResultError(fmt.Sprintf("Unknown quarantine operation: %s", operation)), nil
 	}
 
@@ -3002,23 +3955,24 @@ func (p *MCPProxyServer) handleQuarantineSecurity(ctx context.Context, request m
 
 	// Spec 024: Emit activity event based on result with args and response
 	if opErr != nil {
-		p.emitActivityInternalToolCall("quarantine_security", "", "", "", sessionID, requestID, "error", opErr.Error(), time.Since(startTime).Milliseconds(), args, nil, nil, "")
+		p.emitActivityInternalToolCall("quarantine_security", targetServer, "", "", sessionID, requestID, "error", opErr.Error(), time.Since(startTime).Milliseconds(), args, nil, nil, "")
 	} else if result != nil && result.IsError {
 		// Extract error message from result if available
 		errMsg := "operation failed"
 		if responseText != "" {
 			errMsg = responseText
 		}
-		p.emitActivityInternalToolCall("quarantine_security", "", "", "", sessionID, requestID, "error", errMsg, time.Since(startTime).Milliseconds(), args, nil, nil, "")
+		p.emitActivityInternalToolCall("quarantine_security", targetServer, "", "", sessionID, requestID, "error", scrubUpstreamTextForAudit(errMsg), time.Since(startTime).Milliseconds(), args, nil, nil, "")
 	} else {
-		p.emitActivityInternalToolCall("quarantine_security", "", "", "", sessionID, requestID, "success", "", time.Since(startTime).Milliseconds(), args, responseText, nil, "")
+		// Issue #1148: see the matching net in handleUpstreamServers.
+		p.emitActivityInternalToolCall("quarantine_security", targetServer, "", "", sessionID, requestID, "success", "", time.Since(startTime).Milliseconds(), args, redactBuiltinResponseForActivity(responseText), nil, "")
 	}
 
 	return result, opErr
 }
 
 // handleInspectToolApprovals shows tool-level quarantine status for a server (Spec 032)
-func (p *MCPProxyServer) handleInspectToolApprovals(request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (p *MCPProxyServer) handleInspectToolApprovals(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	serverName := request.GetString("name", "")
 	if serverName == "" {
 		return mcp.NewToolResultError("Missing required parameter 'name' (server name)"), nil
@@ -3029,8 +3983,10 @@ func (p *MCPProxyServer) handleInspectToolApprovals(request mcp.CallToolRequest)
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to list tool approvals: %v", err)), nil
 	}
 
+	scanStatus := p.scanStatusLine(ctx, serverName)
+
 	if len(records) == 0 {
-		return mcp.NewToolResultText(fmt.Sprintf("No tool approval records found for server '%s'", serverName)), nil
+		return mcp.NewToolResultText(fmt.Sprintf("No tool approval records found for server '%s' (scan status: %s)", serverName, scanStatus)), nil
 	}
 
 	pendingCount, changedCount, approvedCount, disabledCount := 0, 0, 0, 0
@@ -3070,6 +4026,7 @@ func (p *MCPProxyServer) handleInspectToolApprovals(request mcp.CallToolRequest)
 
 	result := map[string]interface{}{
 		"server_name":    serverName,
+		"scan_status":    scanStatus,
 		"tools":          toolList,
 		"total":          len(records),
 		"approved_count": approvedCount,
@@ -3193,7 +4150,9 @@ func (p *MCPProxyServer) handleListUpstreams(ctx context.Context) (*mcp.CallTool
 	}
 
 	// Spec 028: Filter servers to only those the agent token can access
-	if authCtx := auth.AuthContextFromContext(ctx); authCtx != nil && !authCtx.IsAdmin() {
+	authCtx := auth.AuthContextFromContext(ctx)
+	scopedCaller := authCtx != nil && !authCtx.IsAdmin()
+	if scopedCaller {
 		var filtered []*config.ServerConfig
 		for _, s := range servers {
 			if authCtx.CanAccessServer(s.Name) {
@@ -3226,27 +4185,55 @@ func (p *MCPProxyServer) handleListUpstreams(ctx context.Context) (*mcp.CallTool
 
 	// Enhance server list with connection status and Docker isolation info
 	enhancedServers := make([]map[string]interface{}, len(servers))
-	revealHeaders := p.config != nil && p.config.RevealSecretHeaders
+	// Redact sensitive header values (Authorization, X-API-Key, Cookie, etc.),
+	// env-var secrets, URL query credentials and argv tokens before surfacing
+	// them through the MCP tool. An MCP agent inside a sandbox should never be
+	// able to read another upstream's Bearer token, API key, or URL-embedded
+	// secret via `upstream_servers list`.
+	//
+	// Issue #1148: `reveal_secret_headers` is an operator opt-in for a TRUSTED
+	// read surface, so it now additionally requires an AUTHENTICATED admin.
+	// /mcp is unprotected by default, so before this an anonymous caller on
+	// that endpoint got the raw values the flag was meant to hand the
+	// operator. CanRevealSecrets is nil-safe: an in-process/stdio caller with
+	// no context gets masked values rather than admin-by-absence.
+	//
+	// Issue #1167 moved the expression itself into auth.RevealSecretsAllowed.
+	// This door was already correct; five REST/SSE/doctor doors checked the
+	// flag alone. Rather than leave the right answer written out in one place
+	// and the wrong one in five, every door now reads it from the shared
+	// predicate, so they cannot drift apart again.
+	revealHeaders := auth.RevealSecretsAllowed(ctx, p.config != nil && p.config.RevealSecretHeaders)
 	for i, server := range servers {
-		// Redact sensitive header values (Authorization, X-API-Key, Cookie,
-		// etc.), env-var secrets, and URL query credentials before surfacing
-		// them through the MCP tool. An MCP agent inside a sandbox should
-		// never be able to read another upstream's Bearer token, API key, or
-		// URL-embedded secret via `upstream_servers list`. Operators who
-		// genuinely need the raw values can set `reveal_secret_headers: true`.
-		headers := server.Headers
-		serverURL := server.URL
-		serverEnv := server.Env
+		// The secret-bearing fields are sourced from redactedServerView — the
+		// shared walker over the config's own JSON — rather than from a
+		// per-field redactor call, so this projection cannot drift from the
+		// one `list_quarantined` uses. viewField falls back to the raw value
+		// only for keys ServerConfig omits when empty, which keeps the
+		// response shape byte-identical to before.
+		view := redactedServerView(server, liveRedaction)
+		headers := interface{}(server.Headers)
+		serverURL := interface{}(server.URL)
+		serverEnv := interface{}(server.Env)
+		serverArgs := interface{}(server.Args)
 		if !revealHeaders {
-			headers = oauth.RedactStringHeaders(server.Headers)
-			serverEnv = oauth.RedactEnvValues(server.Env)
-			serverURL = oauth.RedactURLQueryParams(server.URL)
+			headers = viewField(view, "headers", server.Headers)
+			serverEnv = viewField(view, "env", server.Env)
+			serverURL = viewField(view, "url", server.URL)
+			serverArgs = redactedArgs(server.Args, liveRedaction)
+		}
+		serverCommand := interface{}(server.Command)
+		if !revealHeaders {
+			// Round 8 finding 3: `command` is the one leaf of this projection
+			// that was still read off the struct instead of the view, so it
+			// was masked on `list_quarantined` and raw here.
+			serverCommand = viewField(view, "command", server.Command)
 		}
 		serverMap := map[string]interface{}{
 			"name":        server.Name,
 			"protocol":    server.Protocol,
-			"command":     server.Command,
-			"args":        server.Args,
+			"command":     serverCommand,
+			"args":        serverArgs,
 			"url":         serverURL,
 			"env":         serverEnv,
 			"headers":     headers,
@@ -3269,6 +4256,9 @@ func (p *MCPProxyServer) handleListUpstreams(ctx context.Context) (*mcp.CallTool
 		var isConnected bool
 		var toolCount int
 		var userLoggedOut bool
+		var retryStopped bool
+		var retryStoppedCode, retryStoppedReason string
+		var retryCount int
 
 		if client, exists := p.upstreamManager.GetClient(server.Name); exists {
 			connInfo := client.GetConnectionInfo()
@@ -3281,7 +4271,15 @@ func (p *MCPProxyServer) handleListUpstreams(ctx context.Context) (*mcp.CallTool
 				// all) is commonly echoed into the error; scrub it before it
 				// reaches connection_status.last_error and health.detail.
 				if !revealHeaders {
-					lastError = oauth.RedactSensitiveData(lastError)
+					lastError = scrubUpstreamText(lastError)
+				}
+				// Spec 105 FR-007 (codex round 3): the error re-emits the
+				// child's stderr, which on a `docker run` name collision
+				// names another server's container. Redacted for scoped
+				// callers before it reaches connection_status.last_error and
+				// health.detail; administrators keep it (SC-005).
+				if scopedCaller {
+					lastError = logs.RedactContainerMentions(lastError)
 				}
 			}
 			isConnected = connInfo.State.String() == "connected"
@@ -3294,12 +4292,22 @@ func (p *MCPProxyServer) handleListUpstreams(ctx context.Context) (*mcp.CallTool
 			if toolCount == 0 {
 				if tools, err := client.ListTools(context.Background()); err == nil {
 					for _, tool := range tools {
-						if p.isToolCallable(server.Name, tool.Name) {
+						if p.isExactToolCallable(server.Name, tool.Name) {
 							toolCount++
 						}
 					}
 				}
 			}
+
+			// GH #1145: automatic reconnection permanently given up. Reported
+			// on the MCP surface too — an agent that keeps polling a parked
+			// server otherwise has no way to learn nothing will ever retry.
+			retryStopped = connInfo.Terminal && connInfo.RetryCount >= types.PermanentFailureAttempts
+			if retryStopped {
+				retryStoppedCode = connInfo.TerminalCode
+				retryStoppedReason = diagnostics.PermanentFailureReason(diagnostics.Code(connInfo.TerminalCode), lastError)
+			}
+			retryCount = connInfo.RetryCount
 
 			serverMap["connection_status"] = map[string]interface{}{
 				"state":            connState,
@@ -3308,6 +4316,7 @@ func (p *MCPProxyServer) handleListUpstreams(ctx context.Context) (*mcp.CallTool
 				"last_retry_time":  connInfo.LastRetryTime.Format(time.RFC3339),
 				"container_id":     containerInfo["container_id"],
 				"container_status": containerInfo["status"],
+				"retry_stopped":    retryStopped,
 			}
 		} else {
 			connState = "disconnected"
@@ -3338,17 +4347,28 @@ func (p *MCPProxyServer) handleListUpstreams(ctx context.Context) (*mcp.CallTool
 			ToolCount:      toolCount,
 			MissingSecret:  health.ExtractMissingSecret(lastError),
 			OAuthConfigErr: health.ExtractOAuthConfigError(lastError),
+			// Gates the "Edit URL" remedy — a stdio server emits the same
+			// address phrases from its own failed network calls but has no URL
+			// to edit. Must be supplied at every CalculateHealth call site or
+			// the REST, MCP and tray surfaces disagree about the remedy.
+			HasEndpointURL: server.URL != "",
+			// GH #1145 — must be supplied here too, or the MCP surface reports
+			// a parked server as an ordinary retrying error.
+			RetryStopped:       retryStopped,
+			RetryStoppedCode:   retryStoppedCode,
+			RetryStoppedReason: retryStoppedReason,
+			RetryCount:         retryCount,
 		}
 
-		// T032: Wire refresh state into health calculation (Spec 023)
+		// T032: Wire refresh state into health calculation (Spec 023).
+		// Read through the runtime seam so a stale schedule for a server that
+		// no longer uses OAuth is not reported here either (GH #1172).
 		if p.mainServer != nil && p.mainServer.runtime != nil {
-			if refreshMgr := p.mainServer.runtime.RefreshManager(); refreshMgr != nil {
-				if refreshState := refreshMgr.GetRefreshState(server.Name); refreshState != nil {
-					healthInput.RefreshState = health.RefreshState(refreshState.State)
-					healthInput.RefreshRetryCount = refreshState.RetryCount
-					healthInput.RefreshLastError = refreshState.LastError
-					healthInput.RefreshNextAttempt = refreshState.NextAttempt
-				}
+			if refreshState := p.mainServer.runtime.HealthRefreshState(server.Name, server); refreshState != nil {
+				healthInput.RefreshState = health.RefreshState(refreshState.State)
+				healthInput.RefreshRetryCount = refreshState.RetryCount
+				healthInput.RefreshLastError = refreshState.LastError
+				healthInput.RefreshNextAttempt = refreshState.NextAttempt
 			}
 		}
 
@@ -3367,10 +4387,16 @@ func (p *MCPProxyServer) handleListUpstreams(ctx context.Context) (*mcp.CallTool
 		if server.Command != "" {
 			isolationManager := p.getIsolationManager()
 			if isolationManager != nil {
-				shouldIsolate := isolationManager.ShouldIsolate(server)
-				dockerInfo["applies_to_server"] = shouldIsolate
+				resolved := isolationManager.ResolveIsolation(server)
+				// applies_to_server is the EFFECTIVE answer to "is this server
+				// isolated": a sandbox-isolated server used to report false here
+				// because the check was ShouldIsolate (docker-only) (GH #1142).
+				dockerInfo["applies_to_server"] = resolved.Isolated
+				dockerInfo["isolation_mode"] = string(resolved.Mode)
+				dockerInfo["isolation_inherited"] = resolved.Inherited
+				dockerInfo["isolation_source"] = resolved.Source
 
-				if shouldIsolate {
+				if resolved.Mode == config.IsolationModeDocker {
 					runtimeType := isolationManager.DetectRuntimeType(server.Command)
 					dockerInfo["runtime_detected"] = runtimeType
 
@@ -3380,15 +4406,39 @@ func (p *MCPProxyServer) handleListUpstreams(ctx context.Context) (*mcp.CallTool
 				}
 			}
 
-			// Add server-specific isolation config
+			// Add server-specific isolation config. This block is the RAW
+			// per-server OVERRIDE — it is named server_isolation — so `enabled`
+			// is omitted entirely when the server inherits the global setting
+			// rather than being flattened to false. The effective state lives
+			// in applies_to_server / isolation_mode above.
+			//
+			// "Raw override" means the override SET, not raw secrets: issue
+			// #1148 round 7 finding 3 found this block republishing
+			// `isolation.extra_args` verbatim in the SAME response that masks
+			// env, url and args — and `extra_args` is free text an operator
+			// puts `-e API_KEY=<token>` into. The values are therefore sourced
+			// from the redacted view, under the same reveal_secret_headers gate
+			// as every other secret-bearing field on this surface.
 			if server.Isolation != nil {
-				dockerInfo["server_isolation"] = map[string]interface{}{
-					"enabled":      server.Isolation.IsEnabled(),
-					"image":        server.Isolation.Image,
-					"network_mode": server.Isolation.NetworkMode,
-					"working_dir":  server.Isolation.WorkingDir,
-					"extra_args":   server.Isolation.ExtraArgs,
+				// viewField keeps the payload SHAPE byte-identical: every
+				// string field of config.IsolationConfig is `omitempty`, so an
+				// unset one is absent from the view and falls back to the raw
+				// (empty) value rather than turning into a JSON null.
+				isoSource := isolationValues(server.Isolation, revealHeaders)
+				serverIso := map[string]interface{}{
+					"image":        viewField(isoSource, "image", server.Isolation.Image),
+					"network_mode": viewField(isoSource, "network_mode", server.Isolation.NetworkMode),
+					"working_dir":  viewField(isoSource, "working_dir", server.Isolation.WorkingDir),
+					"extra_args":   viewField(isoSource, "extra_args", server.Isolation.ExtraArgs),
 				}
+				if server.Isolation.Enabled != nil {
+					serverIso["enabled"] = *server.Isolation.Enabled
+					serverIso["enabled_override"] = *server.Isolation.Enabled
+				}
+				if server.Isolation.Mode != nil {
+					serverIso["mode_override"] = string(*server.Isolation.Mode)
+				}
+				dockerInfo["server_isolation"] = serverIso
 			}
 
 			// Add global limits
@@ -3410,10 +4460,14 @@ func (p *MCPProxyServer) handleListUpstreams(ctx context.Context) (*mcp.CallTool
 		"servers": enhancedServers,
 		"total":   len(servers),
 		"docker_status": map[string]interface{}{
-			"available":        dockerAvailable,
-			"docker_path":      dockerPath,
-			"global_enabled":   dockerIsolationGlobalEnabled,
-			"isolation_config": p.config.DockerIsolation,
+			"available":      dockerAvailable,
+			"docker_path":    dockerPath,
+			"global_enabled": dockerIsolationGlobalEnabled,
+			// The WHOLE global docker_isolation block, including its own
+			// `extra_args` — which is exactly as credential-bearing as a
+			// server's, and was published here in the clear beside the masked
+			// per-server fields (issue #1148, round 7 finding 3).
+			"isolation_config": globalIsolationView(p.config.DockerIsolation, revealHeaders),
 		},
 	}
 
@@ -3633,6 +4687,10 @@ func (p *MCPProxyServer) getIsolationManager() IsolationChecker {
 
 // IsolationChecker interface for checking isolation settings
 type IsolationChecker interface {
+	// ResolveIsolation is the single source of truth for "is this server
+	// isolated" — it accounts for the global mode, the tri-state per-server
+	// override and the structural gates (GH #1142).
+	ResolveIsolation(serverConfig *config.ServerConfig) config.ResolvedIsolation
 	ShouldIsolate(serverConfig *config.ServerConfig) bool
 	DetectRuntimeType(command string) string
 	GetDockerImage(serverConfig *config.ServerConfig, runtimeType string) (string, error)
@@ -3656,15 +4714,35 @@ func (p *MCPProxyServer) getDockerContainerInfo(client *managed.Client) map[stri
 	return result
 }
 
-func (p *MCPProxyServer) handleListQuarantinedUpstreams(_ context.Context) (*mcp.CallToolResult, error) {
+func (p *MCPProxyServer) handleListQuarantinedUpstreams(ctx context.Context) (*mcp.CallToolResult, error) {
 	servers, err := p.storage.ListQuarantinedUpstreamServers()
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to list quarantined upstreams: %v", err)), nil
 	}
 
+	names := make([]string, 0, len(servers))
+	for _, sc := range servers {
+		if sc != nil {
+			names = append(names, sc.Name)
+		}
+	}
+
 	jsonResult, err := json.Marshal(map[string]interface{}{
-		"servers": servers,
+		// Issue #1148: this used to marshal the raw []*config.ServerConfig, so
+		// env values, header values, oauth.client_secret, URL query
+		// credentials and argv tokens all left through the MCP surface in the
+		// clear — to any caller, /mcp being unauthenticated by default — and
+		// were recorded verbatim into the activity store.
+		//
+		// The full (masked) config is still the right payload here: the point
+		// of inspecting a quarantined server is to see HOW it is configured,
+		// including WHICH secrets it carries. Only the values go.
+		"servers": redactedServerViews(servers, liveRedaction),
 		"total":   len(servers),
+		// One line per server so "nobody ever scanned this" is visible right
+		// here, next to the decision it should inform.
+		"scan_status": p.scanStatusLines(ctx, names),
+		"scan_hint":   "Use operation='scan_server' name='<server>' to run the offline TPA baseline scan, then operation='get_scan_report' for the findings.",
 	})
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to serialize quarantined upstreams: %v", err)), nil
@@ -3699,7 +4777,9 @@ func (p *MCPProxyServer) handleInspectQuarantinedTools(ctx context.Context, requ
 		return mcp.NewToolResultError(reason), nil
 	}
 
-	var toolsAnalysis []map[string]interface{}
+	// Non-nil so a tool-less server serializes as "tools": [] — never null
+	// (issue #953: strict MCP clients crash iterating a null array).
+	toolsAnalysis := make([]map[string]interface{}, 0)
 
 	// REQUEST TEMPORARY CONNECTION EXEMPTION FOR INSPECTION
 	p.logger.Warn("⚠️ Requesting temporary connection exemption for quarantined server inspection",
@@ -3807,8 +4887,9 @@ func (p *MCPProxyServer) handleInspectQuarantinedTools(ctx context.Context, requ
 
 		// Try to get connection status for diagnostics
 		if c, exists := p.upstreamManager.GetClient(serverName); exists {
-			connectionStatus := c.GetConnectionStatus()
-			return mcp.NewToolResultError(fmt.Sprintf("Quarantined server '%s' failed to connect within %v timeout. Connection status: %v. This may indicate the server process is not running, there's a network issue, or the server is unstable (see issue #105).", serverName, connectionTimeout, connectionStatus)), nil
+			// Issue #1148 (round 2, finding 2): the status map carries
+			// last_error, which echoes the upstream URL with its credentials.
+			return mcp.NewToolResultError(inspectConnectionTimeoutError(serverName, connectionTimeout, c.GetConnectionStatus())), nil
 		}
 
 		return mcp.NewToolResultError(fmt.Sprintf("Quarantined server '%s' failed to connect within %v timeout. Client was never created, indicating the server may not be properly configured.", serverName, connectionTimeout)), nil
@@ -3820,7 +4901,7 @@ func (p *MCPProxyServer) handleInspectQuarantinedTools(ctx context.Context, requ
 				zap.String("server", serverName),
 				zap.Error(result.err))
 			supervisor.RecordInspectionFailure(serverName)
-			return mcp.NewToolResultError(fmt.Sprintf("Connection wait failed: %v", result.err)), nil
+			return mcp.NewToolResultError(scrubUpstreamText(fmt.Sprintf("Connection wait failed: %v", result.err))), nil
 		}
 
 		client = result.client
@@ -3854,21 +4935,11 @@ func (p *MCPProxyServer) handleInspectQuarantinedTools(ctx context.Context, requ
 			// Force disconnect the client to update its state
 			_ = client.Disconnect()
 
-			// Provide connection error information instead of failing completely
-			connectionStatus := client.GetConnectionStatus()
-			connectionStatus["connection_error"] = err.Error()
-
-			toolsAnalysis = []map[string]interface{}{
-				{
-					"server_name":     serverName,
-					"status":          "QUARANTINED_CONNECTION_FAILED",
-					"message":         fmt.Sprintf("Server '%s' is quarantined and connection failed during tool retrieval. This may indicate the server process crashed or disconnected.", serverName),
-					"connection_info": connectionStatus,
-					"error_details":   err.Error(),
-					"next_steps":      "The server connection failed. Check server process status, logs, and configuration. Server may need to be restarted.",
-					"security_note":   "Connection failure prevents tool analysis. Server must be stable and connected for security inspection.",
-				},
-			}
+			// Provide connection error information instead of failing
+			// completely — scrubbed, because both the status map's last_error
+			// and the raw ListTools error echo the upstream URL with its
+			// credentials (issue #1148, round 2, finding 2).
+			toolsAnalysis = inspectConnectionFailedAnalysis(serverName, client.GetConnectionStatus(), err)
 		} else {
 			// Successfully retrieved tools, proceed with security analysis
 			for _, tool := range tools {
@@ -3928,6 +4999,7 @@ func (p *MCPProxyServer) handleInspectQuarantinedTools(ctx context.Context, requ
 	response := map[string]interface{}{
 		"server":            serverName,
 		"quarantine_status": "ACTIVE",
+		"scan_status":       p.scanStatusLine(ctx, serverName),
 		"tools":             toolsAnalysis,
 		"total_tools":       len(toolsAnalysis),
 		"analysis_purpose":  "SECURITY_INSPECTION",
@@ -4024,6 +5096,12 @@ func (p *MCPProxyServer) handleAddUpstream(ctx context.Context, request mcp.Call
 	// explicit `quarantined` request boolean (#370) still wins after, as a
 	// distinct pre-existing escape hatch.
 	trustMode := request.GetString("trust_mode", "")
+	// GH #938: the tool schema declares an enum, but enum enforcement is
+	// client-side — reject an unrecognized value here so a bogus mode is never
+	// persisted and then silently treated as manual.
+	if !config.IsValidTrustMode(trustMode) {
+		return mcp.NewToolResultError(invalidTrustModeError(trustMode)), nil
+	}
 	defaultQuarantined := true
 	if p.mainServer != nil && p.mainServer.runtime != nil {
 		if cfg := p.mainServer.runtime.Config(); cfg != nil {
@@ -4118,6 +5196,11 @@ func (p *MCPProxyServer) handleAddUpstream(ctx context.Context, request mcp.Call
 		if err := json.Unmarshal([]byte(isolationJSON), &isoConfig); err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("Invalid isolation_json format: %v", err)), nil
 		}
+		// GH #1142: an unknown mode must be refused here, not persisted and
+		// then rejected by the NEXT daemon start's config validation.
+		if err := config.ValidateIsolationModeOverride(isoConfig.Mode); err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Invalid isolation_json: %v", err)), nil
+		}
 		isolation = &isoConfig
 	}
 
@@ -4127,6 +5210,11 @@ func (p *MCPProxyServer) handleAddUpstream(ctx context.Context, request mcp.Call
 		var oauthConfig config.OAuthConfig
 		if err := json.Unmarshal([]byte(oauthJSON), &oauthConfig); err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("Invalid oauth_json format: %v", err)), nil
+		}
+		// Reject a malformed oauth.redirect_uri here, where the caller is
+		// typing it: it is otherwise a permanent connect failure.
+		if err := oauthConfig.Validate(); err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Invalid oauth_json: %v", err)), nil
 		}
 		oauth = &oauthConfig
 	}
@@ -4172,6 +5260,27 @@ func (p *MCPProxyServer) handleAddUpstream(ctx context.Context, request mcp.Call
 		TrustMode:   trustMode, // spec 086: carry the per-server trust_mode through on create
 	}
 
+	// F9: optional per-server expose_prompts override on add. GetBool can't tell
+	// absent from false, so probe the raw args for presence.
+	if rawArgs := request.GetArguments(); rawArgs != nil {
+		if raw, ok := rawArgs["expose_prompts"]; ok {
+			if b, ok := raw.(bool); ok {
+				serverConfig.ExposePrompts = &b
+			}
+		}
+	}
+
+	// #1148 round 6 (finding 4): on CREATE there is no stored value to bind a
+	// mask back to, so ANY mask this proxy rendered can only be a placeholder
+	// an agent copied out of another server's read payload — never a value
+	// worth persisting. Refusing beats persisting literal text like
+	// `••••AL (12 chars)` as an argv token or a header, which produces a server
+	// that fails to connect for a non-obvious reason. REST
+	// `POST /api/v1/servers` runs the same check, so the two create doors agree.
+	if err := checkServerWriteMasks("", serverConfig); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
 	// Save to storage
 	if err := p.storage.SaveUpstreamServer(serverConfig); err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to add upstream: %v", err)), nil
@@ -4182,14 +5291,19 @@ func (p *MCPProxyServer) handleAddUpstream(ctx context.Context, request mcp.Call
 		// Update runtime's in-memory config with the new server
 		// This is CRITICAL for test environments where SaveConfiguration() might fail
 		// Without this, the ConfigService won't know about the new server
+		//
+		// Copy-on-write: runtime.Config() returns the PUBLISHED snapshot that
+		// other goroutines read lock-free — the background reconcile/index
+		// passes, the httpapi handlers, and (server edition) an
+		// AdminServersProvider call on every authenticated request. Appending
+		// to its Servers in place writes shared state under those readers.
+		// See configWithAppendedServer.
 		currentConfig := p.mainServer.runtime.Config()
-		if currentConfig != nil {
-			// Add server to config's server list
-			currentConfig.Servers = append(currentConfig.Servers, serverConfig)
-			p.mainServer.runtime.UpdateConfig(currentConfig, "")
+		if updatedConfig := configWithAppendedServer(currentConfig, serverConfig); updatedConfig != nil {
+			p.mainServer.runtime.UpdateConfig(updatedConfig, "")
 			p.logger.Debug("Updated runtime config with new server",
 				zap.String("server", name),
-				zap.Int("total_servers", len(currentConfig.Servers)))
+				zap.Int("total_servers", len(updatedConfig.Servers)))
 		}
 
 		// Save configuration first to ensure servers are persisted to config file
@@ -4202,7 +5316,15 @@ func (p *MCPProxyServer) handleAddUpstream(ctx context.Context, request mcp.Call
 		}
 		p.mainServer.OnUpstreamServerChange()
 
-		// Spec 024: Emit config change activity for server addition
+		// Spec 024: Emit config change activity for server addition.
+		//
+		// Issue #1146 (review round 3): this is a SECOND activity row for the
+		// same `add`, built from the resolved values rather than the request
+		// map, so it does not pass through activityArgsFromRequest. It has the
+		// same durability class — BBolt, SSE, `mcpproxy activity list` — and
+		// `url` routinely carries a credential in its query string, so it gets
+		// the same redaction. Masking one row and publishing the other is not a
+		// redaction policy.
 		newValues := map[string]interface{}{
 			"protocol":    protocol,
 			"enabled":     enabled,
@@ -4214,7 +5336,7 @@ func (p *MCPProxyServer) handleAddUpstream(ctx context.Context, request mcp.Call
 		if command != "" {
 			newValues["command"] = command
 		}
-		p.mainServer.runtime.EmitActivityConfigChange("server_added", name, "mcp", nil, nil, newValues)
+		p.mainServer.runtime.EmitActivityConfigChange("server_added", name, "mcp", nil, nil, redactActivityConfigValues(newValues))
 	}
 
 	// Wait briefly for supervisor to reconcile and connect (if enabled)
@@ -4342,16 +5464,20 @@ func (p *MCPProxyServer) handleRemoveUpstream(_ context.Context, request mcp.Cal
 	return mcp.NewToolResultText(string(jsonResult)), nil
 }
 
-func (p *MCPProxyServer) handleUpdateUpstream(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+// handleUpdateUpstream returns the resolved config diff alongside the result so
+// handleUpstreamServers can record what actually changed in the activity log
+// (issue #1146). The diff is returned RAW — every rendering seam below and in
+// the caller passes it through redactedConfigDiff first.
+func (p *MCPProxyServer) handleUpdateUpstream(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, *config.ConfigDiff, error) {
 	name, err := request.RequireString("name")
 	if err != nil {
-		return mcp.NewToolResultError("Missing required parameter 'name'"), nil
+		return mcp.NewToolResultError("Missing required parameter 'name'"), nil, nil
 	}
 
 	// Find server by name first
 	servers, err := p.storage.ListUpstreams()
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("Failed to list upstreams: %v", err)), nil
+		return mcp.NewToolResultError(fmt.Sprintf("Failed to list upstreams: %v", err)), nil, nil
 	}
 
 	var serverID string
@@ -4365,32 +5491,36 @@ func (p *MCPProxyServer) handleUpdateUpstream(ctx context.Context, request mcp.C
 	}
 
 	if serverID == "" {
-		return mcp.NewToolResultError(fmt.Sprintf("Server '%s' not found", name)), nil
+		return mcp.NewToolResultError(fmt.Sprintf("Server '%s' not found", name)), nil, nil
 	}
 
 	// Build patch config from request parameters
 	patch, mergeOpts, err := p.buildPatchConfigFromRequest(request, existingServer)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return mcp.NewToolResultError(err.Error()), nil, nil
 	}
 
 	// Use smart merge to preserve existing config fields (Fix for #239, #240)
 	mergedServer, configDiff, err := config.MergeServerConfig(existingServer, patch, mergeOpts)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("Failed to merge config: %v", err)), nil
+		return mcp.NewToolResultError(fmt.Sprintf("Failed to merge config: %v", err)), nil, nil
 	}
 
-	// Log the config diff for audit trail (FR-006)
-	if configDiff != nil && !configDiff.IsEmpty() {
+	// Log the config diff for audit trail (FR-006). Issue #1146: config.FieldChange
+	// carries raw before/after VALUES, so logging Modified verbatim wrote env
+	// values, Authorization headers and oauth.client_secret to main.log in the
+	// clear. Render through the shared redactor instead.
+	redactedDiff := redactedConfigDiff(configDiff)
+	if redactedDiff != nil {
 		p.logger.Info("Server config updated via MCP tool",
 			zap.String("server", name),
-			zap.Any("modified", configDiff.Modified),
+			zap.Any("modified", redactedDiff["modified"]),
 			zap.Strings("removed", configDiff.Removed))
 	}
 
 	// Update in storage
 	if err := p.storage.UpdateUpstream(serverID, mergedServer); err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("Failed to update upstream: %v", err)), nil
+		return mcp.NewToolResultError(fmt.Sprintf("Failed to update upstream: %v", err)), nil, nil
 	}
 
 	// Update in upstream manager with connection monitoring
@@ -4400,7 +5530,7 @@ func (p *MCPProxyServer) handleUpdateUpstream(ctx context.Context, request mcp.C
 		if err := p.upstreamManager.AddServer(serverID, mergedServer); err != nil {
 			p.logger.Warn("Failed to connect to updated upstream", zap.String("id", serverID), zap.Error(err))
 			connectionStatus = statusError
-			connectionMessage = fmt.Sprintf("Failed to update server config: %v", err)
+			connectionMessage = scrubUpstreamText(fmt.Sprintf("Failed to update server config: %v", err))
 		} else {
 			// Monitor connection status for 1 minute
 			connectionStatus, connectionMessage = p.monitorConnectionStatus(ctx, name, 1*time.Minute)
@@ -4429,12 +5559,10 @@ func (p *MCPProxyServer) handleUpdateUpstream(ctx context.Context, request mcp.C
 		"connection_message": connectionMessage,
 	}
 
-	// Include diff in response for LLM transparency (T4.3)
-	if configDiff != nil && !configDiff.IsEmpty() {
-		responseMap["changes"] = map[string]interface{}{
-			"modified": configDiff.Modified,
-			"removed":  configDiff.Removed,
-		}
+	// Include diff in response for LLM transparency (T4.3). Issue #1146: values
+	// are masked — field paths, which is what agents branch on, are preserved.
+	if redactedDiff != nil {
+		responseMap["changes"] = redactedDiff
 	}
 
 	if isolationManager := p.getIsolationManager(); isolationManager != nil {
@@ -4445,22 +5573,24 @@ func (p *MCPProxyServer) handleUpdateUpstream(ctx context.Context, request mcp.C
 
 	jsonResult, err := json.Marshal(responseMap)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("Failed to serialize result: %v", err)), nil
+		return mcp.NewToolResultError(fmt.Sprintf("Failed to serialize result: %v", err)), nil, nil
 	}
 
-	return mcp.NewToolResultText(string(jsonResult)), nil
+	return mcp.NewToolResultText(string(jsonResult)), configDiff, nil
 }
 
-func (p *MCPProxyServer) handlePatchUpstream(_ context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+// handlePatchUpstream returns the resolved config diff alongside the result; see
+// handleUpdateUpstream for why (issue #1146).
+func (p *MCPProxyServer) handlePatchUpstream(_ context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, *config.ConfigDiff, error) {
 	name, err := request.RequireString("name")
 	if err != nil {
-		return mcp.NewToolResultError("Missing required parameter 'name'"), nil
+		return mcp.NewToolResultError("Missing required parameter 'name'"), nil, nil
 	}
 
 	// Find server by name first
 	servers, err := p.storage.ListUpstreams()
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("Failed to list upstreams: %v", err)), nil
+		return mcp.NewToolResultError(fmt.Sprintf("Failed to list upstreams: %v", err)), nil, nil
 	}
 
 	var serverID string
@@ -4474,32 +5604,33 @@ func (p *MCPProxyServer) handlePatchUpstream(_ context.Context, request mcp.Call
 	}
 
 	if serverID == "" {
-		return mcp.NewToolResultError(fmt.Sprintf("Server '%s' not found", name)), nil
+		return mcp.NewToolResultError(fmt.Sprintf("Server '%s' not found", name)), nil, nil
 	}
 
 	// Build patch config from request parameters
 	patch, mergeOpts, err := p.buildPatchConfigFromRequest(request, existingServer)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return mcp.NewToolResultError(err.Error()), nil, nil
 	}
 
 	// Use smart merge to preserve existing config fields (Fix for #239, #240)
 	mergedServer, configDiff, err := config.MergeServerConfig(existingServer, patch, mergeOpts)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("Failed to merge config: %v", err)), nil
+		return mcp.NewToolResultError(fmt.Sprintf("Failed to merge config: %v", err)), nil, nil
 	}
 
-	// Log the config diff for audit trail (FR-006)
-	if configDiff != nil && !configDiff.IsEmpty() {
+	// Log the config diff for audit trail (FR-006), values masked (issue #1146).
+	redactedDiff := redactedConfigDiff(configDiff)
+	if redactedDiff != nil {
 		p.logger.Info("Server config patched via MCP tool",
 			zap.String("server", name),
-			zap.Any("modified", configDiff.Modified),
+			zap.Any("modified", redactedDiff["modified"]),
 			zap.Strings("removed", configDiff.Removed))
 	}
 
 	// Update in storage
 	if err := p.storage.UpdateUpstream(serverID, mergedServer); err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("Failed to update upstream: %v", err)), nil
+		return mcp.NewToolResultError(fmt.Sprintf("Failed to update upstream: %v", err)), nil, nil
 	}
 
 	// Update in upstream manager
@@ -4527,12 +5658,9 @@ func (p *MCPProxyServer) handlePatchUpstream(_ context.Context, request mcp.Call
 		"enabled": mergedServer.Enabled,
 	}
 
-	// Include diff in response for LLM transparency (T4.3)
-	if configDiff != nil && !configDiff.IsEmpty() {
-		responseMap["changes"] = map[string]interface{}{
-			"modified": configDiff.Modified,
-			"removed":  configDiff.Removed,
-		}
+	// Include diff in response for LLM transparency (T4.3), values masked.
+	if redactedDiff != nil {
+		responseMap["changes"] = redactedDiff
 	}
 
 	if isolationManager := p.getIsolationManager(); isolationManager != nil {
@@ -4543,10 +5671,10 @@ func (p *MCPProxyServer) handlePatchUpstream(_ context.Context, request mcp.Call
 
 	jsonResult, err := json.Marshal(responseMap)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("Failed to serialize result: %v", err)), nil
+		return mcp.NewToolResultError(fmt.Sprintf("Failed to serialize result: %v", err)), nil, nil
 	}
 
-	return mcp.NewToolResultText(string(jsonResult)), nil
+	return mcp.NewToolResultText(string(jsonResult)), configDiff, nil
 }
 
 // buildPatchConfigFromRequest constructs a partial ServerConfig from request parameters
@@ -4566,7 +5694,15 @@ func (p *MCPProxyServer) buildPatchConfigFromRequest(request mcp.CallToolRequest
 		// #872: the read path masks URL query/userinfo secrets; if a caller
 		// echoes the masked url back, restore the stored real secrets so the
 		// mask is never persisted over them (parity with the REST PATCH path).
-		patch.URL = oauth.UnmaskURL(url, existingServer.URL)
+		// #1148 round 2: unmaskLiveURL recognises THIS surface's rendering
+		// first, then defers to oauth.UnmaskURL for a genuinely edited URL.
+		// #1148 round 4: a mask the per-parameter revert cannot bind is
+		// REFUSED rather than persisted over the credential.
+		unmaskedURL, err := unmaskLiveURL(url, existingServer.URL)
+		if err != nil {
+			return nil, opts, err
+		}
+		patch.URL = unmaskedURL
 	}
 	if protocol := request.GetString("protocol", ""); protocol != "" {
 		patch.Protocol = protocol
@@ -4578,6 +5714,11 @@ func (p *MCPProxyServer) buildPatchConfigFromRequest(request mcp.CallToolRequest
 		patch.Command = command
 	}
 	if trustMode := request.GetString("trust_mode", ""); trustMode != "" {
+		// GH #938: refuse an unrecognized tier rather than persisting a value the
+		// runtime will silently resolve to manual.
+		if !config.IsValidTrustMode(trustMode) {
+			return nil, opts, errors.New(invalidTrustModeError(trustMode))
+		}
 		patch.TrustMode = trustMode // spec 086: allow changing the per-server trust tier via update/patch
 	}
 
@@ -4607,6 +5748,18 @@ func (p *MCPProxyServer) buildPatchConfigFromRequest(request mcp.CallToolRequest
 		if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
 			return nil, opts, fmt.Errorf("invalid args_json format: %v", err)
 		}
+		// #1148 round 3: the read path masks credential-shaped argv tokens,
+		// and unlike env/headers/url there is NO unmask contract for argv —
+		// an argv slot has no key to bind a stored secret to, and the caller
+		// controls both the whole vector and `command`, so any revert can be
+		// steered into relocating the credential (see checkArgvMaskEcho).
+		// An echoed mask is therefore refused, not reverted: the caller
+		// resends the real value, so the mask is never restored into an
+		// attacker-chosen command line and never persisted over the
+		// credential either.
+		if err := checkArgvMaskEcho(args, existingServer.Args); err != nil {
+			return nil, opts, err
+		}
 		patch.Args = args
 	}
 
@@ -4631,7 +5784,10 @@ func (p *MCPProxyServer) buildPatchConfigFromRequest(request mcp.CallToolRequest
 			}
 		}
 		// #872: revert any masked env value echoed back by the caller.
-		patch.Env = oauth.UnmaskEnvValues(patch.Env, existingServer.Env)
+		// #1148 round 2: the live view can mask a value oauth's name rule left
+		// alone (a vendor-shaped credential under a benign name), so this
+		// surface's own rendering is recognised first.
+		patch.Env = oauth.UnmaskEnvValues(unmaskLiveEnvValues(patch.Env, existingServer.Env), existingServer.Env)
 	}
 
 	// Handle headers JSON string - maps are deep merged with RFC 7396 null-means-remove
@@ -4655,7 +5811,8 @@ func (p *MCPProxyServer) buildPatchConfigFromRequest(request mcp.CallToolRequest
 			}
 		}
 		// #872: revert any masked header value echoed back by the caller.
-		patch.Headers = oauth.UnmaskHeaders(patch.Headers, existingServer.Headers)
+		// #1148 round 2: see the env note above.
+		patch.Headers = oauth.UnmaskHeaders(unmaskLiveHeaders(patch.Headers, existingServer.Headers), existingServer.Headers)
 	}
 
 	// Handle isolation JSON string - deep merge for nested config
@@ -4667,6 +5824,11 @@ func (p *MCPProxyServer) buildPatchConfigFromRequest(request mcp.CallToolRequest
 			var isolation config.IsolationConfig
 			if err := json.Unmarshal([]byte(isolationJSON), &isolation); err != nil {
 				return nil, opts, fmt.Errorf("invalid isolation_json format: %v", err)
+			}
+			// GH #1142: refuse an unknown mode at the seam rather than writing
+			// a config file the next daemon start will reject.
+			if err := config.ValidateIsolationModeOverride(isolation.Mode); err != nil {
+				return nil, opts, fmt.Errorf("invalid isolation_json: %w", err)
 			}
 			patch.Isolation = &isolation
 		}
@@ -4683,6 +5845,19 @@ func (p *MCPProxyServer) buildPatchConfigFromRequest(request mcp.CallToolRequest
 		patch.InitTimeout = &v
 	}
 
+	// F9: per-server expose_prompts override. GetBool collapses absent→false, so
+	// detect key presence in the raw args and only set the pointer when the caller
+	// actually provided it (nil = leave unchanged for MergeServerConfig).
+	if args := request.GetArguments(); args != nil {
+		if raw, ok := args["expose_prompts"]; ok {
+			b, ok := raw.(bool)
+			if !ok {
+				return nil, opts, fmt.Errorf("invalid expose_prompts: must be a boolean, got %T", raw)
+			}
+			patch.ExposePrompts = &b
+		}
+	}
+
 	// Handle oauth JSON string - deep merge for nested config
 	if oauthJSON := request.GetString("oauth_json", ""); oauthJSON != "" {
 		// Check for explicit null removal
@@ -4693,8 +5868,29 @@ func (p *MCPProxyServer) buildPatchConfigFromRequest(request mcp.CallToolRequest
 			if err := json.Unmarshal([]byte(oauthJSON), &oauth); err != nil {
 				return nil, opts, fmt.Errorf("invalid oauth_json format: %v", err)
 			}
+			// #1148 round 2 (finding 6): list_quarantined renders the WHOLE
+			// config, so client_secret is masked on the read surface — and
+			// oauth_json REPLACES the block, so an unedited echo would persist
+			// the mask over the real secret. Revert it, bound to the field.
+			if err := unmaskLiveOAuth(&oauth, existingServer.OAuth); err != nil {
+				return nil, opts, err
+			}
+			if err := oauth.Validate(); err != nil {
+				return nil, opts, fmt.Errorf("invalid oauth_json: %w", err)
+			}
 			patch.OAuth = &oauth
 		}
+	}
+
+	// #1148 round 6: the fail-closed net. Every mask this proxy can bind back
+	// to the value it was read from has been reverted above; anything still
+	// carrying one is refused rather than persisted over a live credential.
+	// This is what covers the fields with no revert (isolation.extra_args) AND
+	// every field added to config.ServerConfig later — a new field fails CLOSED
+	// instead of silently round-tripping its own mask into the config. See
+	// oauth.ServerFieldMaskDecisions.
+	if err := checkServerWriteMasks("", patch); err != nil {
+		return nil, opts, err
 	}
 
 	return patch, opts, nil
@@ -4805,7 +6001,7 @@ func (p *MCPProxyServer) handleReadCache(ctx context.Context, request mcp.CallTo
 	if sess := mcpserver.ClientSessionFromContext(ctx); sess != nil {
 		sessionID = sess.SessionID()
 	}
-	requestID := fmt.Sprintf("%d-read_cache", time.Now().UnixNano())
+	requestID := mintCorrelationID("read_cache")
 
 	key, err := request.RequireString("key")
 	if err != nil {
@@ -4823,28 +6019,37 @@ func (p *MCPProxyServer) handleReadCache(ctx context.Context, request mcp.CallTo
 		"offset": offset,
 		"limit":  limit,
 	}
+	// Spec 028: auth identity on the activity record only (never in the
+	// cache-key derivation input, which stays `args`).
+	activityArgs := injectAuthMetadata(ctx, args)
 
 	// Validate parameters
 	if offset < 0 {
-		p.emitActivityInternalToolCall("read_cache", "", "", "", sessionID, requestID, "error", "Offset must be non-negative", time.Since(startTime).Milliseconds(), args, nil, nil, "")
+		p.emitActivityInternalToolCall("read_cache", "", "", "", sessionID, requestID, "error", "Offset must be non-negative", time.Since(startTime).Milliseconds(), activityArgs, nil, nil, "")
 		return mcp.NewToolResultError("Offset must be non-negative"), nil
 	}
 	if limit <= 0 || limit > 1000 {
-		p.emitActivityInternalToolCall("read_cache", "", "", "", sessionID, requestID, "error", "Limit must be between 1 and 1000", time.Since(startTime).Milliseconds(), args, nil, nil, "")
+		p.emitActivityInternalToolCall("read_cache", "", "", "", sessionID, requestID, "error", "Limit must be between 1 and 1000", time.Since(startTime).Milliseconds(), activityArgs, nil, nil, "")
 		return mcp.NewToolResultError("Limit must be between 1 and 1000"), nil
 	}
 
-	// Retrieve cached data
-	response, err := p.cacheManager.GetRecords(key, offset, limit)
+	// Retrieve cached data. The read is gated on the authorization the entry
+	// was produced under (Spec 104 FR-016a): a cache key is a hash, not a
+	// credential, and the MCP session is shared by whichever tokens present
+	// on it, so a narrower token must not page a payload a broader one
+	// generated. The gate runs here, on every page.
+	reader := p.cacheAuthorization(ctx)
+	response, err := p.cacheManager.GetRecordsAs(key, offset, limit, reader)
 	if err != nil {
-		p.emitActivityInternalToolCall("read_cache", "", "", "", sessionID, requestID, "error", err.Error(), time.Since(startTime).Milliseconds(), args, nil, nil, "")
-		return mcp.NewToolResultError(fmt.Sprintf("Failed to retrieve cached data: %v", err)), nil
+		// The activity record keeps the real reason; the body below may not.
+		p.emitActivityInternalToolCall("read_cache", "", "", "", sessionID, requestID, "error", err.Error(), time.Since(startTime).Milliseconds(), activityArgs, nil, nil, "")
+		return readCacheRefusal(err, reader), nil
 	}
 
 	// Serialize response
 	jsonResult, err := json.Marshal(response)
 	if err != nil {
-		p.emitActivityInternalToolCall("read_cache", "", "", "", sessionID, requestID, "error", err.Error(), time.Since(startTime).Milliseconds(), args, nil, nil, "")
+		p.emitActivityInternalToolCall("read_cache", "", "", "", sessionID, requestID, "error", err.Error(), time.Since(startTime).Milliseconds(), activityArgs, nil, nil, "")
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to serialize response: %v", err)), nil
 	}
 
@@ -4855,13 +6060,23 @@ func (p *MCPProxyServer) handleReadCache(ctx context.Context, request mcp.CallTo
 	// in that case there's nothing this layer can subdivide, so the oversize
 	// text flows through unchanged. p.logger receives a zap.Warn if the cache
 	// write fails so the resulting "cache key not found" is diagnosable.
+	//
+	// A re-cached page is stamped with the PARENT entry's snapshot, not the
+	// redeemer's (Spec 105 FR-001, monotone recursive provenance). Because
+	// the child's snapshot equals the parent's, the child's readers are
+	// exactly the parent's readers: a child never becomes redeemable by a
+	// caller the parent refused, nor unreadable to the producer whose payload
+	// it continues. (Under caller-kind-first ordering the redeemer is not
+	// necessarily broader in reach — a session-profiled administrator passes
+	// the gate — which is why the parent's snapshot, not "the narrower of the
+	// two", is the rule.)
 	text, reTruncated := maybeTruncateAndCacheText(
 		string(jsonResult),
 		"read_cache",
 		args,
 		len(response.Records),
 		p.currentTruncator(),
-		p.cacheManager,
+		p.cacheStoreAs(childPageProducer(response, reader)),
 		p.logger,
 	)
 
@@ -4871,7 +6086,7 @@ func (p *MCPProxyServer) handleReadCache(ctx context.Context, request mcp.CallTo
 	// operators, so surface it as a structured log: it signals the agent is
 	// walking a payload deep enough that even one cache page overflows.
 	if reTruncated {
-		p.logger.Info("read_cache output exceeded the response limit and was recursively truncated-and-cached",
+		p.logger.Info("read_cache output exceeded the response limit and was truncated",
 			zap.String("requested_key", key),
 			zap.Int("offset", offset),
 			zap.Int("limit", limit),
@@ -4881,16 +6096,45 @@ func (p *MCPProxyServer) handleReadCache(ctx context.Context, request mcp.CallTo
 	}
 
 	// Spec 024: Emit success event with args and response
-	p.emitActivityInternalToolCall("read_cache", "", "", "", sessionID, requestID, "success", "", time.Since(startTime).Milliseconds(), args, response, nil, "")
+	p.emitActivityInternalToolCall("read_cache", "", "", "", sessionID, requestID, "success", "", time.Since(startTime).Milliseconds(), activityArgs, response, nil, "")
 
 	return mcp.NewToolResultText(text), nil
 }
 
+// tailLogNotFound is the single refusal shape for tail_log. It is shared by
+// the "no such server" path and the "server outside the caller's scope" path
+// so that an agent token cannot use the difference between the two as an
+// existence oracle for servers it is not allowed to see (Spec 104 FR-016h).
+func tailLogNotFound(name string) *mcp.CallToolResult {
+	return mcp.NewToolResultError(fmt.Sprintf("Server '%s' not found: %v", name, storage.ErrUpstreamNotFound))
+}
+
 // handleTailLog implements the tail_log functionality
-func (p *MCPProxyServer) handleTailLog(_ context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (p *MCPProxyServer) handleTailLog(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	name, err := request.RequireString("name")
 	if err != nil {
 		return mcp.NewToolResultError("Missing required parameter 'name'"), nil
+	}
+
+	// Spec 104 FR-016h: tail_log is a per-server READ that agent tokens may
+	// invoke (it is deliberately absent from auth.agentDeniedServerOps), so the
+	// named server must be authorized against the token's AllowedServers AND
+	// the effective profile (pin > URL > session) BEFORE the storage lookup —
+	// the same scope predicate `list` filters by and call_tool_* enforces.
+	// Administrators (API key / OS socket / no AuthContext) skip the
+	// AllowedServers check but NOT the profile check: an explicit URL profile
+	// (/mcp/p/<slug>) or a session set_profile bounds every caller here exactly
+	// as it already does for `list` (handleListUpstreams) and call_tool_*
+	// (handleCallToolVariant's profile gate) — Spec 057 FR-004, "profile
+	// filtering is independent of agent scope". Pre-feature tail_log ignored
+	// its context entirely, so this is an administrator-visible change on
+	// profile-scoped connections; unscoped administrators are unaffected. The
+	// refusal is rendered by the same function as the nonexistent-server case
+	// so the response discloses neither existence, status nor logs.
+	authCtx := auth.AuthContextFromContext(ctx)
+	_, profileScope := p.resolveActiveProfile(ctx)
+	if !p.serverInScope(authCtx, profileScope, name) {
+		return tailLogNotFound(name), nil
 	}
 
 	// Get optional lines parameter
@@ -4916,6 +6160,9 @@ func (p *MCPProxyServer) handleTailLog(_ context.Context, request mcp.CallToolRe
 	// Check if server exists
 	serverConfig, err := p.storage.GetUpstreamServer(name)
 	if err != nil {
+		if errors.Is(err, storage.ErrUpstreamNotFound) {
+			return tailLogNotFound(name), nil
+		}
 		return mcp.NewToolResultError(fmt.Sprintf("Server '%s' not found: %v", name, err)), nil
 	}
 
@@ -4927,8 +6174,22 @@ func (p *MCPProxyServer) handleTailLog(_ context.Context, request mcp.CallToolRe
 		}
 	}
 
-	// Read log tail
-	logLines, err := logs.ReadUpstreamServerLogTail(logConfig, name, lines)
+	// Read log tail. Spec 105 FR-007 (research D8): two raw names can share
+	// one log file (`a/b` and `a_b` both sanitise to server-a_b.log), so a
+	// scoped caller receives only the records attributable to the server it
+	// asked for — filtered BEFORE the tail limit, so an interleaved co-owner
+	// record never displaces an authorized one, and lines_returned counts the
+	// authorized tail. The policy is uniform whether or not a co-owner exists:
+	// legacy records with no writer stamp are withheld either way, never a
+	// whole-file refusal. Administrators (nil AuthContext, API key, socket)
+	// keep the whole file exactly as before (SC-005) — a profile scope bounds
+	// WHICH server they may name (above), not which records of it they see.
+	var logLines []string
+	if authCtx == nil || authCtx.IsAdmin() {
+		logLines, err = logs.ReadUpstreamServerLogTail(logConfig, name, lines)
+	} else {
+		logLines, err = logs.ReadUpstreamServerLogTailAttributed(logConfig, name, lines)
+	}
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to read log for server '%s': %v", name, err)), nil
 	}
@@ -4938,7 +6199,13 @@ func (p *MCPProxyServer) handleTailLog(_ context.Context, request mcp.CallToolRe
 		"server_name":     name,
 		"lines_requested": lines,
 		"lines_returned":  len(logLines),
-		"log_lines":       logLines,
+		// Issue #1148 (c2): the per-server log is written by mcpproxy AND by
+		// the child process, and both put credentials in it — the connection
+		// logger records the upstream URL with its `?token=…`, and an MCP
+		// server is free to print its own API key. Scrub every line before it
+		// leaves through the tool response and is recorded into the activity
+		// store.
+		"log_lines": scrubUpstreamLines(logLines),
 		"server_status": map[string]interface{}{
 			"enabled":     serverConfig.Enabled,
 			"quarantined": serverConfig.Quarantined,
@@ -4948,6 +6215,21 @@ func (p *MCPProxyServer) handleTailLog(_ context.Context, request mcp.CallToolRe
 	// Add connection status if available
 	if client, exists := p.upstreamManager.GetClient(name); exists {
 		connectionStatus := client.GetConnectionStatus()
+		// last_error commonly echoes the upstream URL, credentials included.
+		if lastError, ok := connectionStatus["last_error"].(string); ok {
+			lastError = scrubUpstreamText(lastError)
+			// Spec 105 FR-007 (codex round 3): a connect error re-emits the
+			// child's stderr, and on a `docker run` name collision that names
+			// another server's container (`a/b` and `a-b` generate the same
+			// name). Scoped callers get container mentions redacted — the
+			// same predicate the attributed reader applies to the log record
+			// — uniformly, whether or not a co-owner exists; administrators
+			// keep the text (SC-005).
+			if authCtx != nil && !authCtx.IsAdmin() {
+				lastError = logs.RedactContainerMentions(lastError)
+			}
+			connectionStatus["last_error"] = lastError
+		}
 		result["connection_status"] = connectionStatus
 	}
 
@@ -5007,12 +6289,16 @@ func (p *MCPProxyServer) createDetailedErrorResponse(err error, serverName, tool
 	// Check if it's our enhanced error types
 	if errors.As(err, &httpErr) {
 		// We have HTTP error details
+		// Issue #1148, round 8: `server_url` is the FULL upstream request URL,
+		// query credentials and all, and `response_body` is whatever the
+		// upstream printed — both went out of the MCP surface verbatim. Route
+		// them through the same two shared rules every other door uses.
 		errorDetails := map[string]interface{}{
-			"error": httpErr.Error(),
+			"error": scrubUpstreamText(httpErr.Error()),
 			"http_details": map[string]interface{}{
 				"status_code":   httpErr.StatusCode,
-				"response_body": httpErr.Body,
-				"server_url":    httpErr.URL,
+				"response_body": scrubUpstreamText(httpErr.Body),
+				"server_url":    liveRedaction.URLValue(httpErr.URL),
 				"method":        httpErr.Method,
 			},
 			"troubleshooting": p.generateTroubleshootingAdvice(httpErr.StatusCode, httpErr.Body),
@@ -5025,16 +6311,16 @@ func (p *MCPProxyServer) createDetailedErrorResponse(err error, serverName, tool
 	if errors.As(err, &jsonRPCErr) {
 		// We have JSON-RPC error details
 		errorDetails := map[string]interface{}{
-			"error":      jsonRPCErr.Message,
+			"error":      scrubUpstreamText(jsonRPCErr.Message),
 			"error_code": jsonRPCErr.Code,
-			"error_data": jsonRPCErr.Data,
+			"error_data": redactValueWith("error_data", normalizeForRedaction(jsonRPCErr.Data), liveRedaction),
 		}
 
 		if jsonRPCErr.HTTPError != nil {
 			errorDetails["http_details"] = map[string]interface{}{
 				"status_code":   jsonRPCErr.HTTPError.StatusCode,
-				"response_body": jsonRPCErr.HTTPError.Body,
-				"server_url":    jsonRPCErr.HTTPError.URL,
+				"response_body": scrubUpstreamText(jsonRPCErr.HTTPError.Body),
+				"server_url":    liveRedaction.URLValue(jsonRPCErr.HTTPError.URL),
 			}
 			errorDetails["troubleshooting"] = p.generateTroubleshootingAdvice(jsonRPCErr.HTTPError.StatusCode, jsonRPCErr.HTTPError.Body)
 		}
@@ -5226,7 +6512,15 @@ func (p *MCPProxyServer) monitorConnectionStatus(ctx context.Context, serverName
 				case types.StateReady:
 					return "ready", "Server connected and ready"
 				case types.StateError:
-					return "error", fmt.Sprintf("Server connection failed: %v", connectionInfo.LastError)
+					// Issue #1148 (c3): scrubbed like the `last_error` this
+					// same string feeds in `upstream_servers list` — it lands
+					// in connection_message and in the activity record.
+					return "error", scrubUpstreamText(fmt.Sprintf("Server connection failed: %v", connectionInfo.LastError))
+				case types.StatePendingAuth:
+					// Parked awaiting user login (#1013): waiting out the monitor
+					// timeout would just stall the caller — nothing will change
+					// until a human signs in.
+					return statusError, scrubUpstreamText(fmt.Sprintf("Server connection failed: %v", connectionInfo.LastError))
 				case types.StateDisconnected:
 					// If server is explicitly disconnected and enabled is false, return disabled
 					for _, serverConfig := range p.config.Servers {
@@ -5262,6 +6556,19 @@ func (p *MCPProxyServer) monitorConnectionStatus(ctx context.Context, serverName
 func (p *MCPProxyServer) CallToolDirect(ctx context.Context, request mcp.CallToolRequest) (interface{}, error) {
 	toolName := request.Params.Name
 
+	// Spec 093 FR-011: the REST surface must answer a concurrency-limiter shed
+	// with 429 + Retry-After, but the handlers below can only answer with an
+	// isError RESULT (the MCP contract). Install a capture box so the typed
+	// *limiter.LimitError survives to the HTTP layer instead of being flattened
+	// into a string by the IsError branch at the bottom of this function.
+	ctx, shed := withShedCapture(ctx)
+
+	// Spec 097: the same problem for code_execution's refusals — a disabled
+	// feature is a 403 and a missing stored script a 404, but the handler can
+	// only answer with an isError result. Capture the typed refusal so the HTTP
+	// layer classifies it without re-parsing the message.
+	ctx, codeExecRefusal := withCodeExecCapture(ctx)
+
 	// Route to the appropriate handler based on tool name
 	var result *mcp.CallToolResult
 	var err error
@@ -5277,6 +6584,13 @@ func (p *MCPProxyServer) CallToolDirect(ctx context.Context, request mcp.CallToo
 		result, err = p.handleCallToolDestructive(ctx, request)
 	case "retrieve_tools":
 		result, err = p.handleRetrieveTools(ctx, request)
+	case "read_cache":
+		// Truncated responses on this path carry the same "use read_cache"
+		// banner the MCP surface emits, so the follow-up has to be routable
+		// here too — otherwise REST/CLI/Web-UI/tray callers are told to call a
+		// tool that answers "unknown tool: read_cache" (HTTP 500) and the
+		// parked payload is unreachable outside an MCP session.
+		result, err = p.handleReadCache(ctx, request)
 	case "quarantine_security":
 		result, err = p.handleQuarantineSecurity(ctx, request)
 	case "code_execution":
@@ -5302,8 +6616,19 @@ func (p *MCPProxyServer) CallToolDirect(ctx context.Context, request mcp.CallToo
 
 	// Extract the actual result content from the MCP response
 	if result.IsError {
+		// A shed keeps its typed identity so the HTTP layer can map it to 429 +
+		// Retry-After (FR-011). The message is still the agent-readable one.
+		if limitErr := shed.take(); limitErr != nil {
+			return nil, &shedDispatchError{limitErr: limitErr, message: shedMessage(limitErr)}
+		}
 		if len(result.Content) > 0 {
 			if textContent, ok := result.Content[0].(mcp.TextContent); ok {
+				// A code_execution refusal keeps its typed identity so the HTTP
+				// layer can answer 403/404/400 (Spec 097). The message stays the
+				// agent-readable one either way.
+				if refusal := codeExecRefusal.take(); refusal != nil {
+					return nil, &codeExecDispatchError{err: refusal, message: textContent.Text}
+				}
 				return nil, fmt.Errorf("%s", textContent.Text)
 			}
 		}
@@ -5404,6 +6729,16 @@ func (p *MCPProxyServer) getVisibleToolCount(serverName string) int {
 		return 0
 	}
 
+	// #1064: a quarantined server contributes no AVAILABLE tools -- every
+	// dispatch to them is refused with a SECURITY BLOCK. Gated here rather than
+	// in isToolCallable, which is the search filter and must stay
+	// quarantine-blind to preserve merge-base retrieve_tools semantics
+	// (Spec 085 FR-006/FR-011). The tools themselves stay in the StateView so
+	// the review surface can still list them.
+	if cfg, err := p.storage.GetUpstreamServer(serverName); err == nil && cfg != nil && cfg.Quarantined {
+		return 0
+	}
+
 	supervisor := p.mainServer.runtime.Supervisor()
 	if supervisor == nil {
 		return 0
@@ -5417,7 +6752,7 @@ func (p *MCPProxyServer) getVisibleToolCount(serverName string) int {
 
 	visible := 0
 	for _, tool := range serverStatus.Tools {
-		if p.isToolCallable(serverName, tool.Name) {
+		if p.isExactToolCallable(serverName, tool.Name) {
 			visible++
 		}
 	}
@@ -5470,46 +6805,47 @@ func (p *MCPProxyServer) serverToolCounts(serverName string, toolNames []string)
 }
 
 // classifyServerToolStatus returns "" when the tool is callable, otherwise the
-// disable reason. Mirrors classifyDisabledTool's precedence so the two never
-// drift. The config-denied leg prefers the live runtime signal (the same
-// authority isToolCallable/blockedToolMessage use — config-file disabled_tools
-// only lives in the live config, not always in the storage copy); it falls
-// back to the storage ServerConfig when no runtime is wired (unit tests).
+// disable reason. It delegates to the SHARED gate primitive (Spec 098 FR-002 /
+// research D2), so the discovery-facing status can no longer disagree with what
+// dispatch would actually do. Two divergences of the pre-098 classifier are
+// resolved in dispatch's favor, because dispatch is ground truth:
+//
+//   - the pending/changed gate now honors the quarantine flags (global switch +
+//     per-server trust_mode auto). The old version checked the approval status
+//     unconditionally and therefore reported false "pending_approval" for
+//     auto-approving servers whose tools dispatch happily calls;
+//   - a quarantined SERVER now reports server_quarantined instead of "callable"
+//     — every dispatch path refuses those tools.
+//
+// A genuine approval-read failure keeps the historical behavior here (report
+// callable rather than invent a lock): this surface describes state, it does not
+// gate anything, and the gates themselves still fail closed.
+//
+// The pair is a SPLIT (server, RAW tool) pair — StateView / ListTools names
+// from serverToolNames, the retrieve loop's once-derived raw name, describe's
+// split id — and is read through the exact gate (Spec 105 FR-009): a raw
+// name that begins with the server's own prefix must be counted and
+// classified as itself, not as the suffix sibling.
 func (p *MCPProxyServer) classifyServerToolStatus(serverName, toolName string) contracts.DisabledToolStatus {
-	if strings.Contains(toolName, ":") {
-		if parts := strings.SplitN(toolName, ":", 2); len(parts) == 2 {
-			if serverName == "" {
-				serverName = parts[0]
-			}
-			toolName = parts[1]
-		}
-	}
-	sc, err := p.storage.GetUpstreamServer(serverName)
-	if err != nil || sc == nil {
+	gate := p.evaluateExactToolGate(serverName, toolName)
+	switch gate.class {
+	case preflight.ToolClassServerNotConfigured:
+		return contracts.DisabledStatusUnknown
+	case preflight.ToolClassServerQuarantined:
+		return contracts.DisabledStatusServerQuarantined
+	case preflight.ToolClassServerDisabled:
+		return contracts.DisabledStatusServerDisabled
+	case preflight.ToolClassDeniedByConfig:
+		return contracts.DisabledStatusByConfig
+	case preflight.ToolClassBlockedByUser:
+		return contracts.DisabledStatusByUser
+	case preflight.ToolClassPendingApproval, preflight.ToolClassChanged:
+		return contracts.DisabledStatusPendingApproval
+	case preflight.ToolClassReady:
+		return "" // callable
+	default:
 		return contracts.DisabledStatusUnknown
 	}
-	if !sc.Enabled {
-		return contracts.DisabledStatusServerDisabled
-	}
-	configDenied := false
-	if p.mainServer != nil && p.mainServer.runtime != nil {
-		configDenied = p.mainServer.runtime.IsToolConfigDenied(serverName, toolName)
-	} else {
-		configDenied = !sc.IsToolAllowedByConfig(toolName)
-	}
-	if configDenied {
-		return contracts.DisabledStatusByConfig
-	}
-	if approval, aerr := p.storage.GetToolApproval(serverName, toolName); aerr == nil && approval != nil {
-		if approval.Disabled {
-			return contracts.DisabledStatusByUser
-		}
-		if approval.Status == storage.ToolApprovalStatusPending ||
-			approval.Status == storage.ToolApprovalStatusChanged {
-			return contracts.DisabledStatusPendingApproval
-		}
-	}
-	return "" // callable
 }
 
 // serverToolNames returns the best-available list of a server's tool names:
@@ -5539,16 +6875,18 @@ func (p *MCPProxyServer) serverToolNames(serverName string) []string {
 }
 
 func (p *MCPProxyServer) isToolCallable(serverName, toolName string) bool {
-	if strings.Contains(toolName, ":") {
-		parts := strings.SplitN(toolName, ":", 2)
-		if len(parts) == 2 {
-			if serverName == "" {
-				serverName = parts[0]
-			}
-			toolName = parts[1]
-		}
-	}
+	// Same prefix rule as every other gate (Spec 105 FR-009): only the
+	// server's own indexing prefix is stripped; a foreign "ns:" segment is
+	// part of the raw tool name and keys config denial / approval as itself.
+	serverName, toolName = normalizeServerTool(serverName, toolName)
+	return p.isExactToolCallable(serverName, toolName)
+}
 
+// isExactToolCallable is isToolCallable for a pair that is already split into
+// server and RAW tool name (a live ListTools / StateView name, or a pair a
+// resolver normalized once). It never re-normalizes, so a raw name carrying
+// the server's own prefix keys config denial and approval as itself.
+func (p *MCPProxyServer) isExactToolCallable(serverName, toolName string) bool {
 	if serverName == "" || toolName == "" {
 		return false
 	}
@@ -5562,6 +6900,13 @@ func (p *MCPProxyServer) isToolCallable(serverName, toolName string) bool {
 		return false
 	}
 
+	// NOTE: quarantine is deliberately NOT gated here. isToolCallable is the
+	// SEARCH filter and must reproduce merge-base semantics exactly (Spec 085
+	// FR-006/FR-011) -- retrieve_tools still surfaces a quarantined server's
+	// lingering indexed tools; the stricter p.toolVisibleToSession is what
+	// applies the quarantine gate. The #1064 counting fix lives in
+	// getVisibleToolCount instead.
+
 	// Config-layer filter — evaluated at call time, never written to BBolt.
 	// A tool absent from enabled_tools or present in disabled_tools is hard off.
 	if p.mainServer != nil && p.mainServer.runtime != nil {
@@ -5570,7 +6915,7 @@ func (p *MCPProxyServer) isToolCallable(serverName, toolName string) bool {
 		}
 	}
 
-	approval, err := p.storage.GetToolApproval(serverName, toolName)
+	approval, err := p.lookupToolApproval(serverName, toolName)
 	switch {
 	case err == nil:
 		if approval != nil && approval.Disabled {
@@ -5815,35 +7160,444 @@ func toolNameMatchesQuery(toolName string, tokens []string) bool {
 }
 
 func (p *MCPProxyServer) lookupToolAnnotations(serverName, toolName string) *config.ToolAnnotations {
-	if p.mainServer == nil || p.mainServer.runtime == nil {
-		return nil
-	}
+	annotations, _ := p.lookupToolAnnotationsFound(serverName, toolName)
+	return annotations
+}
 
-	// Callers now pass the canonical "server:tool" identity (#871), while the
-	// StateView stores bare tool names on the live path — strip the prefix so
-	// the name match below cannot silently miss (Issue #306 regression guard).
+// lookupToolAnnotationsFound is lookupToolAnnotations that also reports whether
+// the StateView knows the tool at all. A nil result with found=true is a
+// discovered tool that publishes no annotations; found=false means the proxy
+// has no metadata for it (server unknown, not yet discovered, or no runtime)
+// and no tier can be established from it.
+//
+// Callers pass the canonical "server:tool" identity (#871), while the
+// StateView stores bare tool names on the live path — the prefix is stripped
+// so the name match cannot silently miss (Issue #306 regression guard). A
+// caller that already holds a SPLIT pair must use lookupExactToolAnnotations
+// instead: normalizing it again would strip a raw name's own leading segment.
+func (p *MCPProxyServer) lookupToolAnnotationsFound(serverName, toolName string) (*config.ToolAnnotations, bool) {
 	serverName, toolName = normalizeServerTool(serverName, toolName)
+	return p.lookupExactToolAnnotations(serverName, toolName)
+}
+
+// lookupExactToolAnnotations is lookupToolAnnotationsFound for a pair that is
+// ALREADY split into server and raw tool name — handleCallToolVariant's and
+// handleCallTool's parsed id, the sandbox's callTool(server, tool) arguments.
+// It never re-normalizes: a raw tool name may itself begin with the server's
+// own prefix ("a:ns:erase" on server "a"), and normalizeServerTool would
+// strip that segment and classify the pair as the suffix tool "ns:erase"
+// while dispatch still targets "a:ns:erase" (Spec 105 FR-009).
+func (p *MCPProxyServer) lookupExactToolAnnotations(serverName, toolName string) (*config.ToolAnnotations, bool) {
+	identity := p.resolveExactToolIdentity(serverName, toolName)
+	return identity.Annotations, identity.Found
+}
+
+// toolIdentity is the outcome of resolving one split (server, RAW tool) pair
+// against the live discovery snapshot (Spec 105 FR-009, research D4). It is
+// the registration identity every dispatch path authorizes against: the
+// annotations feed the target-tier gate, and the two booleans tell an
+// undiscovered name on a server the proxy knows apart from a server the
+// snapshot has never held.
+type toolIdentity struct {
+	// ServerKnown reports whether the snapshot holds the server at all. False
+	// also covers a proxy with no runtime wired (pure-unit constructions),
+	// which therefore never refuses on identity grounds.
+	ServerKnown bool
+	// SnapshotHydrated reports whether the server is in the state in which
+	// its snapshot is the authority on its tool set: enabled, not quarantined
+	// and CONNECTED. "Enabled" and "not quarantined" are decided by the
+	// PERSISTED server record — the same read the server-level verdicts
+	// (quarantined / disabled) are decided from — never by the StateView's
+	// cached copy of those flags, which lags an operator's write (codex r6
+	// G1). "Connected" is decided by the LIVE client when there is
+	// one (codex r5 F1): the snapshot's Connected flag is written by
+	// best-effort events or the 30s reconcile and can still read true after
+	// the client has dropped, and a snapshot the live client contradicts is
+	// as stale as one that reads Connected=false — it is NOT hydrated. The
+	// StateView registers every configured server; for one that is
+	// disconnected, connecting, OAuth-pending, disabled or quarantined its
+	// tool list is NOT authoritative — usually empty, but the reconcile sweep
+	// republishes a disconnected server's retained set for counts
+	// (supervisor.reconcile), and a lagging disconnect leaves the previous
+	// connection's full stamp and list in place — so neither an absent nor a
+	// present name there says anything about the tool's identity, only about
+	// the server's state, and the server-level verdicts (quarantined /
+	// disabled / not connected / reconnect_on_use) own that answer exactly as
+	// they did before Spec 105, for every name on the server alike (SC-005).
+	SnapshotHydrated bool
+	// DiscoveryDone reports whether a discovery pass has completed for the
+	// LIVE connection: stateview.ServerStatus.ToolsDiscovered is set AND the
+	// connection token the stamp was captured under
+	// (ServerStatus.DiscoveryEpoch) is the live client's current one
+	// (managed.Client.ConnectionEpoch). Then the snapshot's tool list —
+	// possibly EMPTY, for an upstream that lists no tools — is its
+	// authoritative result. A connected server whose discovery has not run
+	// yet is NOT resolvable: its snapshot is empty for want of a pass, not
+	// because the name is absent, and admitting names in that window with
+	// the destructive-tier fallback would let an upstream that hides tools
+	// from tools/list keep them callable with zero approval. Nor is a server
+	// whose stamp belongs to a PREVIOUS connection (astra r2 C3): the
+	// connect/disconnect events that clear the stamp are best-effort, and a
+	// name connection A discovered says nothing about what connection B
+	// serves under it.
+	DiscoveryDone bool
+	// StaleConnection reports that DiscoveryDone was withdrawn because the
+	// live client's connection token differs from the snapshot's stamp: the
+	// discovery result is a previous connection's (astra r2 C3).
+	StaleConnection bool
+	// DiscoveryEpoch is the connection generation the snapshot's discovery
+	// stamp was captured under (stateview.ServerStatus.DiscoveryEpoch). When
+	// DiscoveryDone stands it is the LIVE client's generation too, so it is
+	// the generation a certified identity is valid on — and the one the
+	// dispatch that follows must be pinned to (codex r3 D2; certified).
+	DiscoveryEpoch int64
+	// Found reports whether the server's snapshot lists the raw name, verbatim.
+	Found bool
+	// Description and Annotations are the snapshot's metadata for the tool;
+	// zero when Found is false.
+	Description string
+	Annotations *config.ToolAnnotations
+}
+
+// Unresolved reports the D4 refusal condition: the server is known and
+// CONNECTED, and either its discovery has not completed for this connection
+// or its completed discovery result does not list the raw name — in both
+// cases a name whose permission tier cannot be established, so no caller may
+// dispatch it. Two things are NOT this condition: a server the snapshot does
+// not hold (server-existence handling, which stays with the paths that own
+// it), and a known server whose snapshot is NOT HYDRATED because of its own
+// state (quarantined, disabled, disconnected, connecting) — those keep their
+// pre-105 server-level verdicts, which run in the same order they always did
+// and which the caller's reconnect_on_use path relies on. "Quarantined" and
+// "disabled" are the PERSISTED record's word (codex r6 G1) — the read the
+// server-level verdicts themselves are decided from, so this condition can
+// be true only when that same read cannot answer quarantined or disabled;
+// the StateView's cached flags, which lag an operator's write, never decide
+// it. "Disconnected" is
+// the LIVE client's word where there is one, not the snapshot's flag (codex
+// r5 F1): a snapshot that still reads Connected=true for a dropped client is
+// not hydrated either. A not-hydrated snapshot is not necessarily EMPTY (the
+// reconcile sweep retains a disconnected server's tool set for counts; a
+// lagging disconnect leaves the previous connection's whole list), which is
+// why the deferral is safe only while the live client really is not
+// connected: once it is, liveIdentityRefusal re-reads and admits nothing
+// short of certified().
+func (id toolIdentity) Unresolved() bool {
+	return id.ServerKnown && id.SnapshotHydrated && (!id.DiscoveryDone || !id.Found)
+}
+
+// certified reports that the live snapshot lists the raw name as a completed
+// discovery result of the CURRENT connection generation — the only state in
+// which DiscoveryEpoch names the generation the identity is valid on. A
+// dispatch that follows a certified read is pinned to that generation
+// (managed.Client.CallToolOnEpoch): it reaches the upstream on exactly the
+// connection the name, tier and approval hash were certified against, or not
+// at all (Spec 105 FR-009 "stale generation"; codex r3 D2). On a CONNECTED
+// live client it is also the only admitting outcome of liveIdentityRefusal
+// (codex r4 E1); the unpinned dispatch remains only for the shapes in which
+// that check stands aside (no runtime, server not in the StateView, client
+// not connected) — the server-existence and not-connected handling own it.
+func (id toolIdentity) certified() bool {
+	return id.ServerKnown && id.SnapshotHydrated && id.DiscoveryDone && id.Found
+}
+
+// resolveExactToolIdentity resolves a pair that is ALREADY split into server
+// and raw tool name against the StateView snapshot. It never re-normalizes:
+// a raw tool name may itself begin with the server's own prefix ("a:ns:erase"
+// on server "a"), and normalizeServerTool would strip that segment and
+// classify the pair as the suffix tool "ns:erase" while dispatch still
+// targets "a:ns:erase" (Spec 105 FR-009).
+//
+// It reads the server's PERSISTED record for the hydration verdict (codex
+// r6 G1; see resolveExactToolIdentityIn). A caller that already holds that
+// record — the shared gate, evaluateExactToolGate, and every step of a
+// dispatch that follows the gate (liveIdentityRefusal, the sandbox bridge's
+// hydration) — must resolve through resolveExactToolIdentityWith instead, so
+// its server-level verdicts and the identity derive from ONE read (codex r7
+// H1: one persisted record per dispatch). This convenience is for the
+// non-dispatch readers (describe_tool, visibility, direct callability) and
+// for tests.
+func (p *MCPProxyServer) resolveExactToolIdentity(serverName, toolName string) toolIdentity {
+	return p.resolveExactToolIdentityWith(p.persistedServerRecord(serverName), serverName, toolName)
+}
+
+// resolveExactToolIdentityWith is resolveExactToolIdentity for a caller that
+// already holds the server's persisted record (nil when there is none).
+func (p *MCPProxyServer) resolveExactToolIdentityWith(record *config.ServerConfig, serverName, toolName string) toolIdentity {
+	if p.mainServer == nil || p.mainServer.runtime == nil {
+		return toolIdentity{}
+	}
 
 	supervisor := p.mainServer.runtime.Supervisor()
 	if supervisor == nil {
-		return nil
+		return toolIdentity{}
 	}
 
-	snapshot := supervisor.StateView().Snapshot()
-	serverStatus, exists := snapshot.Servers[serverName]
-	if !exists {
+	return p.resolveExactToolIdentityIn(supervisor.StateView().Snapshot().Servers, serverName, toolName, record)
+}
+
+// persistedServerRecord reads one stored upstream record, the authority the
+// server-level verdicts (quarantined / disabled) are decided from. It
+// returns nil when the proxy has no storage, the server has no record, or
+// the record cannot be read: the identity read then falls back to the
+// StateView's own flags, and a genuine read failure is refused by the shared
+// gate's storageErr (toolGate.callable fails closed) on every dispatch path.
+func (p *MCPProxyServer) persistedServerRecord(serverName string) *config.ServerConfig {
+	if p.storage == nil || serverName == "" {
 		return nil
 	}
+	record, err := p.storage.GetUpstreamServer(serverName)
+	if err != nil {
+		return nil
+	}
+	return record
+}
 
-	for _, tool := range serverStatus.Tools {
-		// tool.Name may be in "server:tool" format (from ToolMetadata.Name),
-		// while toolName is just the tool part. Match both formats.
-		if tool.Name == toolName || tool.Name == serverName+":"+toolName {
-			return tool.Annotations
+// resolveExactToolIdentityIn is resolveExactToolIdentity against a
+// caller-supplied StateView snapshot, so a batch reader that already holds
+// one (the preflight glue) resolves every id against the same instant it
+// reads the connection state from, and against a caller-supplied persisted
+// server record.
+//
+// The record, when there is one, decides the enabled / quarantined half of
+// hydration (codex r6 G1). The StateView's Enabled and Quarantined flags are
+// a CACHE of the persisted record, refreshed by the reconcile pass that
+// follows an operator's write (Runtime.EnableServer writes storage and
+// reloads in a goroutine; QuarantineServer writes storage before its
+// reconcile), so a call that interleaves reads a record that says quarantined
+// or disabled while the snapshot still reads enabled, non-quarantined,
+// connected and discovered. The server-level verdicts every dispatch path
+// answers (toolGate.serverQuarantined, ToolClassServerDisabled) come from
+// the record, so hydration must too: otherwise an absent name on the freshly
+// quarantined server was refused as "undiscovered or stale — refresh with
+// retrieve_tools" while the listed sibling answered the quarantine analysis
+// — two names, one server, two verdicts (SC-005 parity), and a remediation
+// that cannot heal a quarantined server. With no record (a StateView-only
+// fixture, a server not in storage) the snapshot's own flags stand.
+func (p *MCPProxyServer) resolveExactToolIdentityIn(servers map[string]*stateview.ServerStatus, serverName, toolName string, record *config.ServerConfig) toolIdentity {
+	serverStatus, exists := servers[serverName]
+	if !exists || serverStatus == nil {
+		return toolIdentity{}
+	}
+	enabled, quarantined := serverStatus.Enabled, serverStatus.Quarantined
+	if record != nil {
+		enabled, quarantined = record.Enabled, record.Quarantined
+	}
+	identity := toolIdentity{
+		ServerKnown:      true,
+		SnapshotHydrated: enabled && !quarantined && serverStatus.Connected,
+		DiscoveryDone:    serverStatus.ToolsDiscovered,
+		DiscoveryEpoch:   serverStatus.DiscoveryEpoch,
+	}
+	// The snapshot's Connected and its discovery stamp are written by
+	// best-effort events (dropped on a full channel, delivered through two
+	// goroutine hops) or the 30s reconcile, so they can lag the live client
+	// in BOTH directions, and the live client is the authority on each:
+	//
+	//   - The client is present and NOT connected while the snapshot still
+	//     reads Connected=true (the disconnect event is in flight or was
+	//     dropped; codex r5 F1): nothing on that snapshot is authoritative
+	//     any more — its Connected is stale, exactly as if it read false —
+	//     so it is NOT hydrated and the not-connected / connecting /
+	//     reconnect_on_use verdicts own every name on the server, listed or
+	//     not, in their pre-105 order (research D4; SC-005 parity: two names
+	//     on one dropped server must not answer different verdicts, and the
+	//     "refresh with retrieve_tools" remediation cannot heal a dropped
+	//     server).
+	//   - The client is connected but a NEW connection while the snapshot
+	//     still carries the previous one's stamp and tools (astra r2 C3):
+	//     the stamp certifies the tool list only for the connection it was
+	//     captured on, so a token mismatch is the discovery window for this
+	//     connection — refused as "discovery has not completed", not as a
+	//     stale name — until its own pass re-stamps the snapshot.
+	//   - No client at all (a pure-unit proxy, or a StateView-only fixture):
+	//     the snapshot stands as read, fail-closed.
+	//
+	// The mirror window — snapshot Connected=false while the live client IS
+	// connected — is closed by liveIdentityRefusal (astra r1 I3), which the
+	// dispatch paths run once they have found the client connected.
+	if identity.SnapshotHydrated {
+		switch live, state := p.liveConnectionState(serverName); state {
+		case liveClientDisconnected:
+			identity.SnapshotHydrated = false
+		case liveClientConnected:
+			if identity.DiscoveryDone && live != serverStatus.DiscoveryEpoch {
+				identity.DiscoveryDone = false
+				identity.StaleConnection = true
+			}
 		}
 	}
 
-	return nil
+	// Only the EXACT raw name — the identity that is dispatched (Spec 105
+	// FR-009) — is matched. The StateView holds the name the upstream
+	// published, verbatim (internal/upstream/core/client.go copies tool.Name
+	// into ToolMetadata.Name, and the supervisor copies that into ToolInfo),
+	// so the legacy "server:tool" spelling this lookup once also accepted
+	// never matched a real entry on the live path. What it did match was a
+	// raw tool literally named "a:ns:erase": with foreign prefixes now
+	// preserved, that alternative resolved the UNDISCOVERED pair
+	// (a, "ns:erase") to the prefixed tool's annotations with found=true, so
+	// the tier gate classified a name the proxy holds no metadata for by a
+	// different tool's hints instead of failing closed.
+	for i := range serverStatus.Tools {
+		if serverStatus.Tools[i].Name == toolName {
+			identity.Found = true
+			identity.Description = serverStatus.Tools[i].Description
+			identity.Annotations = serverStatus.Tools[i].Annotations
+			return identity
+		}
+	}
+
+	return identity
+}
+
+// liveConnectionEpoch returns the live client's connection-instance token
+// for a server, and whether there is a CONNECTED live client to read it from
+// (managed.Client.ConnectionEpoch; astra r2 C3). No upstream manager (a
+// pure-unit proxy), no client, or a client that is not connected reports
+// false, and the caller then makes no token claim.
+func (p *MCPProxyServer) liveConnectionEpoch(serverName string) (int64, bool) {
+	epoch, state := p.liveConnectionState(serverName)
+	return epoch, state == liveClientConnected
+}
+
+// liveClientState is what the live upstream client says about a server,
+// independently of the StateView snapshot (codex r5 F1).
+type liveClientState int
+
+const (
+	// liveClientAbsent: no upstream manager (a pure-unit proxy) or no client
+	// for the server — the live side makes no claim either way.
+	liveClientAbsent liveClientState = iota
+	// liveClientDisconnected: a client exists and is NOT connected
+	// (disconnected, connecting, OAuth-pending, ...): whatever the snapshot
+	// reads, the server is not callable and the server-level verdicts own it.
+	liveClientDisconnected
+	// liveClientConnected: a client exists and is connected; the epoch
+	// returned alongside is its current connection generation.
+	liveClientConnected
+)
+
+// liveConnectionState is liveConnectionEpoch with the not-connected case
+// told apart from the no-client case, so resolveExactToolIdentityIn can
+// overrule a snapshot whose Connected flag the live client contradicts.
+func (p *MCPProxyServer) liveConnectionState(serverName string) (int64, liveClientState) {
+	if p.upstreamManager == nil {
+		return 0, liveClientAbsent
+	}
+	client, ok := p.upstreamManager.GetClient(serverName)
+	if !ok || client == nil {
+		return 0, liveClientAbsent
+	}
+	if !client.IsConnected() {
+		return 0, liveClientDisconnected
+	}
+	return client.ConnectionEpoch(), liveClientConnected
+}
+
+// unresolvedToolIdentityMessage is the insufficient-permission body every
+// dispatch path answers for a name it cannot resolve on a known server
+// (Spec 105 FR-009, research D4). It is worded as a permission refusal —
+// the caller holds no tier for a tool the proxy cannot identify — and
+// deliberately does not echo any upstream answer: the upstream is never
+// asked. The remediation depends on WHY the name is unresolved
+// (toolIdentity.DiscoveryDone): while the server's discovery has not
+// completed for this connection, no tool list exists yet to refresh from and
+// the caller should simply retry shortly; once discovery has completed and
+// the name is absent from its result, the caller must refresh with
+// retrieve_tools and pick a listed name.
+func unresolvedToolIdentityMessage(serverName, toolName string, discoveryDone bool) string {
+	if !discoveryDone {
+		return fmt.Sprintf("Permission denied: tool '%s:%s' cannot be resolved because tool discovery has not completed for server '%s' yet, so no permission tier applies to it; retry shortly, once the server's tools have been discovered",
+			serverName, toolName, serverName)
+	}
+	return fmt.Sprintf("Permission denied: tool '%s:%s' cannot be resolved against the current tool list of server '%s' (undiscovered or stale name), so no permission tier applies to it; refresh the tool list with retrieve_tools and retry with a listed name",
+		serverName, toolName, serverName)
+}
+
+// liveIdentityRefusal closes the D4 deferral window (astra r1 I3). The
+// identity gate stands aside when the StateView reads a known server as not
+// connected (toolIdentity.SnapshotHydrated false) because the pre-105
+// not-connected verdict will refuse — but that verdict consults the LIVE
+// client, and the StateView's Connected flag is written only by the async
+// server_connected event (notifications → actor_pool, which drops on a full
+// channel → supervisor goroutine) or the 30s reconcile. In that window the
+// live client is connected, the not-connected verdict does not fire, and an
+// unlisted name would dispatch with the destructive-tier fallback and, under
+// a lifted quarantine gate or an existing record for a now-stale name, no
+// approval answer either. So, once the live client has been found connected,
+// the snapshot is re-read and the name is refused unless it now lists it. A
+// server whose live client is NOT connected keeps the not-connected /
+// connecting / reconnect_on_use verdicts untouched.
+//
+// The re-read is not limited to the deferred (not-hydrated) case (astra r2
+// C3): a hydrated snapshot that resolved the name at the top of the dispatch
+// may belong to a previous connection, and the live client found connected
+// here is the authority on WHICH connection that is — resolveExactToolIdentity
+// compares the stamp's token with it, so a name certified by connection A is
+// refused on connection B with the discovery-window body.
+//
+// Once the live client is connected, the ONLY admitting outcome is a
+// certified identity (codex r4 E1): hydrated, discovery completed, stamp
+// captured under the live client's own generation, name listed. "Listed" on
+// its own is not enough — a not-connected snapshot is NOT empty in general:
+// the reconcile sweep copies a server's retained tool set forward into a
+// StateView entry that reads Connected=false, ToolsDiscovered=false,
+// DiscoveryEpoch=0 (supervisor.reconcile keeps existing.Tools for counts),
+// so between the next connection becoming Ready and the event or sweep that
+// flips Connected, the snapshot lists the PREVIOUS generation's names
+// without certifying any of them. Admitting Found there sent such a name
+// down the unpinned dispatch to the fresh connection; now it is the
+// discovery window, like every other uncertified shape on a live client.
+//
+// The live identity is returned alongside the verdict (codex r3 D2): when
+// admitted it is certified, and its DiscoveryEpoch is the generation the
+// caller must pin the dispatch to (upstream.Manager.CallToolOnEpoch /
+// managed.Client.CallToolOnEpoch), so a generation change between this
+// check and the transport — a queue wait behind admission control is
+// seconds long — is refused by the client itself with the same
+// discovery-window body. The zero identity comes back only when the check
+// stood aside (no runtime, server not in the StateView, client not
+// connected), and the caller dispatches unpinned as before.
+//
+// The re-read is of the StateView and the live client ONLY. record is the
+// persisted server record the caller's dispatch gate captured (nil when the
+// gate found none) and the live identity is hydrated from THAT record, never
+// from a fresh storage read (codex r7 H1): a dispatch reads the persisted
+// record exactly once, at its gate, and every later identity step reuses
+// it. Otherwise an operator's quarantine / disable landing between the
+// gate's read and this check un-hydrated the live identity, and the dispatch
+// the gate's record had already admitted was refused with the
+// discovery-window body — a verdict neither record selects (the gate's
+// admits; the new one answers quarantine analysis / TOOL_BLOCKED, and does
+// so for the next dispatch, whose gate reads it), with a "retry shortly"
+// remediation that heals nothing. The write owns every later dispatch; this
+// one keeps the pre-105 gate-then-dispatch semantics, pinned to the
+// generation it certified.
+func (p *MCPProxyServer) liveIdentityRefusal(record *config.ServerConfig, serverName, toolName string, deferred toolIdentity, client interface{ IsConnected() bool }) (toolIdentity, string, bool) {
+	if !deferred.ServerKnown || client == nil || !client.IsConnected() {
+		return toolIdentity{}, "", false
+	}
+	live := p.resolveExactToolIdentityWith(record, serverName, toolName)
+	if live.certified() {
+		return live, "", false
+	}
+	// Not hydrated (Connected still false in the snapshot), no stamp, a
+	// previous generation's stamp, or an unlisted name: refused. The
+	// stale-name body applies only to a hydrated, completed pass of THIS
+	// generation that does not list the name; everything else is the
+	// discovery window.
+	return live, unresolvedToolIdentityMessage(serverName, toolName, live.SnapshotHydrated && live.DiscoveryDone), true
+}
+
+// dispatchOnEpoch routes one upstream dispatch through the manager, pinned
+// to the certified identity's generation when there is one and unpinned
+// otherwise (see toolIdentity.certified).
+func (p *MCPProxyServer) dispatchOnEpoch(ctx context.Context, certified toolIdentity, toolName string, args map[string]interface{}) (interface{}, error) {
+	if certified.certified() {
+		return p.upstreamManager.CallToolOnEpoch(ctx, toolName, args, certified.DiscoveryEpoch)
+	}
+	return p.upstreamManager.CallTool(ctx, toolName, args)
 }
 
 // lookupOutputSchema returns the declared output schema (raw JSON) for a tool,
@@ -5883,7 +7637,9 @@ func (p *MCPProxyServer) lookupOutputSchema(serverName, toolName string) string 
 // only), so validating it here is equivalent to validating the ORIGINAL
 // structured result (FR-010b) — TOON encoding can neither mask nor cause a
 // schema violation.
-func (p *MCPProxyServer) applyOutputValidation(ctx context.Context, serverName, toolName string, forwarded *mcp.CallToolResult) *mcp.CallToolResult {
+// requestID is the dispatch's correlation id, passed down because the decision
+// this records belongs to that call and is otherwise unattributable.
+func (p *MCPProxyServer) applyOutputValidation(ctx context.Context, serverName, toolName, requestID string, forwarded *mcp.CallToolResult) *mcp.CallToolResult {
 	// Disabled (mode=off) or validator not constructed -> no-op (FR-A4/FR-A7).
 	if p.outputValidator == nil || !p.config.OutputValidation.IsEnabled() {
 		return nil
@@ -5912,7 +7668,7 @@ func (p *MCPProxyServer) applyOutputValidation(ctx context.Context, serverName, 
 	if sess := mcpserver.ClientSessionFromContext(ctx); sess != nil {
 		sessionID = sess.SessionID()
 	}
-	p.emitActivityPolicyDecision(serverName, toolName, sessionID, d.decision, d.reason)
+	p.emitActivityPolicyDecision(ctx, serverName, toolName, sessionID, requestID, d.decision, d.reason, telemetry.BlockReasonOutputSchema)
 	if d.block {
 		return mcp.NewToolResultError("output schema validation failed: " + d.reason)
 	}

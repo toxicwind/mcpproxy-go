@@ -89,15 +89,15 @@ Add to your `~/.mcpproxy/mcp_config.json`:
     "network_mode": "bridge",
     "registry": "docker.io",
     "default_images": {
-      "python": "python:3.11",
-      "python3": "python:3.11",
-      "uvx": "python:3.11",
-      "pip": "python:3.11",
-      "pipx": "python:3.11",
-      "node": "node:20",
-      "npm": "node:20",
-      "npx": "node:20",
-      "yarn": "node:20",
+      "python": "ghcr.io/astral-sh/uv:python3.13-bookworm-slim",
+      "python3": "ghcr.io/astral-sh/uv:python3.13-bookworm-slim",
+      "uvx": "ghcr.io/astral-sh/uv:python3.13-bookworm-slim",
+      "pip": "ghcr.io/astral-sh/uv:python3.13-bookworm-slim",
+      "pipx": "ghcr.io/astral-sh/uv:python3.13-bookworm-slim",
+      "node": "node:22",
+      "npm": "node:22",
+      "npx": "node:22",
+      "yarn": "node:22",
       "go": "golang:1.21-alpine",
       "cargo": "rust:1.75-slim",
       "rustc": "rust:1.75-slim",
@@ -124,8 +124,61 @@ Add to your `~/.mcpproxy/mcp_config.json`:
 | `timeout` | Container startup timeout | `"30s"` |
 | `network_mode` | Docker network mode | `"bridge"` |
 | `registry` | Docker registry to use | `"docker.io"` |
-| `default_images` | Runtime to image mappings | See above |
+| `default_images` | Runtime to image mappings. The optional `uvx-git` key (not shipped in the defaults) overrides the git-capable image used when a Python runner installs from a `git+` URL | See above |
 | `extra_args` | Additional docker run arguments | `[]` |
+
+### Git dependencies (`uvx-git`)
+
+The Python default image is Astral's **slim** `uv` image, which does not contain
+`git`. A server installed straight from a repository —
+
+```json
+{ "name": "my-server", "command": "uvx", "args": ["--from", "my-server@git+https://github.com/o/r", "my-server"] }
+```
+
+— cannot resolve without it, and fails with `Git executable not found` /
+`Git operation failed` ([`MCPX_DOCKER_MISSING_TOOLCHAIN`](../errors/MCPX_DOCKER_MISSING_TOOLCHAIN.md)).
+
+MCPProxy detects the `git+` URL in a Python package runner's arguments and runs
+that server only on a git-capable image — everyone else keeps the small slim
+image. By default that is `ghcr.io/astral-sh/uv:python3.13-bookworm`, which
+ships git. Set the **`uvx-git`** key to use your own mirror or a custom build:
+
+```json
+{ "docker_isolation": { "default_images": { "uvx-git": "my-registry.example/uv-git:1" } } }
+```
+
+`default_images` from your config file is merged **over** the built-in map, so a
+partial map like the one above only changes the keys it lists — every other
+runtime keeps its built-in image.
+
+**Mirrored / air-gapped registries.** `uvx-git` is deliberately *not* part of
+the built-in map, so its presence in your config means exactly one thing: you
+chose that image, and it is used — even if you set it to the same public value
+MCPProxy ships. Two things follow:
+
+- If you set `registry`, the built-in git-capable image is pulled from **your**
+  registry (`<registry>/astral-sh/uv:python3.13-bookworm`) rather than from
+  `ghcr.io`.
+- If you retargeted `uvx`/`python` at your own registry and never set
+  `uvx-git`, the server runs on **your** image instead of MCPProxy reaching
+  outside your registry for a public one, and a warning naming this key is
+  logged. Point `uvx-git` at a git-capable image to get the substitution back:
+
+```json
+{ "docker_isolation": { "default_images": { "uvx-git": "mirror.internal/astral/uv:python3.13-bookworm" } } }
+```
+
+To turn the substitution off entirely, set the key to an empty string; those
+servers then keep whatever `uvx`/`python` image you configured:
+
+```json
+{ "docker_isolation": { "default_images": { "uvx-git": "" } } }
+```
+
+A per-server `isolation.image` override always wins over this selection, so a
+pinned image must ship git itself. `node`/`npx` need no equivalent: `node:22`
+already includes git, and the substitution never applies to them.
 
 ### Per-Server Configuration
 
@@ -295,7 +348,60 @@ When MCPProxy stops, containers are cleaned up with a 30-second timeout:
 1. **Graceful Stop**: `docker stop` (sends SIGTERM to container)
 2. **Force Kill**: `docker kill` if container doesn't stop gracefully
 
-Containers are labeled with `mcpproxy.managed=true` for identification.
+Containers are labeled with `com.mcpproxy.managed=true` for identification
+and `com.mcpproxy.server=<server name>` (the raw, unsanitised name) for
+ownership.
+
+### Container ownership
+
+Every container mcpproxy creates is named
+`mcpproxy-<sanitised server name>-<4 random chars>`. The name alone does not
+identify the server — `a/b` and `a-b` both sanitise to `a-b` — so every
+cleanup path (the pre-start sweep for stale containers, the container
+captured from `--cidfile`, the disconnect fallbacks by exact name, by name
+pattern and by image name) inspects the container and stops or removes it
+only when its `com.mcpproxy.server` label **and** canonical name both match
+the server being cleaned up — and it re-inspects the container immediately
+before every `docker stop`, `kill` or `rm -f` (the kill after a failed stop
+included), never acting on an earlier listing, so a container renamed,
+relabelled or replaced in between is left alone. Containers you started yourself with
+`docker run --name …`, or that pre-date the label, are never touched by any
+of these paths, and a container that merely shares an image with a server's
+is never stopped on that server's behalf. Housekeeping records in the
+per-server log carry `container_owner` (the label value read back from
+Docker) so [`tail_log`](/features/agent-tokens) can attribute them to the
+right server; the pre-start "Docker isolation configured" record names the
+generated container name before Docker has created anything and carries no
+owner. The child process's own output lines (the docker CLI's stderr
+included) are written to the per-server log as the `message` field of a
+`stderr` or `launcher` record marked `child_output`, never as the record
+text.
+
+Two consequences of the ownership rule are worth knowing:
+
+- **Servers you configure as `docker run …` yourself** (no isolation) get no
+  `com.mcpproxy.server` label — MCPProxy only labels the containers it
+  builds for isolation — so MCPProxy never stops or removes their
+  container, not even through the `--cidfile` it injects into your command.
+  Use `--rm` (and let the container exit when its stdin closes) or stop it
+  by hand; earlier versions would stop it via the cidfile and, if that
+  capture failed, every container on the same image, yours or not.
+- **Renaming a server** changes the label value a container must carry. A
+  container created under the old name is no longer owned by the new one,
+  so it is left alone by the pre-start sweep and must be removed manually
+  (`docker rm -f`).
+- **The shutdown and emergency sweeps** (every `com.mcpproxy.managed`
+  container on shutdown; every one carrying this instance's id when
+  shutdown fails) apply the same rule: only containers canonically owned by
+  a server in the current configuration are stopped or removed — each one
+  re-inspected immediately before its stop, kill or removal through the
+  same check every per-server cleanup uses, so a container renamed or
+  relabelled after the sweep listed it is left alone — and the
+  disconnect-timeout path re-checks the ownership of the id it tracked
+  before `docker rm -f`. A container that merely carries the mcpproxy
+  labels — one you labelled yourself, or an orphan of a server that is no
+  longer configured — is left alone and only counted in a warning, never
+  named. Remove such orphans by hand (see below).
 
 ### Manual Cleanup
 
@@ -303,10 +409,10 @@ If containers remain after MCPProxy stops:
 
 ```bash
 # List MCPProxy-managed containers
-docker ps --filter "label=mcpproxy.managed=true"
+docker ps --filter "label=com.mcpproxy.managed=true"
 
 # Remove all MCPProxy containers
-docker rm -f $(docker ps -q --filter "label=mcpproxy.managed=true")
+docker rm -f $(docker ps -q --filter "label=com.mcpproxy.managed=true")
 ```
 
 See [Shutdown Behavior](/operations/shutdown-behavior) for detailed subprocess lifecycle documentation.

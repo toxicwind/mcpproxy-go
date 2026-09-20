@@ -30,7 +30,8 @@ func TestDefaultConfig(t *testing.T) {
 	assert.True(t, config.AllowServerRemove)
 
 	// Test prompts default
-	assert.True(t, config.EnablePrompts)
+	assert.True(t, config.EnablePrompts, "built-in prompts stay on by default")
+	assert.False(t, config.AggregateUpstreamPrompts, "upstream aggregation is opt-in (off by default)")
 
 	// Test empty servers list
 	assert.Empty(t, config.Servers)
@@ -90,20 +91,21 @@ func TestConfigValidation(t *testing.T) {
 
 func TestConfigJSONSerialization(t *testing.T) {
 	original := &Config{
-		Listen:            ":9090",
-		DataDir:           "/tmp/test",
-		EnableTray:        false,
-		DebugSearch:       true,
-		TopK:              10,
-		ToolsLimit:        20,
-		ToolResponseLimit: 50000,
-		CallToolTimeout:   Duration(5 * time.Minute),
-		RequireMCPAuth:    true,
-		ReadOnlyMode:      true,
-		DisableManagement: true,
-		AllowServerAdd:    false,
-		AllowServerRemove: false,
-		EnablePrompts:     false,
+		Listen:                   ":9090",
+		DataDir:                  "/tmp/test",
+		EnableTray:               false,
+		DebugSearch:              true,
+		TopK:                     10,
+		ToolsLimit:               20,
+		ToolResponseLimit:        50000,
+		CallToolTimeout:          Duration(5 * time.Minute),
+		RequireMCPAuth:           true,
+		ReadOnlyMode:             true,
+		DisableManagement:        true,
+		AllowServerAdd:           false,
+		AllowServerRemove:        false,
+		EnablePrompts:            false,
+		AggregateUpstreamPrompts: true,
 		Servers: []*ServerConfig{
 			{
 				Name:     "test-server",
@@ -139,6 +141,7 @@ func TestConfigJSONSerialization(t *testing.T) {
 	assert.Equal(t, original.AllowServerAdd, restored.AllowServerAdd)
 	assert.Equal(t, original.AllowServerRemove, restored.AllowServerRemove)
 	assert.Equal(t, original.EnablePrompts, restored.EnablePrompts)
+	assert.Equal(t, original.AggregateUpstreamPrompts, restored.AggregateUpstreamPrompts)
 	assert.Len(t, restored.Servers, 1)
 	assert.Equal(t, original.Servers[0].Name, restored.Servers[0].Name)
 }
@@ -1427,6 +1430,36 @@ func TestServerConfig_ReconnectOnUse(t *testing.T) {
 	})
 }
 
+func TestServerConfig_ExposePrompts_RoundTrip(t *testing.T) {
+	tests := []struct {
+		name string
+		val  *bool
+	}{
+		{"unset", nil},
+		{"true", BoolPtr(true)},
+		{"false", BoolPtr(false)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			original := ServerConfig{Name: "test", ExposePrompts: tt.val}
+
+			data, err := json.Marshal(original)
+			require.NoError(t, err)
+
+			var decoded ServerConfig
+			require.NoError(t, json.Unmarshal(data, &decoded))
+
+			if tt.val == nil {
+				assert.Nil(t, decoded.ExposePrompts)
+			} else {
+				require.NotNil(t, decoded.ExposePrompts)
+				assert.Equal(t, *tt.val, *decoded.ExposePrompts)
+			}
+		})
+	}
+}
+
 func TestServerConfig_IsToolAllowedByConfig(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -1859,5 +1892,76 @@ func TestTrustedHostsLoadAndEnvOverride(t *testing.T) {
 		cfg := &Config{}
 		require.NoError(t, cfg.Validate())
 		assert.Empty(t, cfg.TrustedHosts)
+	})
+}
+
+// TestCodeExecutionMaxParallel covers the Spec 096 config field end to end:
+// the built-in default, an operator value surviving load, the accepted range,
+// and the absent/zero → default resolution the sandbox relies on (a zero would
+// otherwise mean "no workers" and stall every batch).
+func TestCodeExecutionMaxParallel(t *testing.T) {
+	t.Run("default is 8", func(t *testing.T) {
+		assert.Equal(t, 8, DefaultConfig().CodeExecutionMaxParallel)
+	})
+
+	t.Run("absent value resolves to the default", func(t *testing.T) {
+		cfg := &Config{}
+		require.NoError(t, cfg.Validate())
+		assert.Equal(t, 8, cfg.CodeExecutionMaxParallel)
+	})
+
+	t.Run("zero resolves to the default", func(t *testing.T) {
+		cfg := &Config{CodeExecutionMaxParallel: 0}
+		require.NoError(t, cfg.Validate())
+		assert.Equal(t, 8, cfg.CodeExecutionMaxParallel)
+	})
+
+	t.Run("explicit value survives", func(t *testing.T) {
+		cfg := &Config{CodeExecutionMaxParallel: 16}
+		require.NoError(t, cfg.Validate())
+		assert.Equal(t, 16, cfg.CodeExecutionMaxParallel)
+	})
+
+	t.Run("range validation", func(t *testing.T) {
+		cases := []struct {
+			name    string
+			value   int
+			wantErr bool
+		}{
+			{name: "zero means default", value: 0},
+			{name: "lower bound", value: 1},
+			{name: "upper bound", value: 32},
+			{name: "below range", value: -1, wantErr: true},
+			{name: "above range", value: 33, wantErr: true},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				cfg := &Config{Listen: "127.0.0.1:8080", CodeExecutionMaxParallel: tc.value}
+				errs := cfg.ValidateDetailed()
+				var found bool
+				for _, e := range errs {
+					if e.Field == "code_execution_max_parallel" {
+						found = true
+					}
+				}
+				assert.Equal(t, tc.wantErr, found, "validation errors: %v", errs)
+			})
+		}
+	})
+
+	t.Run("value loads from the config file", func(t *testing.T) {
+		tmp := t.TempDir()
+		cfgPath := filepath.Join(tmp, "mcp_config.json")
+		raw, err := json.Marshal(map[string]any{
+			"listen":                      "127.0.0.1:0",
+			"data_dir":                    tmp,
+			"code_execution_max_parallel": 4,
+		})
+		require.NoError(t, err)
+		require.NoError(t, os.WriteFile(cfgPath, raw, 0o600))
+
+		cfg, err := LoadFromFile(cfgPath)
+		require.NoError(t, err)
+		assert.Equal(t, 4, cfg.CodeExecutionMaxParallel)
 	})
 }

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -843,4 +844,313 @@ func TestHandleConvertConfigToSecret_ServerNotFound(t *testing.T) {
 
 	require.Equal(t, http.StatusNotFound, w.Code, "body=%s", w.Body.String())
 	require.Contains(t, w.Body.String(), `missing`)
+}
+
+// TestHandlePatchServer_ConcurrencyOverrides verifies the spec-093 per-server
+// concurrency limits are settable over REST (FR-020 scope (c) is documented as
+// file/API-configured) with tri-state nil-preserve semantics: an explicit value
+// (including 0, the documented per-server opt-out) is applied, and an omitted
+// field never wipes a configured limit.
+func TestHandlePatchServer_ConcurrencyOverrides(t *testing.T) {
+	logger := zap.NewNop().Sugar()
+
+	intPtr := func(v int) *int { return &v }
+	durPtr := func(d time.Duration) *config.Duration { v := config.Duration(d); return &v }
+
+	newServer := func() *config.ServerConfig {
+		return &config.ServerConfig{Name: "db", Protocol: "stdio", Command: "docker", Enabled: true}
+	}
+
+	patch := func(t *testing.T, existing *config.ServerConfig, body string) *config.ServerConfig {
+		t.Helper()
+		mockCtrl := &mockPatchServerController{apiKey: "test-key", existingServer: existing}
+		srv := NewServer(mockCtrl, logger, nil)
+		req := httptest.NewRequest(http.MethodPatch, "/api/v1/servers/db", bytes.NewReader([]byte(body)))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-API-Key", "test-key")
+		w := httptest.NewRecorder()
+		srv.ServeHTTP(w, req)
+		require.Equal(t, http.StatusOK, w.Code, "body=%s", w.Body.String())
+		require.NotNil(t, mockCtrl.capturedUpdates, "UpdateServer should have been called")
+		return mockCtrl.capturedUpdates
+	}
+
+	t.Run("explicit values set the pointers", func(t *testing.T) {
+		updates := patch(t, newServer(), `{"max_concurrent_requests":5,"queue_size":10,"queue_timeout":"45s"}`)
+		require.NotNil(t, updates.MaxConcurrentRequests)
+		assert.Equal(t, 5, *updates.MaxConcurrentRequests)
+		require.NotNil(t, updates.QueueSize)
+		assert.Equal(t, 10, *updates.QueueSize)
+		require.NotNil(t, updates.QueueTimeout)
+		assert.Equal(t, 45*time.Second, updates.QueueTimeout.Duration())
+	})
+
+	t.Run("explicit zero is a real opt-out, not an omission", func(t *testing.T) {
+		existing := newServer()
+		existing.MaxConcurrentRequests = intPtr(5)
+		updates := patch(t, existing, `{"max_concurrent_requests":0}`)
+		require.NotNil(t, updates.MaxConcurrentRequests)
+		assert.Equal(t, 0, *updates.MaxConcurrentRequests)
+	})
+
+	t.Run("omitting preserves a prior value", func(t *testing.T) {
+		existing := newServer()
+		existing.MaxConcurrentRequests = intPtr(5)
+		existing.QueueSize = intPtr(10)
+		existing.QueueTimeout = durPtr(45 * time.Second)
+		updates := patch(t, existing, `{"args":["new-arg"]}`)
+		require.NotNil(t, updates.MaxConcurrentRequests)
+		assert.Equal(t, 5, *updates.MaxConcurrentRequests)
+		require.NotNil(t, updates.QueueSize)
+		assert.Equal(t, 10, *updates.QueueSize)
+		require.NotNil(t, updates.QueueTimeout)
+		assert.Equal(t, 45*time.Second, updates.QueueTimeout.Duration())
+	})
+
+	t.Run("omitting preserves nil existing", func(t *testing.T) {
+		updates := patch(t, newServer(), `{"args":["new-arg"]}`)
+		assert.Nil(t, updates.MaxConcurrentRequests)
+		assert.Nil(t, updates.QueueSize)
+		assert.Nil(t, updates.QueueTimeout)
+	})
+}
+
+// TestHandleGetServers_ExposesConcurrencyOverrides verifies the GET payload
+// surfaces the per-server limits so a caller can read back what it PATCHed.
+func TestHandleGetServers_ExposesConcurrencyOverrides(t *testing.T) {
+	logger := zap.NewNop().Sugar()
+	mockCtrl := &mockPatchServerController{
+		apiKey: "test-key",
+		allServers: []map[string]interface{}{
+			{
+				"id":                      "db",
+				"name":                    "db",
+				"enabled":                 true,
+				"quarantined":             false,
+				"max_concurrent_requests": 5,
+				"queue_size":              10,
+				"queue_timeout":           "45s",
+			},
+		},
+	}
+	srv := NewServer(mockCtrl, logger, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/servers", http.NoBody)
+	req.Header.Set("X-API-Key", "test-key")
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code, "body=%s", w.Body.String())
+
+	var resp struct {
+		Data struct {
+			Servers []struct {
+				Name                  string `json:"name"`
+				MaxConcurrentRequests *int   `json:"max_concurrent_requests"`
+				QueueSize             *int   `json:"queue_size"`
+				QueueTimeout          string `json:"queue_timeout"`
+			} `json:"servers"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.Len(t, resp.Data.Servers, 1)
+	require.NotNil(t, resp.Data.Servers[0].MaxConcurrentRequests, "max_concurrent_requests must appear in the GET payload")
+	assert.Equal(t, 5, *resp.Data.Servers[0].MaxConcurrentRequests)
+	require.NotNil(t, resp.Data.Servers[0].QueueSize)
+	assert.Equal(t, 10, *resp.Data.Servers[0].QueueSize)
+	assert.Equal(t, "45s", resp.Data.Servers[0].QueueTimeout,
+		"queue_timeout must appear in the GET payload as a duration string")
+}
+
+// TestHandlePatchServer_ExposePrompts verifies F9: the per-server expose_prompts
+// override is reachable via PATCH. An explicit false must be mapped into
+// ServerConfig.ExposePrompts (previously the request had no field, so PATCH
+// {"expose_prompts":false} returned 400 "No fields to update"), and omitting it
+// must preserve the existing pointer.
+func TestHandlePatchServer_ExposePrompts(t *testing.T) {
+	logger := zap.NewNop().Sugar()
+
+	t.Run("explicit false is applied and does not 400", func(t *testing.T) {
+		mockCtrl := &mockPatchServerController{
+			apiKey: "test-key",
+			existingServer: &config.ServerConfig{
+				Name: "github", Protocol: "stdio", Enabled: true,
+			},
+		}
+		srv := NewServer(mockCtrl, logger, nil)
+
+		body, _ := json.Marshal(map[string]any{"expose_prompts": false})
+		req := httptest.NewRequest(http.MethodPatch, "/api/v1/servers/github", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-API-Key", "test-key")
+		w := httptest.NewRecorder()
+
+		srv.ServeHTTP(w, req)
+		require.Equal(t, http.StatusOK, w.Code, "body=%s", w.Body.String())
+		require.NotNil(t, mockCtrl.capturedUpdates)
+		require.NotNil(t, mockCtrl.capturedUpdates.ExposePrompts,
+			"expose_prompts from the PATCH body must be mapped into ServerConfig")
+		assert.False(t, *mockCtrl.capturedUpdates.ExposePrompts)
+	})
+
+	t.Run("omitted expose_prompts preserves existing", func(t *testing.T) {
+		existing := true
+		mockCtrl := &mockPatchServerController{
+			apiKey: "test-key",
+			existingServer: &config.ServerConfig{
+				Name: "github", Protocol: "stdio", Enabled: true,
+				ExposePrompts: &existing,
+			},
+		}
+		srv := NewServer(mockCtrl, logger, nil)
+
+		body, _ := json.Marshal(map[string]any{"args": []string{"x"}})
+		req := httptest.NewRequest(http.MethodPatch, "/api/v1/servers/github", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-API-Key", "test-key")
+		w := httptest.NewRecorder()
+
+		srv.ServeHTTP(w, req)
+		require.Equal(t, http.StatusOK, w.Code, "body=%s", w.Body.String())
+		require.NotNil(t, mockCtrl.capturedUpdates)
+		require.NotNil(t, mockCtrl.capturedUpdates.ExposePrompts,
+			"omitted expose_prompts must preserve the existing pointer")
+		assert.True(t, *mockCtrl.capturedUpdates.ExposePrompts)
+	})
+}
+
+// TestHandlePatchServer_ImageOnlyDoesNotWriteEnabled is THE corruption
+// regression test for GH #1142. The macOS tray seeded its isolation toggle
+// from the flattened `enabled:false` the API reported for an INHERITING
+// server, then force-added `enabled` to every isolation PATCH. Editing an
+// unrelated field (the image) therefore persisted an explicit opt-out and
+// silently un-containerised a server the user never meant to expose.
+//
+// The handler must leave a nil override nil when the request does not mention
+// `enabled` at all.
+func TestHandlePatchServer_ImageOnlyDoesNotWriteEnabled(t *testing.T) {
+	logger := zap.NewNop().Sugar()
+	mockCtrl := &mockPatchServerController{
+		apiKey: "test-key",
+		existingServer: &config.ServerConfig{
+			Name:     "python-mcp",
+			Protocol: "stdio",
+			Command:  "uvx",
+			Enabled:  true,
+			// Enabled override deliberately nil: "inherit the global setting".
+			Isolation: &config.IsolationConfig{Image: "python:3.11"},
+		},
+	}
+	srv := NewServer(mockCtrl, logger, nil)
+
+	body := []byte(`{"isolation":{"image":"python:3.12"}}`)
+	req := httptest.NewRequest(http.MethodPatch, "/api/v1/servers/python-mcp", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-API-Key", "test-key")
+	w := httptest.NewRecorder()
+
+	srv.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code, "body=%s", w.Body.String())
+	require.NotNil(t, mockCtrl.capturedUpdates)
+	require.NotNil(t, mockCtrl.capturedUpdates.Isolation)
+
+	assert.Equal(t, "python:3.12", mockCtrl.capturedUpdates.Isolation.Image)
+	assert.Nil(t, mockCtrl.capturedUpdates.Isolation.Enabled,
+		"a PATCH that never mentions `enabled` must not write an explicit opt-out")
+}
+
+// TestHandlePatchServer_ExplicitNullClearsIsolationOverride pins the "go back
+// to inheriting the global setting" path — previously inexpressible, because
+// an omitted field and a cleared field were the same wire shape.
+func TestHandlePatchServer_ExplicitNullClearsIsolationOverride(t *testing.T) {
+	logger := zap.NewNop().Sugar()
+	mockCtrl := &mockPatchServerController{
+		apiKey: "test-key",
+		existingServer: &config.ServerConfig{
+			Name: "python-mcp", Protocol: "stdio", Command: "uvx", Enabled: true,
+			Isolation: &config.IsolationConfig{Enabled: config.BoolPtr(false)},
+		},
+	}
+	srv := NewServer(mockCtrl, logger, nil)
+
+	body := []byte(`{"isolation":{"enabled_override":null}}`)
+	req := httptest.NewRequest(http.MethodPatch, "/api/v1/servers/python-mcp", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-API-Key", "test-key")
+	w := httptest.NewRecorder()
+
+	srv.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code, "body=%s", w.Body.String())
+	require.NotNil(t, mockCtrl.capturedUpdates)
+	require.NotNil(t, mockCtrl.capturedUpdates.Isolation)
+	assert.Nil(t, mockCtrl.capturedUpdates.Isolation.Enabled,
+		"an explicit null must clear the override back to inherit")
+}
+
+// TestHandlePatchServer_ExplicitIsolationEnabledStillApplies guards against
+// over-correcting: a caller that really does want an explicit opt-out must
+// still get one.
+func TestHandlePatchServer_ExplicitIsolationEnabledStillApplies(t *testing.T) {
+	logger := zap.NewNop().Sugar()
+	for _, want := range []bool{true, false} {
+		mockCtrl := &mockPatchServerController{
+			apiKey: "test-key",
+			existingServer: &config.ServerConfig{
+				Name: "python-mcp", Protocol: "stdio", Command: "uvx", Enabled: true,
+			},
+		}
+		srv := NewServer(mockCtrl, logger, nil)
+
+		body := []byte(`{"isolation":{"enabled_override":` + strconv.FormatBool(want) + `}}`)
+		req := httptest.NewRequest(http.MethodPatch, "/api/v1/servers/python-mcp", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-API-Key", "test-key")
+		w := httptest.NewRecorder()
+
+		srv.ServeHTTP(w, req)
+
+		require.Equal(t, http.StatusOK, w.Code, "body=%s", w.Body.String())
+		require.NotNil(t, mockCtrl.capturedUpdates.Isolation)
+		require.NotNil(t, mockCtrl.capturedUpdates.Isolation.Enabled)
+		assert.Equal(t, want, *mockCtrl.capturedUpdates.Isolation.Enabled)
+	}
+}
+
+// TestHandlePatchServer_IsolationPreservesUnexposedFields pins the contract
+// that lets Server.UpdateServer replace the isolation block wholesale: the
+// handler resolves the patch against the persisted overrides, so fields the
+// REST request cannot express (mode, log driver) survive.
+func TestHandlePatchServer_IsolationPreservesUnexposedFields(t *testing.T) {
+	logger := zap.NewNop().Sugar()
+	sandbox := config.IsolationModeSandbox
+	mockCtrl := &mockPatchServerController{
+		apiKey: "test-key",
+		existingServer: &config.ServerConfig{
+			Name: "python-mcp", Protocol: "stdio", Command: "uvx", Enabled: true,
+			Isolation: &config.IsolationConfig{
+				Mode:      &sandbox,
+				LogDriver: "local",
+				Image:     "old",
+			},
+		},
+	}
+	srv := NewServer(mockCtrl, logger, nil)
+
+	body := []byte(`{"isolation":{"image":"new"}}`)
+	req := httptest.NewRequest(http.MethodPatch, "/api/v1/servers/python-mcp", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-API-Key", "test-key")
+	w := httptest.NewRecorder()
+
+	srv.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code, "body=%s", w.Body.String())
+	iso := mockCtrl.capturedUpdates.Isolation
+	require.NotNil(t, iso)
+	assert.Equal(t, "new", iso.Image)
+	require.NotNil(t, iso.Mode, "isolation.mode is not exposed by the REST request and must survive")
+	assert.Equal(t, sandbox, *iso.Mode)
+	assert.Equal(t, "local", iso.LogDriver)
 }

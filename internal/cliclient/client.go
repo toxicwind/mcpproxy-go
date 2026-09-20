@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"time"
 
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/codescripts"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/contracts"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/reqcontext"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/socket"
@@ -211,9 +213,26 @@ func parseAPIError(errorMsg, requestID string) error {
 	return &APIError{Message: errorMsg, RequestID: requestID}
 }
 
+// execHTTPClient returns a shallow copy of the shared HTTP client with no
+// blanket timeout, so a long-running request is bounded by its context alone.
+// The shared client keeps a generous timeout as a safety net for ordinary
+// commands, but that net is shorter than the largest execution budget the
+// daemon accepts.
+func (c *Client) execHTTPClient() *http.Client {
+	clone := *c.httpClient
+	clone.Timeout = 0
+	return &clone
+}
+
 // CodeExecOptions contains optional parameters for code execution via the daemon API.
 type CodeExecOptions struct {
 	Language string // Source language: "javascript" (default) or "typescript"
+
+	// Script names a server-side stored script to execute instead of inline
+	// code (Spec 097). Only the NAME travels: the daemon's code_execution
+	// handler is the single execution-time resolver, so a stored script means
+	// the same thing over MCP, REST and both CLI modes.
+	Script string
 }
 
 // CodeExec executes JavaScript or TypeScript code via the daemon API.
@@ -228,7 +247,6 @@ func (c *Client) CodeExec(
 ) (*CodeExecResult, error) {
 	// Build request body
 	reqBody := map[string]interface{}{
-		"code":  code,
 		"input": input,
 		"options": map[string]interface{}{
 			"timeout_ms":      timeoutMS,
@@ -237,8 +255,20 @@ func (c *Client) CodeExec(
 		},
 	}
 
-	// Apply optional language parameter
-	if len(opts) > 0 && opts[0].Language != "" && opts[0].Language != "javascript" {
+	// Exactly one source travels (Spec 097): inline code, or the NAME of a
+	// stored script the daemon resolves. Sending an empty "code" alongside a
+	// script name would leave the caller's request ambiguous on the wire.
+	if len(opts) > 0 && opts[0].Script != "" {
+		reqBody["script"] = opts[0].Script
+	} else {
+		reqBody["code"] = code
+	}
+
+	// Forward the language verbatim when the caller named one. Deciding
+	// whether the user MEANT it belongs to the caller (the CLI sends it only
+	// when --language was explicitly set); dropping an explicit "javascript"
+	// here would silently swallow a contradiction with a stored .ts script.
+	if len(opts) > 0 && opts[0].Language != "" {
 		reqBody["language"] = opts[0].Language
 	}
 
@@ -256,8 +286,11 @@ func (c *Client) CodeExec(
 	req.Header.Set("Content-Type", "application/json")
 
 	// Send request
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.execHTTPClient().Do(req)
 	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return nil, fmt.Errorf("client-side timeout waiting for the daemon to return code execution results: %w", err)
+		}
 		return nil, fmt.Errorf("failed to call code execution API: %w", err)
 	}
 	defer resp.Body.Close()
@@ -269,6 +302,53 @@ func (c *Client) CodeExec(
 	}
 
 	return &result, nil
+}
+
+// GetCodeScripts lists the stored scripts the DAEMON can execute (Spec 097),
+// together with the directory it read them from. Asking the daemon rather than
+// listing locally is the point: a listing that disagreed with the process which
+// actually resolves scripts would be worse than none.
+func (c *Client) GetCodeScripts(ctx context.Context) (dir string, entries []codescripts.Entry, err error) {
+	url := c.baseURL + "/api/v1/code/scripts"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to call stored scripts API: %w", err)
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to read response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return "", nil, fmt.Errorf("API returned status %d: %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	var apiResp struct {
+		Success bool `json:"success"`
+		Data    struct {
+			Scripts []codescripts.Entry `json:"scripts"`
+			Dir     string              `json:"dir"`
+		} `json:"data"`
+		Error     string `json:"error"`
+		RequestID string `json:"request_id"`
+	}
+
+	if err := json.Unmarshal(bodyBytes, &apiResp); err != nil {
+		return "", nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	if !apiResp.Success {
+		return "", nil, parseAPIError(apiResp.Error, apiResp.RequestID)
+	}
+
+	return apiResp.Data.Dir, apiResp.Data.Scripts, nil
 }
 
 // CallToolResult represents tool call result.
@@ -1111,25 +1191,47 @@ func (c *Client) SetAllToolsEnabled(ctx context.Context, serverName string, enab
 	return apiResp.Data.Changed, nil
 }
 
+// OAuthLoginResult carries the fields of the daemon's OAuthStartResponse that the
+// CLI needs to guide a user through a headless login: whether the daemon managed to
+// open a browser and, if not, the authorization URL to visit manually.
+type OAuthLoginResult struct {
+	ServerName    string
+	CorrelationID string
+	AuthURL       string
+	BrowserOpened bool
+	BrowserError  string
+	Message       string
+}
+
 // TriggerOAuthLogin initiates OAuth authentication flow for a server.
 // Returns *contracts.OAuthFlowError for structured OAuth errors (Spec 020).
+// Use TriggerOAuthLoginWithResult when the caller needs the auth URL / browser status.
 func (c *Client) TriggerOAuthLogin(ctx context.Context, serverName string) error {
+	_, err := c.TriggerOAuthLoginWithResult(ctx, serverName)
+	return err
+}
+
+// TriggerOAuthLoginWithResult initiates the OAuth flow for a server and returns the
+// daemon's browser status and authorization URL so the CLI can print the URL when
+// the browser could not be opened (headless hosts, SSH sessions).
+// Returns *contracts.OAuthFlowError for structured OAuth errors (Spec 020).
+func (c *Client) TriggerOAuthLoginWithResult(ctx context.Context, serverName string) (*OAuthLoginResult, error) {
 	url := fmt.Sprintf("%s/api/v1/servers/%s/login", c.baseURL, serverName)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
 	if err != nil {
-		return fmt.Errorf("failed to create request: %w", err)
+		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 	c.prepareRequest(ctx, req)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("failed to call login API: %w", err)
+		return nil, fmt.Errorf("failed to call login API: %w", err)
 	}
 	defer resp.Body.Close()
 
 	bodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("failed to read response: %w", err)
+		return nil, fmt.Errorf("failed to read response: %w", err)
 	}
 
 	// Spec 020: Check for structured OAuth errors on 400 responses
@@ -1137,44 +1239,66 @@ func (c *Client) TriggerOAuthLogin(ctx context.Context, serverName string) error
 		// Try to parse as OAuthFlowError
 		var oauthFlowErr contracts.OAuthFlowError
 		if err := json.Unmarshal(bodyBytes, &oauthFlowErr); err == nil && oauthFlowErr.ErrorType != "" {
-			return &oauthFlowErr
+			return nil, &oauthFlowErr
 		}
 
 		// Try to parse as OAuthValidationError
 		var oauthValidationErr contracts.OAuthValidationError
 		if err := json.Unmarshal(bodyBytes, &oauthValidationErr); err == nil && oauthValidationErr.ErrorType != "" {
-			return &oauthValidationErr
+			return nil, &oauthValidationErr
 		}
 
 		// Fall back to generic error
-		return fmt.Errorf("API returned status %d: %s", resp.StatusCode, string(bodyBytes))
+		return nil, fmt.Errorf("API returned status %d: %s", resp.StatusCode, string(bodyBytes))
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("API returned status %d: %s", resp.StatusCode, string(bodyBytes))
+		return nil, fmt.Errorf("API returned status %d: %s", resp.StatusCode, string(bodyBytes))
 	}
 
 	var apiResp struct {
 		Success bool `json:"success"`
 		Data    struct {
+			// Legacy fields kept for older daemons that returned {server, action, success}.
 			Server  string `json:"server"`
 			Action  string `json:"action"`
 			Success bool   `json:"success"`
+			// contracts.OAuthStartResponse fields (Spec 020 phase 3).
+			ServerName    string `json:"server_name"`
+			CorrelationID string `json:"correlation_id"`
+			AuthURL       string `json:"auth_url"`
+			BrowserOpened bool   `json:"browser_opened"`
+			BrowserError  string `json:"browser_error"`
+			Message       string `json:"message"`
 		} `json:"data"`
 		Error     string `json:"error"`
 		RequestID string `json:"request_id"` // T023: Capture request_id for error correlation
 	}
 
 	if err := json.Unmarshal(bodyBytes, &apiResp); err != nil {
-		return fmt.Errorf("failed to parse response: %w", err)
+		return nil, fmt.Errorf("failed to parse response: %w", err)
 	}
 
 	if !apiResp.Success {
 		// T023: Return APIError with request_id for CLI display
-		return parseAPIError(apiResp.Error, apiResp.RequestID)
+		return nil, parseAPIError(apiResp.Error, apiResp.RequestID)
 	}
 
-	return nil
+	result := &OAuthLoginResult{
+		ServerName:    apiResp.Data.ServerName,
+		CorrelationID: apiResp.Data.CorrelationID,
+		AuthURL:       apiResp.Data.AuthURL,
+		BrowserOpened: apiResp.Data.BrowserOpened,
+		BrowserError:  apiResp.Data.BrowserError,
+		Message:       apiResp.Data.Message,
+	}
+	if result.ServerName == "" {
+		result.ServerName = apiResp.Data.Server
+	}
+	if result.ServerName == "" {
+		result.ServerName = serverName
+	}
+	return result, nil
 }
 
 // TriggerOAuthLogout clears OAuth token and disconnects a server.
@@ -1236,6 +1360,11 @@ type AddServerRequest struct {
 	Enabled        *bool             `json:"enabled,omitempty"`
 	Quarantined    *bool             `json:"quarantined,omitempty"`
 	ReconnectOnUse *bool             `json:"reconnect_on_use,omitempty"`
+	// TrustMode is the per-server trust tier (spec 086): auto|scan|manual.
+	// Empty is omitted from the wire so the daemon applies its own default; a
+	// non-empty value is validated CLI-side before the request is built and
+	// again by the REST layer (GH #938).
+	TrustMode string `json:"trust_mode,omitempty"`
 }
 
 // AddServerResult represents the result of adding a server.
@@ -2108,4 +2237,58 @@ func (c *Client) EditRegistrySource(ctx context.Context, id, name, sourceURL, se
 		return nil, fmt.Errorf("daemon returned success with no registry data")
 	}
 	return &apiResp.Data.Registry, nil
+}
+
+// Preflight runs a required-tools preflight against the daemon (Spec 098).
+//
+// The verdict is DATA, not an error: a 200 carrying `blocked` comes back as a
+// response with no error, and the caller turns it into an exit code. Only a
+// request the daemon refused (400/503) or a transport failure is an error here.
+func (c *Client) Preflight(ctx context.Context, request *contracts.PreflightRequest) (*contracts.PreflightResponse, error) {
+	url := fmt.Sprintf("%s/api/v1/preflight", c.baseURL)
+
+	bodyBytes, err := json.Marshal(request)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	c.prepareRequest(ctx, req)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to call preflight API: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+
+	var apiResp struct {
+		Success   bool                         `json:"success"`
+		Data      *contracts.PreflightResponse `json:"data"`
+		Error     string                       `json:"error"`
+		RequestID string                       `json:"request_id"`
+	}
+	if err := json.Unmarshal(respBytes, &apiResp); err != nil {
+		return nil, fmt.Errorf("failed to parse response (status %d): %s", resp.StatusCode, string(respBytes))
+	}
+
+	if !apiResp.Success || resp.StatusCode != http.StatusOK {
+		msg := apiResp.Error
+		if msg == "" {
+			msg = fmt.Sprintf("API returned status %d", resp.StatusCode)
+		}
+		return nil, parseAPIError(msg, apiResp.RequestID)
+	}
+	if apiResp.Data == nil {
+		return nil, fmt.Errorf("daemon returned success with no preflight data")
+	}
+	return apiResp.Data, nil
 }

@@ -237,7 +237,20 @@ struct DiagnosticPayload: Codable, Equatable {
 /// tray can both display and edit them. Mirrors the
 /// `contracts.IsolationConfig` struct on the Go side.
 struct IsolationConfigStatus: Codable, Equatable {
+    /// EFFECTIVE isolation state: what actually happens when the server spawns,
+    /// after the global setting, the per-server override and the structural
+    /// gates. NOT the raw override — read `enabledOverride` for that.
+    ///
+    /// Reading this as the override is exactly what corrupted configs before
+    /// GH #1142: an inheriting server reported `false`, the edit form seeded a
+    /// toggle from it, and saving any isolation field persisted an explicit
+    /// opt-out that silently un-containerised the server.
     let enabled: Bool
+    /// RAW per-server override. `nil` means "inherit the global setting" — a
+    /// distinct state from an explicit `false`.
+    let enabledOverride: Bool?
+    /// RAW per-server mode override ("docker" | "sandbox" | "none").
+    let modeOverride: String?
     let image: String?
     let networkMode: String?
     let extraArgs: [String]?
@@ -245,9 +258,59 @@ struct IsolationConfigStatus: Codable, Equatable {
 
     enum CodingKeys: String, CodingKey {
         case enabled, image
+        case enabledOverride = "enabled_override"
+        case modeOverride = "mode_override"
         case networkMode = "network_mode"
         case extraArgs = "extra_args"
         case workingDir = "working_dir"
+    }
+}
+
+/// Resolved isolation state plus the rule that produced it, so the tray can say
+/// WHY a server is (or is not) isolated instead of showing an ambiguous flag.
+/// Mirrors `contracts.IsolationEffective` on the Go side.
+struct IsolationEffectiveStatus: Codable, Equatable {
+    let mode: String            // "docker" | "sandbox" | "none"
+    let isolated: Bool
+    let globalMode: String?
+    let inherited: Bool
+    /// "global" | "server-mode" | "server-opt-out" | "server-opt-in-ignored" |
+    /// "not-stdio" | "already-docker" | "sandbox-unavailable" |
+    /// "unsupported-mode". Treat anything else as "global".
+    let source: String?
+
+    enum CodingKeys: String, CodingKey {
+        case mode, isolated, inherited, source
+        case globalMode = "global_mode"
+    }
+
+    /// One-line explanation for the read-only Config tab.
+    var explanation: String {
+        let global = (globalMode?.isEmpty == false) ? globalMode! : "none"
+        switch source {
+        case "server-mode":
+            return "Mode set for this server: \(mode)"
+        case "server-opt-out":
+            return "Turned off for this server (global setting is \(global))"
+        case "server-opt-in-ignored":
+            return "Turned on for this server, but global isolation is off — the setting is ignored"
+        case "not-stdio":
+            return "No local process to isolate"
+        case "already-docker":
+            return "This server already runs Docker itself"
+        case "sandbox-unavailable":
+            // The mode is set, but the spawn path degrades to unconfined here:
+            // Landlock is Linux-only, so a Mac never enforces it.
+            return "Sandbox mode is set, but this system cannot enforce it — the server runs unconfined"
+        case "unsupported-mode":
+            return "Isolation mode \(mode) is not one this version implements — the server runs unconfined"
+        default:
+            return inherited ? "Inherits the global setting (\(global))" : "Turned on for this server"
+        }
+    }
+
+    var label: String {
+        isolated ? "Isolated (\(mode))" : "Not isolated"
     }
 }
 
@@ -313,6 +376,7 @@ struct ServerStatus: Codable, Identifiable, Equatable {
     let quarantine: QuarantineStats?
     let isolation: IsolationConfigStatus?
     let isolationDefaults: IsolationDefaultsStatus?
+    let isolationEffective: IsolationEffectiveStatus?
     let error: String?
     /// Spec 044 — stable error code (e.g. MCPX_STDIO_SPAWN_ENOENT) and the
     /// structured diagnostic payload. Present only when the server has an
@@ -342,6 +406,7 @@ struct ServerStatus: Codable, Identifiable, Equatable {
         case quarantine
         case isolation
         case isolationDefaults = "isolation_defaults"
+        case isolationEffective = "isolation_effective"
         case error
         case errorCode = "error_code"
         case diagnostic
@@ -351,6 +416,43 @@ struct ServerStatus: Codable, Identifiable, Equatable {
     var hasAttentionDiagnostic: Bool {
         guard let d = diagnostic, !(d.code).isEmpty else { return false }
         return d.severity == "warn" || d.severity == "error"
+    }
+
+    /// True when the server is held for quarantine review — an intentional
+    /// admin state, not a fault, exactly like `isOAuthLoginRequired`.
+    ///
+    /// mcpproxy still *attempts* a connection to a quarantined server so the
+    /// security scanner can export its tool definitions, and a failed attempt
+    /// leaves an error-severity diagnostic behind. That diagnostic used to tint
+    /// the menu-bar badge red while the very same payload reported
+    /// `health.level == "healthy"` / `admin_state == "quarantined"` — so the
+    /// menu header drew a calm yellow dot under a red menu-bar dot, and the
+    /// user could not clear it without approving or disabling the server.
+    ///
+    /// The `admin_state` half is belt-and-braces, not a second independent
+    /// signal: the backend derives it FROM `quarantined`
+    /// (`internal/health/calculator.go` returns `AdminState: quarantined`
+    /// whenever the input is quarantined), so today it cannot be true while
+    /// `quarantined` is false. It is kept because `admin_state` is the
+    /// cross-surface contract CLI/REST/Web-UI/tray share, and this stays correct
+    /// if those two ever decouple.
+    var isQuarantineReview: Bool {
+        quarantined || health?.adminState == "quarantined"
+    }
+
+    /// Whether this server's diagnostic is allowed to tint the menu-bar badge.
+    ///
+    /// The badge answers "is something broken?", so a server sitting in a state
+    /// the user chose — or is being asked to act on calmly — must not turn it
+    /// red. Two such states exist, and both still carry an error-severity
+    /// diagnostic from the connect attempt that state implies:
+    /// waiting for sign-in, and held for quarantine review.
+    ///
+    /// Any future intentional non-connected state belongs here too, and must be
+    /// added to BOTH `worstDiagnosticSeverity` and `diagnosticCount` — they
+    /// share this predicate precisely so they cannot drift apart.
+    var isBadgeExempt: Bool {
+        isOAuthLoginRequired || isQuarantineReview
     }
 
     /// True when the server is in the OAuth login-required state (MCP-1819/T3).
@@ -548,6 +650,16 @@ struct ActivityEntry: Codable, Identifiable, Equatable {
     let timestamp: String
     let sessionId: String?
     let requestId: String?
+    /// Correlation id of the `code_execution` call this record is a sub-call of,
+    /// or nil for a top-level record.
+    ///
+    /// It is the PARENT's `requestId` (the core mints one `parentCallID` per
+    /// `code_execution` dispatch and stamps every sandboxed `call_tool` with
+    /// it), so `?parent_id=<parent request_id>` fetches a parent's children and
+    /// `?request_id=<child parent_id>` fetches a child's parent. Children carry
+    /// fresh request ids of their own, which is what keeps rule 4 from
+    /// collapsing a whole script into one row.
+    let parentId: String?
     let metadata: [String: JSONValue]?
     let hasSensitiveData: Bool?
     let detectionTypes: [String]?
@@ -562,6 +674,7 @@ struct ActivityEntry: Codable, Identifiable, Equatable {
         case durationMs = "duration_ms"
         case sessionId = "session_id"
         case requestId = "request_id"
+        case parentId = "parent_id"
         case hasSensitiveData = "has_sensitive_data"
         case detectionTypes = "detection_types"
         case maxSeverity = "max_severity"
@@ -631,6 +744,102 @@ struct ActivityEntry: Codable, Identifiable, Equatable {
     }
 }
 
+/// What a record *is*, for grouping purposes: a call (successful or failed) or
+/// a policy block. Blocks never group with calls — a burst of blocked attempts
+/// at a tool is a different story from a burst of calls to it (spec 090 FR-002).
+enum OutcomeClass: String, Equatable {
+    case call
+    case blocked
+}
+
+/// How a record *ended*, coarsened to what a row can render (spec 090 FR-004).
+///
+/// The second half of the group key, and the reason it exists: with only
+/// `OutcomeClass` in the key, a stretch of calls to one tool that failed twice
+/// in the middle was ONE run, rendered with the failure mark and a `×N` that
+/// counted the successes too — a row claiming twelve failures where two
+/// happened. Splitting the stretch by status class keeps every run homogeneous,
+/// so a `×N` is always a count of the thing the row is marked as.
+///
+/// Three classes, not one per raw status: `running`, `blocked` and anything
+/// else the core may write are all "not finished the way a row cares about",
+/// and bucketing them keeps an unfamiliar status from fragmenting a run record
+/// by record.
+enum StatusClass: String, Equatable {
+    case success
+    case failure
+    case pending
+}
+
+// MARK: - Glance accessors (spec 090)
+//
+// Derived, no stored fields. They exist so the tray's pure row pipeline reads
+// one vocabulary — `reason`, `outcomeClass`, `statusClass` — instead of
+// re-deriving the metadata layout at every call site, and so a live SSE-adapted
+// entry and a polled entry answer identically (`GlanceEvent` populates the same
+// slots).
+extension ActivityEntry {
+
+    /// Reason a policy decision gives for itself: `metadata.reason`.
+    ///
+    /// Separate from `intentReason`, which lives under `metadata.intent`: a
+    /// blocked record can carry both (the caller's plan and the policy's
+    /// refusal), and the row must show the refusal.
+    var blockReason: String? {
+        guard let meta = metadata,
+              case .string(let r) = meta["reason"] else { return nil }
+        return r.isEmpty ? nil : r
+    }
+
+    /// The reason to display for this record: the policy's on a policy record,
+    /// the caller's declared intent on everything else (FR-005).
+    var reason: String? {
+        type == ActivityEntry.policyDecisionType ? blockReason : intentReason
+    }
+
+    /// Grouping class (FR-002).
+    ///
+    /// A policy decision is a *block* only when it actually stopped the call —
+    /// `decision` (canonically "blocked"; legacy "block" accepted) rather than a
+    /// warning or a redaction, which let the call through. When the record
+    /// carries no `decision` metadata — legacy records, or a projection that
+    /// dropped it — the persisted status IS the decision (`activity_service.go`
+    /// writes `Status: decision`), so it is the fallback.
+    var outcomeClass: OutcomeClass {
+        guard type == ActivityEntry.policyDecisionType else { return .call }
+        let decision: String
+        if let meta = metadata, case .string(let d) = meta["decision"], !d.isEmpty {
+            decision = d
+        } else {
+            decision = status
+        }
+        return ActivityEntry.blockingDecisions.contains(decision) ? .blocked : .call
+    }
+
+    /// Grouping class for the record's outcome (FR-004).
+    ///
+    /// Deliberately parallel to `outcomeClass` rather than folded into it: rule
+    /// 6 (`GlanceSelection.qualifies`) asks "did policy stop this call?", which
+    /// is a question about the record's KIND, while grouping also has to ask
+    /// "how did it end?". One enum answering both would make a blocked record
+    /// and a failed call indistinguishable at the qualification gate.
+    var statusClass: StatusClass {
+        switch status {
+        case "success": return .success
+        case "error": return .failure
+        default: return .pending
+        }
+    }
+
+    /// Activity record type of a policy decision (`storage.ActivityTypePolicyDecision`).
+    static let policyDecisionType = "policy_decision"
+
+    /// Decisions that stopped the call. "blocked" is what the runtime emits
+    /// today; "block" is accepted because `event_bus.go` still treats both as a
+    /// block and old records may carry it.
+    static let blockingDecisions: Set<String> = ["blocked", "block"]
+}
+
 /// Response wrapper for `GET /api/v1/activity`.
 struct ActivityListResponse: Codable {
     let activities: [ActivityEntry]
@@ -689,6 +898,11 @@ struct StatusResponse: Codable {
     let routingMode: String?
     let upstreamStats: UpstreamStats?
     let timestamp: Int64?
+    /// MCP-2176: the core's built-in default MCP instructions, rendered as the
+    /// placeholder of the Settings → Advanced instructions field so the shown
+    /// default never drifts from `resolveInstructions("")`. Optional — a core
+    /// older than the field simply omits it.
+    let defaultInstructions: String?
 
     enum CodingKeys: String, CodingKey {
         case running
@@ -697,6 +911,7 @@ struct StatusResponse: Codable {
         case routingMode = "routing_mode"
         case upstreamStats = "upstream_stats"
         case timestamp
+        case defaultInstructions = "default_instructions"
     }
 }
 
@@ -715,6 +930,14 @@ struct UpdateInfo: Codable, Equatable {
     let isPrerelease: Bool?
     let checkError: String?
 
+    /// Spec 079 FR-002 — the core-rendered "N releases / M weeks behind"
+    /// clause. Optional because a core older than this feature omits it, and
+    /// because the core withholds it whenever the delta could not be resolved
+    /// (offline, rate-limited, a build with no release record). Render it
+    /// verbatim; never re-derive the wording here, or this tray drifts from
+    /// `mcpproxy status`, `doctor` and the Web UI banner.
+    let behindSummary: String?
+
     enum CodingKeys: String, CodingKey {
         case available
         case latestVersion = "latest_version"
@@ -722,6 +945,7 @@ struct UpdateInfo: Codable, Equatable {
         case checkedAt = "checked_at"
         case isPrerelease = "is_prerelease"
         case checkError = "check_error"
+        case behindSummary = "behind_summary"
     }
 }
 
@@ -733,12 +957,33 @@ struct InfoResponse: Codable, Equatable {
     let endpoints: InfoEndpoints
     let update: UpdateInfo?
 
+    /// Spec 092 FR-001a — durable launch provenance: "tray"/"installer" when a
+    /// tray process started this core, "" when the user did. Optional in the
+    /// model, not in the contract: a core from before this field existed omits
+    /// it, and an older core is precisely the one the supersede logic has to
+    /// reason about, so decoding must not fail on its absence.
+    let launchedBy: String?
+
+    /// Spec 092 FR-002 — the core's own pid. Nil from a core too old to report
+    /// one, which downgrades the supersede action to "show instructions".
+    let pid: Int32?
+
+    /// Spec 092 FR-015 — the effective update policy. Optional for the same
+    /// reason as the two fields above: a pre-092 core omits it, and the tray
+    /// must keep working against one. Absence maps to the permissive default
+    /// those builds already behaved as (see `UpdatePolicyResolver`), never to
+    /// "silently disable updates".
+    let updatePolicy: CoreUpdatePolicy?
+
     enum CodingKeys: String, CodingKey {
         case version
         case webUiUrl = "web_ui_url"
         case listenAddr = "listen_addr"
         case endpoints
         case update
+        case launchedBy = "launched_by"
+        case pid
+        case updatePolicy = "update_policy"
     }
 }
 
@@ -1053,4 +1298,95 @@ struct SearchToolsResponse: Codable {
     let results: [SearchResult]?
     let tools: [SearchTool]?
     let total: Int?
+}
+
+// MARK: - Usage Aggregate (Spec 069 A3)
+
+/// One hourly bar of the usage timeline.
+/// Matches Go `contracts.UsageTimeBucket`.
+///
+/// `calls` INCLUDES `errors` — a stacked chart must plot `calls - errors` and
+/// `errors`, never the two raw fields, or failures are counted twice.
+/// Buckets are UTC-hour aligned and sparse: hours with no activity are omitted.
+struct UsageBucket: Codable, Equatable {
+    /// Start of the UTC hour this bucket covers.
+    let start: Date
+    let calls: Int
+    let errors: Int
+    let totalRespBytes: Int
+
+    enum CodingKeys: String, CodingKey {
+        case start, calls, errors
+        case totalRespBytes = "total_resp_bytes"
+    }
+}
+
+// The Codable conformance lives in an extension so the memberwise initialiser
+// is still synthesised (an `init` in the struct body would suppress it).
+extension UsageBucket {
+    /// The API emits Go's RFC 3339 rendering (`2026-07-29T13:00:00Z`), which the
+    /// shared `JSONDecoder` in `fetchWrapped` cannot parse with its default
+    /// `.deferredToDate` strategy. Parsing here keeps the model self-contained
+    /// instead of forcing a decoder-wide date strategy onto every other model.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let raw = try container.decode(String.self, forKey: .start)
+        guard let parsed = UsageBucket.parseRFC3339(raw) else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .start, in: container,
+                debugDescription: "Not an RFC 3339 timestamp: \(raw)"
+            )
+        }
+        let calls = try container.decode(Int.self, forKey: .calls)
+        let errors = try container.decode(Int.self, forKey: .errors)
+        let bytes = try container.decode(Int.self, forKey: .totalRespBytes)
+        self.init(start: parsed, calls: calls, errors: errors, totalRespBytes: bytes)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(UsageBucket.rfc3339String(from: start), forKey: .start)
+        try container.encode(calls, forKey: .calls)
+        try container.encode(errors, forKey: .errors)
+        try container.encode(totalRespBytes, forKey: .totalRespBytes)
+    }
+
+    /// Parse an RFC 3339 timestamp, with or without fractional seconds.
+    static func parseRFC3339(_ value: String) -> Date? {
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = fractional.date(from: value) { return date }
+        let plain = ISO8601DateFormatter()
+        plain.formatOptions = [.withInternetDateTime]
+        return plain.date(from: value)
+    }
+
+    /// Render a date the way the API renders bucket starts.
+    static func rfc3339String(from date: Date) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter.string(from: date)
+    }
+}
+
+/// Response for `GET /api/v1/activity/usage`.
+/// Matches Go `contracts.UsageAggregateResponse`.
+///
+/// The per-tool rollup (`tools`, `other`) and `generated_at` are deliberately not
+/// decoded: the tray requests `top=1` and renders only the timeline plus the
+/// tokens-saved headline. Unknown keys are ignored by `JSONDecoder`.
+struct UsageAggregateResponse: Codable, Equatable {
+    let window: String
+    let tokenSource: String?
+    let tokensSaved: Int?
+    let tokensSavedPercentage: Double?
+    /// Global hourly buckets, trimmed to `window`. Never nil; empty when idle.
+    let timeline: [UsageBucket]
+
+    enum CodingKeys: String, CodingKey {
+        case window, timeline
+        case tokenSource = "token_source"
+        case tokensSaved = "tokens_saved"
+        case tokensSavedPercentage = "tokens_saved_percentage"
+    }
 }

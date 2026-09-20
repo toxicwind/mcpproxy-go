@@ -21,8 +21,17 @@ final class ConfigStore: ObservableObject {
     @Published var loadError: String?
     /// Bumped on every mutation so SwiftUI re-evaluates dirty state.
     @Published var revision = 0
+    /// The core's built-in MCP `instructions` text (MCP-2176), shown as the
+    /// placeholder of the instructions field so a blank box reads as "the
+    /// default is this" instead of "nothing". Fetched, never hardcoded — the
+    /// Web UI does the same and the two must not drift.
+    @Published var defaultInstructions: String?
 
     private var original: [String: Any] = [:]
+    /// The API response exactly as the core sent it. `working`/`original` are
+    /// normalized (absent `omitempty` defaults filled in) so blank Pickers show
+    /// their real default, but the Raw tab must keep showing server truth.
+    private var raw: [String: Any] = [:]
     private let appState: AppState
 
     init(appState: AppState) { self.appState = appState }
@@ -35,23 +44,42 @@ final class ConfigStore: ObservableObject {
         loading = true
         loadError = nil
         do {
-            let cfg = try await api.getConfig()
-            working = cfg
-            original = cfg
-            loaded = true
-            revision += 1
+            hydrate(from: try await api.getConfig())
         } catch {
             loadError = (error as? APIClientError)?.errorDescription ?? error.localizedDescription
         }
+        // Best-effort: an older core without the field just leaves the generic
+        // placeholder in place, so this never fails the settings load.
+        if let status = try? await api.status(), let text = status.defaultInstructions, !text.isEmpty {
+            defaultInstructions = text
+        }
         loading = false
+    }
+
+    /// Populate the store from a raw `GET /api/v1/config` response.
+    ///
+    /// Split out of `load()` so the hydration invariant is testable without an
+    /// API client. That invariant: `working` and `original` BOTH get the
+    /// resolved defaults for `omitempty` keys the core omits (the serialization
+    /// modes — absent means "full") so their Picker shows the real default
+    /// instead of blank, while `raw` keeps the untouched response because the
+    /// Raw tab must show server truth. Normalizing only one of the two would
+    /// make an untouched field read as an unsaved change.
+    func hydrate(from cfg: [String: Any]) {
+        raw = cfg
+        let normalized = SettingsCatalog.normalizeDefaults(cfg)
+        working = normalized
+        original = normalized
+        loaded = true
+        revision += 1
     }
 
     /// The core's current (saved) configuration, pretty-printed for the
     /// read-only Raw tab. Reflects server truth — not unsaved form edits.
     var prettyJSON: String {
-        guard JSONSerialization.isValidJSONObject(original),
+        guard JSONSerialization.isValidJSONObject(raw),
               let data = try? JSONSerialization.data(
-                withJSONObject: original, options: [.prettyPrinted, .sortedKeys]),
+                withJSONObject: raw, options: [.prettyPrinted, .sortedKeys]),
               let str = String(data: data, encoding: .utf8)
         else { return "{}" }
         return str
@@ -95,8 +123,13 @@ final class ConfigStore: ObservableObject {
             }.joined(separator: "; ")
             throw APIClientError.httpError(statusCode: 422, message: msg.isEmpty ? "Validation failed" : msg)
         }
-        // Commit saved keys into the snapshot so they're no longer dirty.
-        for k in keys { configSet(&original, k, configGet(working, k)) }
+        // Commit saved keys into the snapshot so they're no longer dirty. The
+        // Raw tab tracks the same commit, so it keeps reflecting what the core
+        // now holds rather than the config as it was at load time.
+        for k in keys {
+            configSet(&original, k, configGet(working, k))
+            configSet(&raw, k, configGet(working, k))
+        }
         revision += 1
         let requiresRestart = (result["requires_restart"] as? Bool) ?? false
         return (requiresRestart, result["restart_reason"] as? String)
@@ -130,6 +163,27 @@ final class ConfigStore: ObservableObject {
         )
     }
 
+    /// Binding for a `listLines` textarea (fields.ts `listKind: 'lines'`): the
+    /// JSON value is a []string shown one entry per line. Writing splits on
+    /// newlines AND commas (a pasted "a,b" still yields two entries), trims,
+    /// and drops blank entries, so a cleared box is an empty list — never a
+    /// string the Go side cannot decode into []string. Clearing a key the core
+    /// never sent stores "unset" rather than [], so the row does not read as
+    /// dirty against an absent key (same tri-state as optionalStringBinding).
+    func linesBinding(_ key: String) -> Binding<String> {
+        Binding(
+            get: { linesText(self.value(key)) },
+            set: {
+                let list = parseLines($0)
+                if list.isEmpty, isBlankValue(configGet(self.original, key)) {
+                    self.setValue(key, nil)
+                } else {
+                    self.setValue(key, list)
+                }
+            }
+        )
+    }
+
     func doubleBinding(_ key: String) -> Binding<Double> {
         Binding(
             get: { coerceDouble(self.value(key)) ?? 0 },
@@ -157,6 +211,21 @@ func coerceString(_ v: Any?) -> String {
     default: return ""
     }
 }
+/// Render a []string as one entry per line; a scalar falls back to its string
+/// form so a hand-edited file never shows as blank.
+func linesText(_ v: Any?) -> String {
+    if let arr = v as? [Any] { return arr.map { coerceString($0) }.joined(separator: "\n") }
+    return coerceString(v)
+}
+
+/// Parse textarea text into a trimmed []string (mirrors textToList in
+/// fields.ts): newlines and commas both separate entries; blanks are dropped.
+func parseLines(_ text: String) -> [String] {
+    text.components(separatedBy: CharacterSet(charactersIn: "\n,"))
+        .map { $0.trimmingCharacters(in: .whitespaces) }
+        .filter { !$0.isEmpty }
+}
+
 func coerceDouble(_ v: Any?) -> Double? {
     switch v {
     case let n as NSNumber: return n.doubleValue
@@ -304,30 +373,45 @@ struct ConfigFieldRow: View {
     private var validationError: String? { dirty ? validateConfigField(field, store.value(field.key)) : nil }
 
     var body: some View {
-        HStack(alignment: .top) {
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 6) {
-                    Text(field.label).fontWeight(.medium)
-                    if dirty { Circle().fill(Color.orange).frame(width: 6, height: 6) }
-                    if field.restart {
-                        Text("restart").font(.caption2).padding(.horizontal, 5).padding(.vertical, 1)
-                            .background(Color.orange.opacity(0.25)).cornerRadius(4)
-                    }
-                    if let docs = field.docs, let url = URL(string: SettingsCatalog.docsBase + docs) {
-                        Link("docs ↗", destination: url).font(.caption)
-                    }
+        Group {
+            // A textarea cannot share a row with its label — 240pt of trailing
+            // column is not a place to edit a paragraph. It stacks instead.
+            if field.control == .textarea {
+                VStack(alignment: .leading, spacing: 6) {
+                    labelBlock
+                    control.frame(maxWidth: .infinity, alignment: .leading)
                 }
-                if let help = field.help {
-                    Text(help).font(.caption).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
-                }
-                if let err = validationError {
-                    Text(err).font(.caption).foregroundColor(.red)
+            } else {
+                HStack(alignment: .top) {
+                    labelBlock
+                    Spacer(minLength: 16)
+                    control.frame(maxWidth: 240, alignment: .trailing)
                 }
             }
-            Spacer(minLength: 16)
-            control.frame(maxWidth: 240, alignment: .trailing)
         }
         .padding(.vertical, 8)
+    }
+
+    private var labelBlock: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 6) {
+                Text(field.label).fontWeight(.medium)
+                if dirty { Circle().fill(Color.orange).frame(width: 6, height: 6) }
+                if field.restart {
+                    Text("restart").font(.caption2).padding(.horizontal, 5).padding(.vertical, 1)
+                        .background(Color.orange.opacity(0.25)).cornerRadius(4)
+                }
+                if let docs = field.docs, let url = URL(string: SettingsCatalog.docsBase + docs) {
+                    Link("docs ↗", destination: url).font(.caption)
+                }
+            }
+            if let help = field.help {
+                Text(help).font(.caption).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+            if let err = validationError {
+                Text(err).font(.caption).foregroundColor(.red)
+            }
+        }
     }
 
     @ViewBuilder private var control: some View {
@@ -340,9 +424,39 @@ struct ConfigFieldRow: View {
             }
             .labelsHidden().frame(maxWidth: 220)
         case .number:
-            TextField("", value: store.doubleBinding(field.key), format: .number)
-                .multilineTextAlignment(.trailing).frame(width: 100)
-                .textFieldStyle(.roundedBorder)
+            HStack(spacing: 4) {
+                TextField("", value: store.doubleBinding(field.key), format: .number)
+                    .multilineTextAlignment(.trailing).frame(width: 100)
+                    .textFieldStyle(.roundedBorder)
+                // F13: fields.ts gives entropy_threshold step 0.1 and
+                // oauth_expiry_warning_hours step 0.5; without a stepper the
+                // native form could only be typed into.
+                if let step = field.step {
+                    Stepper("", value: store.doubleBinding(field.key),
+                            in: (field.min ?? -.greatestFiniteMagnitude)...(field.max ?? .greatestFiniteMagnitude),
+                            step: step)
+                        .labelsHidden()
+                }
+            }
+        case .textarea:
+            // The instructions field: multi-line, and its placeholder is the
+            // live built-in default rather than an example. A `listLines`
+            // field (trusted_proxies) binds a []string one entry per line and
+            // keeps its own example placeholder.
+            let text = field.listLines ? store.linesBinding(field.key) : store.optionalStringBinding(field.key)
+            ZStack(alignment: .topLeading) {
+                TextEditor(text: text)
+                    .font(.system(.callout, design: .monospaced))
+                    .frame(minHeight: 120)
+                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color(nsColor: .separatorColor)))
+                if text.wrappedValue.isEmpty {
+                    Text(field.listLines ? (field.placeholder ?? "") : (store.defaultInstructions ?? field.placeholder ?? ""))
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundColor(.secondary)
+                        .padding(.horizontal, 6).padding(.vertical, 10)
+                        .allowsHitTesting(false)
+                }
+            }
         case .text, .duration:
             // Duration fields are tri-state: an optional one stores a blank
             // value as "unset" (reset to default) via optionalStringBinding.

@@ -315,6 +315,15 @@ func (e *mockEmitter) EmitSecurityScannerChanged(scannerID, status, errMsg strin
 	})
 }
 
+func (e *mockEmitter) EmitSecurityScanTelemetry(completed bool, findingsBySeverity map[string]int) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.events = append(e.events, mockEvent{
+		eventType: "scan_telemetry",
+		data:      map[string]interface{}{"completed": completed, "findings": findingsBySeverity},
+	})
+}
+
 // mockUnquarantiner records UnquarantineServer calls for test assertions.
 type mockUnquarantiner struct {
 	mu    sync.Mutex
@@ -2122,7 +2131,10 @@ func TestGetScanSummary_OverwritesNilSentinelOnRealScan(t *testing.T) {
 		t.Fatalf("SaveScanJob: %v", err)
 	}
 	real := &ScanSummary{Status: "clean", LastScanAt: &now}
-	svc.cacheScanSummary("later-scanned", real)
+	svc.summaryCacheMu.RLock()
+	realGen := svc.summaryCacheGen["later-scanned"]
+	svc.summaryCacheMu.RUnlock()
+	svc.cacheScanSummary("later-scanned", real, realGen)
 
 	// Subsequent GetScanSummary returns the real summary, not the nil sentinel.
 	if got := svc.GetScanSummary(context.Background(), "later-scanned"); got == nil || got.Status != "clean" {
@@ -2493,9 +2505,34 @@ func TestServiceStartScanDeepOnRunsSourceResolutionAndPass2(t *testing.T) {
 		t.Errorf("deep scan on: Pass 2 (ResolveFullSource) must run, got %d call(s)", got)
 	}
 
-	// Drain the engine so the background Pass-2 goroutine finishes before the
-	// test tears down its temp dirs (keeps -race teardown quiet).
+	// Drain Pass 2 before the test tears down its temp dirs. Waiting for the
+	// engine to go idle is not enough: the Pass-2 goroutine writes tools.json
+	// into workDir (exportToolDefinitions) AFTER ResolveFullSource returns and
+	// BEFORE it registers its job with the engine, so an idle engine can mean
+	// "Pass 1 cleared, Pass 2 not yet started" — and TempDir's RemoveAll then
+	// raced the write ("directory not empty", flaky on ubuntu CI). The Pass-2
+	// job is saved to storage on every exit path (completed, or the failed
+	// placeholder), so that is the terminal signal.
+	waitForPass2Saved(t, store, "srv-on")
 	waitForScanIdle(t, svc, "srv-on")
+}
+
+// waitForPass2Saved polls storage until a Pass-2 job for server has reached a
+// terminal status — the goroutine's last write, on every path startPass2 can
+// take.
+func waitForPass2Saved(t *testing.T, store *mockStorage, server string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		jobs, _ := store.ListScanJobs(server)
+		for _, j := range jobs {
+			if j.ScanPass == ScanPassSupplyChainAudit && j.Status != ScanJobStatusRunning && j.Status != ScanJobStatusPending {
+				return
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("Pass 2 for %s did not reach a terminal status in time", server)
 }
 
 // TestApplySecurityConfigDefaultConfigGatesDeepScanOff locks the audit's FIX-1

@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -23,6 +24,7 @@ import (
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/logs"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/socket"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/storage"
 )
 
 // Activity command flags
@@ -39,6 +41,7 @@ var (
 	activityOffset        int
 	activityIntentType    string // Spec 018: Filter by operation type (read, write, destructive)
 	activityRequestID     string // Spec 021: Filter by HTTP request ID for correlation
+	activityParentID      string // Activity transparency: filter to sub-calls of a code_execution parent
 	activityNoIcons       bool   // Disable emoji icons in output
 	activityDetectionType string // Spec 026: Filter by detection type (e.g., "aws_access_key")
 	activitySeverity      string // Spec 026: Filter by severity level (critical, high, medium, low)
@@ -71,6 +74,7 @@ type ActivityFilter struct {
 	Offset        int
 	IntentType    string // Spec 018: Filter by operation type (read, write, destructive)
 	RequestID     string // Spec 021: Filter by HTTP request ID for correlation
+	ParentID      string // Activity transparency: filter to sub-calls of a code_execution parent
 	SensitiveData *bool  // Spec 026: Filter by sensitive data detection
 	DetectionType string // Spec 026: Filter by detection type
 	Severity      string // Spec 026: Filter by severity level
@@ -85,6 +89,8 @@ func (f *ActivityFilter) Validate() error {
 		validTypes := []string{
 			"tool_call", "policy_decision", "quarantine_change", "server_change",
 			"system_start", "system_stop", "internal_tool_call", "config_change", // Spec 024: new types
+			string(storage.ActivityTypePreflight), // Spec 098: required-tools preflight
+			string(storage.ActivityTypePromptGet), // Finding F10: prompts/get activity
 		}
 		// Split by comma for multi-type support
 		types := strings.Split(f.Type, ",")
@@ -105,7 +111,9 @@ func (f *ActivityFilter) Validate() error {
 
 	// Validate status
 	if f.Status != "" {
-		validStatuses := []string{"success", "error", "blocked"}
+		// Spec 093 added "rejected" (shed by a concurrency limit) to the closed
+		// activity status vocabulary; the CLI filter must accept it.
+		validStatuses := []string{"success", "error", "blocked", "rejected"}
 		valid := false
 		for _, s := range validStatuses {
 			if f.Status == s {
@@ -221,6 +229,11 @@ func (f *ActivityFilter) ToQueryParams() url.Values {
 	// Spec 021: Add request_id filter for log correlation
 	if f.RequestID != "" {
 		q.Set("request_id", f.RequestID)
+	}
+	// Activity transparency: parent_id joins a code_execution record to the
+	// sandboxed sub-calls it made (child.parent_id == parent.request_id).
+	if f.ParentID != "" {
+		q.Set("parent_id", f.ParentID)
 	}
 	// Spec 026: Add sensitive data filters
 	if f.SensitiveData != nil {
@@ -554,6 +567,219 @@ func displaySensitiveDataSection(activity map[string]interface{}) {
 	}
 }
 
+// --- Spec 098: preflight activity records ------------------------------------
+//
+// A preflight record is set-scoped, not server-scoped: server_name and
+// tool_name are empty and everything an operator wants to see lives in
+// Metadata ({verdict, ids_count, reasons{code:count}, per_tool[{id,status,
+// reason?}]}, written by runtime.ActivityService.RecordPreflight). Without the
+// renderers below, `activity list` shows a bare row with three empty columns
+// and `activity show` shows nothing at all — the FR-014 transparency promise
+// only holds if the record is actually readable.
+//
+// The metadata arrives here as decoded JSON, so counts are float64 and the
+// nested payloads are []interface{} / map[string]interface{}; every accessor
+// below tolerates both that and the native Go shape used in tests.
+
+// maxPreflightSummaryReasons caps how many distinct reason codes the one-line
+// summary names before it collapses the tail into "+N more". A preflight may
+// carry up to 100 ids across 15 reason codes; an uncapped rollup would push
+// every other column of `activity list` off screen.
+const maxPreflightSummaryReasons = 3
+
+// maxPreflightSummaryCell bounds the summary in the `activity list` TOOL
+// column, matching the cap the tool tables already use for their widest cell.
+const maxPreflightSummaryCell = 60
+
+// isPreflightActivity reports whether a record is a Spec 098 preflight.
+func isPreflightActivity(activity map[string]interface{}) bool {
+	return getStringField(activity, "type") == string(storage.ActivityTypePreflight)
+}
+
+// preflightReasonCount is one {reason code, count} pair of the metadata rollup.
+type preflightReasonCount struct {
+	Reason string
+	Count  int
+}
+
+// preflightReasonRollup reads metadata["reasons"] into a DETERMINISTIC order:
+// most frequent first, ties broken alphabetically. Map iteration order would
+// otherwise make the same record render differently on every invocation, which
+// breaks both diffing two runs and any test that asserts the line.
+func preflightReasonRollup(metadata map[string]interface{}) []preflightReasonCount {
+	counts := map[string]int{}
+	for reason, raw := range getMapField(metadata, storage.MetadataKeyPreflightReasons) {
+		if count, ok := numericMetadataValue(raw); ok {
+			counts[reason] = count
+		}
+	}
+
+	// Fallback for a record whose rollup is missing: recount from the per-tool
+	// detail, which carries the same codes.
+	if len(counts) == 0 {
+		for _, entry := range getArrayField(metadata, storage.MetadataKeyPreflightPerTool) {
+			tool, ok := entry.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if reason := getStringField(tool, storage.PreflightPerToolKeyReason); reason != "" {
+				counts[reason]++
+			}
+		}
+	}
+	if len(counts) == 0 {
+		return nil
+	}
+
+	rollup := make([]preflightReasonCount, 0, len(counts))
+	for reason, count := range counts {
+		rollup = append(rollup, preflightReasonCount{Reason: reason, Count: count})
+	}
+	sort.Slice(rollup, func(i, j int) bool {
+		if rollup[i].Count != rollup[j].Count {
+			return rollup[i].Count > rollup[j].Count
+		}
+		return rollup[i].Reason < rollup[j].Reason
+	})
+	return rollup
+}
+
+// formatPreflightReasons renders a rollup as "code xN, code xN". limit <= 0
+// means "name them all"; a positive limit collapses the tail into "+N more".
+func formatPreflightReasons(rollup []preflightReasonCount, limit int) string {
+	if len(rollup) == 0 {
+		return ""
+	}
+
+	shown := rollup
+	remaining := 0
+	if limit > 0 && len(rollup) > limit {
+		shown = rollup[:limit]
+		remaining = len(rollup) - limit
+	}
+
+	parts := make([]string, 0, len(shown)+1)
+	for _, entry := range shown {
+		parts = append(parts, fmt.Sprintf("%s x%d", entry.Reason, entry.Count))
+	}
+	if remaining > 0 {
+		parts = append(parts, fmt.Sprintf("+%d more", remaining))
+	}
+	return strings.Join(parts, ", ")
+}
+
+// numericMetadataValue reads a metadata count that may have arrived as JSON
+// (float64) or as the native int the writer used.
+func numericMetadataValue(raw interface{}) (int, bool) {
+	switch v := raw.(type) {
+	case float64:
+		return int(v), true
+	case int:
+		return v, true
+	default:
+		return 0, false
+	}
+}
+
+// preflightIDsCount is how many unique tool ids the run evaluated. ids_count is
+// authoritative (the writer sets it); per_tool length is the fallback for a
+// record written by an older/partial writer.
+func preflightIDsCount(metadata map[string]interface{}) int {
+	if count := getIntField(metadata, storage.MetadataKeyPreflightIDsCount); count > 0 {
+		return count
+	}
+	return len(getArrayField(metadata, storage.MetadataKeyPreflightPerTool))
+}
+
+// preflightActivitySummary renders the one-line verdict summary shown in the
+// `activity list` table, e.g. "blocked (4 tools): server_disabled x2,
+// tool_changed x1". Empty string for anything that is not a readable preflight
+// record, so the caller falls back to its usual "-" placeholder.
+func preflightActivitySummary(activity map[string]interface{}) string {
+	if !isPreflightActivity(activity) {
+		return ""
+	}
+	metadata := getMapField(activity, "metadata")
+	if metadata == nil {
+		return ""
+	}
+	verdict := getStringField(metadata, storage.MetadataKeyPreflightVerdict)
+	if verdict == "" {
+		return ""
+	}
+
+	count := preflightIDsCount(metadata)
+	unit := "tools"
+	if count == 1 {
+		unit = "tool"
+	}
+	summary := fmt.Sprintf("%s (%d %s)", verdict, count, unit)
+
+	if reasons := formatPreflightReasons(preflightReasonRollup(metadata), maxPreflightSummaryReasons); reasons != "" {
+		summary += ": " + reasons
+	}
+	return summary
+}
+
+// preflightDetailLines builds the `activity show` section for a preflight
+// record. It returns lines instead of printing so the rendering is unit-tested
+// without capturing stdout. Empty slice ⇒ nothing to render.
+func preflightDetailLines(activity map[string]interface{}) []string {
+	if !isPreflightActivity(activity) {
+		return nil
+	}
+	metadata := getMapField(activity, "metadata")
+	if metadata == nil {
+		return nil
+	}
+	verdict := getStringField(metadata, storage.MetadataKeyPreflightVerdict)
+	if verdict == "" {
+		return nil
+	}
+
+	lines := []string{
+		"",
+		"Preflight:",
+		fmt.Sprintf("  Verdict:           %s", verdict),
+		fmt.Sprintf("  Tools Checked:     %d", preflightIDsCount(metadata)),
+	}
+	// The full rollup here — the detail view has the room the table row lacks.
+	if reasons := formatPreflightReasons(preflightReasonRollup(metadata), 0); reasons != "" {
+		lines = append(lines, fmt.Sprintf("  Reasons:           %s", reasons))
+	}
+
+	perTool := getArrayField(metadata, storage.MetadataKeyPreflightPerTool)
+	if len(perTool) == 0 {
+		return lines
+	}
+
+	lines = append(lines, "", "  Tools:")
+	for i, entry := range perTool {
+		tool, ok := entry.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		// Tool ids are caller-supplied strings that round-trip through the
+		// activity log; escape them before they reach a tty (same trust
+		// boundary as `tools list`).
+		id := sanitizeName(getStringField(tool, storage.PreflightPerToolKeyID))
+		status := getStringField(tool, storage.PreflightPerToolKeyStatus)
+		line := fmt.Sprintf("    [%d] %-40s %s", i+1, id, status)
+		if reason := getStringField(tool, storage.PreflightPerToolKeyReason); reason != "" {
+			line += "  " + reason
+		}
+		lines = append(lines, line)
+	}
+	return lines
+}
+
+// displayPreflightSection prints the preflight detail for `activity show`.
+func displayPreflightSection(activity map[string]interface{}) {
+	for _, line := range preflightDetailLines(activity) {
+		fmt.Println(line)
+	}
+}
+
 // formatSeverityWithColor returns a severity string with visual indicator
 func formatSeverityWithColor(severity string) string {
 	if activityNoIcons {
@@ -637,6 +863,9 @@ Examples:
   # List activity by request ID (for error correlation)
   mcpproxy activity list --request-id abc123-def456
 
+  # List the sub-calls a code_execution made (value = the parent's request_id)
+  mcpproxy activity list --parent-id abc123-def456
+
   # List only activities with sensitive data detected
   mcpproxy activity list --sensitive-data
 
@@ -713,7 +942,10 @@ Examples:
   mcpproxy activity export --format csv --output activity.csv
 
   # Export to stdout for piping
-  mcpproxy activity export --format csv | gzip > activity.csv.gz`,
+  mcpproxy activity export --format csv | gzip > activity.csv.gz
+
+  # Export just the sub-calls of one code_execution
+  mcpproxy activity export --parent-id abc123-def456`,
 		RunE: runActivityExport,
 	}
 )
@@ -732,10 +964,10 @@ func init() {
 	activityCmd.AddCommand(activityExportCmd)
 
 	// List command flags
-	activityListCmd.Flags().StringVarP(&activityType, "type", "t", "", "Filter by type (comma-separated for multiple): tool_call, system_start, system_stop, internal_tool_call, config_change, policy_decision, quarantine_change, server_change")
+	activityListCmd.Flags().StringVarP(&activityType, "type", "t", "", "Filter by type (comma-separated for multiple): tool_call, system_start, system_stop, internal_tool_call, config_change, policy_decision, quarantine_change, server_change, preflight")
 	activityListCmd.Flags().StringVarP(&activityServer, "server", "s", "", "Filter by server name")
 	activityListCmd.Flags().StringVar(&activityTool, "tool", "", "Filter by tool name")
-	activityListCmd.Flags().StringVar(&activityStatus, "status", "", "Filter by status: success, error, blocked")
+	activityListCmd.Flags().StringVar(&activityStatus, "status", "", "Filter by status: success, error, blocked, rejected")
 	activityListCmd.Flags().StringVar(&activitySessionID, "session", "", "Filter by session — a work session id (ws-...) or a raw MCP transport session id")
 	activityListCmd.Flags().StringVar(&activityStartTime, "start-time", "", "Filter records after this time (RFC3339)")
 	activityListCmd.Flags().StringVar(&activityEndTime, "end-time", "", "Filter records before this time (RFC3339)")
@@ -743,6 +975,7 @@ func init() {
 	activityListCmd.Flags().IntVar(&activityOffset, "offset", 0, "Pagination offset")
 	activityListCmd.Flags().StringVar(&activityIntentType, "intent-type", "", "Filter by intent operation type: read, write, destructive")
 	activityListCmd.Flags().StringVar(&activityRequestID, "request-id", "", "Filter by HTTP request ID for log correlation")
+	activityListCmd.Flags().StringVar(&activityParentID, "parent-id", "", "List child tool calls of a code_execution activity (value = the parent record request_id)")
 	activityListCmd.Flags().BoolVar(&activityNoIcons, "no-icons", false, "Disable emoji icons in output (use text instead)")
 	// Spec 026: Sensitive data detection filters
 	activityListCmd.Flags().Bool("sensitive-data", false, "Filter to show only activities with sensitive data detected")
@@ -753,7 +986,7 @@ func init() {
 	activityListCmd.Flags().StringVar(&activityAuthType, "auth-type", "", "Filter by auth type: admin, agent")
 
 	// Watch command flags
-	activityWatchCmd.Flags().StringVarP(&activityType, "type", "t", "", "Filter by type (comma-separated): tool_call, system_start, system_stop, internal_tool_call, config_change, policy_decision, quarantine_change, server_change")
+	activityWatchCmd.Flags().StringVarP(&activityType, "type", "t", "", "Filter by type (comma-separated): tool_call, system_start, system_stop, internal_tool_call, config_change, policy_decision, quarantine_change, server_change, preflight")
 	activityWatchCmd.Flags().StringVarP(&activityServer, "server", "s", "", "Filter by server name")
 
 	// Show command flags
@@ -769,13 +1002,14 @@ func init() {
 	activityExportCmd.Flags().StringVarP(&activityExportFormat, "format", "f", "json", "Export format: json, csv")
 	activityExportCmd.Flags().BoolVar(&activityIncludeBodies, "include-bodies", false, "Include full request/response bodies")
 	// Reuse list filter flags for export
-	activityExportCmd.Flags().StringVarP(&activityType, "type", "t", "", "Filter by type (comma-separated): tool_call, system_start, system_stop, internal_tool_call, config_change, policy_decision, quarantine_change, server_change")
+	activityExportCmd.Flags().StringVarP(&activityType, "type", "t", "", "Filter by type (comma-separated): tool_call, system_start, system_stop, internal_tool_call, config_change, policy_decision, quarantine_change, server_change, preflight")
 	activityExportCmd.Flags().StringVarP(&activityServer, "server", "s", "", "Filter by server name")
 	activityExportCmd.Flags().StringVar(&activityTool, "tool", "", "Filter by tool name")
-	activityExportCmd.Flags().StringVar(&activityStatus, "status", "", "Filter by status")
+	activityExportCmd.Flags().StringVar(&activityStatus, "status", "", "Filter by status: success, error, blocked, rejected")
 	activityExportCmd.Flags().StringVar(&activitySessionID, "session", "", "Filter by session — a work session id (ws-...) or a raw MCP transport session id")
 	activityExportCmd.Flags().StringVar(&activityStartTime, "start-time", "", "Filter after this time (RFC3339)")
 	activityExportCmd.Flags().StringVar(&activityEndTime, "end-time", "", "Filter before this time (RFC3339)")
+	activityExportCmd.Flags().StringVar(&activityParentID, "parent-id", "", "Export only child tool calls of a code_execution activity (value = the parent record request_id)")
 }
 
 // getActivityClient creates an HTTP client for the daemon
@@ -826,6 +1060,7 @@ func runActivityList(cmd *cobra.Command, _ []string) error {
 		Offset:        activityOffset,
 		IntentType:    activityIntentType,
 		RequestID:     activityRequestID,
+		ParentID:      activityParentID,
 		SensitiveData: sensitiveDataPtr,
 		DetectionType: activityDetectionType,
 		Severity:      activitySeverity,
@@ -894,6 +1129,15 @@ func runActivityList(cmd *cobra.Command, _ []string) error {
 		durationMs := getIntField(act, "duration_ms")
 		timestamp := getStringField(act, "timestamp")
 
+		// Spec 098: a preflight is set-scoped — server_name/tool_name are empty
+		// by construction, so the TOOL cell carries the verdict summary instead
+		// of rendering an empty row the operator cannot interpret.
+		if tool == "" {
+			if summary := preflightActivitySummary(act); summary != "" {
+				tool = sanitizeCell(summary, maxPreflightSummaryCell)
+			}
+		}
+
 		// Extract intent from metadata (Spec 018)
 		intentStr := formatIntentIndicator(act)
 
@@ -919,7 +1163,9 @@ func runActivityList(cmd *cobra.Command, _ []string) error {
 			sourceIcon,
 			actType,
 			server,
-			tool,
+			// Activity transparency: a sub-call of a code_execution parent is
+			// indented so a mixed list reads as a tree, not a flat run of rows.
+			activityChildToolCell(act, tool),
 			intentStr,
 			sensitiveStr, // Spec 026: Show sensitive data indicator
 			status,
@@ -1205,11 +1451,16 @@ func formatToolCallEvent(event map[string]interface{}, timestamp string) string 
 	statusIcon := formatStatusIcon(status)
 
 	line := fmt.Sprintf("[%s] [%s] %s:%s %s %s", timestamp, sourceIcon, server, tool, statusIcon, formatActivityDuration(int64(durationMs)))
+	// Activity transparency: mark sub-calls made from inside a code_execution.
+	line += formatParentMarker(event)
 	if errMsg != "" {
 		line += " " + errMsg
 	}
-	if status == "blocked" {
+	switch status {
+	case "blocked":
 		line += " BLOCKED"
+	case "rejected":
+		line += " REJECTED (concurrency limit)"
 	}
 	return line
 }
@@ -1234,6 +1485,7 @@ func formatInternalToolCallEvent(event map[string]interface{}, timestamp string)
 	}
 
 	line := fmt.Sprintf("[%s] [INT] %s%s %s %s", timestamp, internalTool, target, statusIcon, formatActivityDuration(int64(durationMs)))
+	line += formatParentMarker(event)
 	if errMsg != "" {
 		line += " " + errMsg
 	}
@@ -1308,9 +1560,47 @@ func formatStatusIcon(status string) string {
 		return "\u2717" // X
 	case "blocked":
 		return "\u2298" // circle with slash
+	case "rejected":
+		// Spec 093: shed by a concurrency limit — backpressure, not a failure.
+		return "\u23f8" // pause
 	default:
 		return "?"
 	}
+}
+
+// activityChildToolCell renders the TOOL cell for a list row, marking records
+// that are sub-calls of a code_execution parent (ParentID == parent request_id).
+func activityChildToolCell(act map[string]interface{}, tool string) string {
+	if getStringField(act, "parent_id") == "" {
+		return tool
+	}
+	return "└ " + tool
+}
+
+// formatParentMarker renders the short "[child of <parent_id>]" suffix used by
+// `activity watch`, so a sub-call is recognisable in the live stream.
+func formatParentMarker(event map[string]interface{}) string {
+	parentID := getStringField(event, "parent_id")
+	if parentID == "" {
+		return ""
+	}
+	return fmt.Sprintf(" [child of %s]", parentID)
+}
+
+// isCodeExecutionParent reports whether a record is the code_execution activity
+// that sandboxed sub-calls hang off. Only the internal_tool_call record spawns
+// children; a same-named upstream tool_call does not.
+func isCodeExecutionParent(activity map[string]interface{}) bool {
+	if getStringField(activity, "type") != string(storage.ActivityTypeInternalToolCall) {
+		return false
+	}
+	if getStringField(activity, "tool_name") == "code_execution" {
+		return true
+	}
+	if metadata := getMapField(activity, "metadata"); metadata != nil {
+		return getStringField(metadata, "internal_tool_name") == "code_execution"
+	}
+	return false
 }
 
 // runActivityShow implements the activity show command
@@ -1384,6 +1674,25 @@ func runActivityShow(cmd *cobra.Command, args []string) error {
 		fmt.Printf("Session ID:   %s\n", sessionID)
 	}
 
+	// Spec 098 (SC-005): the request id is how a preflight record is joined to
+	// the tool calls of the same workflow (`activity list --request-id <id>`),
+	// so the detail view has to show it, not just accept it as a filter.
+	requestID := getStringField(activity, "request_id")
+	if requestID != "" {
+		fmt.Printf("Request ID:   %s\n", requestID)
+	}
+
+	// Activity transparency: both directions of the code_execution ↔ sub-call
+	// link are navigable from the detail view.
+	//   child  → parent:   the Parent ID line below
+	//   parent → children: the hint below it
+	if parentID := getStringField(activity, "parent_id"); parentID != "" {
+		fmt.Printf("Parent ID:    %s\n", parentID)
+		fmt.Printf("              (sub-call of a code_execution — 'mcpproxy activity list --request-id %s' shows the parent)\n", parentID)
+	} else if isCodeExecutionParent(activity) && requestID != "" {
+		fmt.Printf("\nUse 'mcpproxy activity list --parent-id %s' to see sub-calls.\n", requestID)
+	}
+
 	if errMsg := getStringField(activity, "error_message"); errMsg != "" {
 		fmt.Printf("Error:        %s\n", errMsg)
 	}
@@ -1393,6 +1702,9 @@ func runActivityShow(cmd *cobra.Command, args []string) error {
 
 	// Sensitive Data Detection (Spec 026)
 	displaySensitiveDataSection(activity)
+
+	// Preflight verdict + per-tool reasons (Spec 098)
+	displayPreflightSection(activity)
 
 	// Arguments
 	if args, ok := activity["arguments"].(map[string]interface{}); ok && len(args) > 0 {
@@ -1478,6 +1790,8 @@ func runActivitySummary(cmd *cobra.Command, _ []string) error {
 	// Table output
 	period := getStringField(summary, "period")
 	totalCount := getIntField(summary, "total_count")
+	callCount := getIntField(summary, "call_count")
+	callErrorCount := getIntField(summary, "call_error_count")
 	successCount := getIntField(summary, "success_count")
 	errorCount := getIntField(summary, "error_count")
 	blockedCount := getIntField(summary, "blocked_count")
@@ -1496,9 +1810,20 @@ func runActivitySummary(cmd *cobra.Command, _ []string) error {
 		blockedPct = float64(blockedCount) / float64(totalCount) * 100
 	}
 
+	// "Total Calls" used to print total_count, which counts every activity
+	// record — security scans, quarantine auto-approvals, system starts — so the
+	// CLI, the Web UI's Usage tab and the tray all reported different totals for
+	// the same window (audit finding F1, #1046). Events and calls are separate
+	// rows now, and the call row is the number every other surface shows.
+	callErrorPct := float64(0)
+	if callCount > 0 {
+		callErrorPct = float64(callErrorCount) / float64(callCount) * 100
+	}
+
 	fmt.Printf("%-15s %s\n", "METRIC", "VALUE")
 	fmt.Printf("%-15s %s\n", strings.Repeat("-", 15), strings.Repeat("-", 20))
-	fmt.Printf("%-15s %d\n", "Total Calls", totalCount)
+	fmt.Printf("%-15s %d\n", "Total Events", totalCount)
+	fmt.Printf("%-15s %d (%.1f%% failed)\n", "Calls", callCount, callErrorPct)
 	fmt.Printf("%-15s %d (%.1f%%)\n", "Successful", successCount, successPct)
 	fmt.Printf("%-15s %d (%.1f%%)\n", "Errors", errorCount, errorPct)
 	fmt.Printf("%-15s %d (%.1f%%)\n", "Blocked", blockedCount, blockedPct)
@@ -1535,6 +1860,43 @@ func runActivitySummary(cmd *cobra.Command, _ []string) error {
 	return nil
 }
 
+// activityExportQueryParams builds the export query string from the export
+// flags. Export does NOT go through ActivityFilter.ToQueryParams, so every
+// filter flag has to be wired here as well or it is a silent no-op.
+func activityExportQueryParams() url.Values {
+	q := url.Values{}
+	q.Set("format", activityExportFormat)
+	if activityType != "" {
+		q.Set("type", activityType)
+	}
+	if activityServer != "" {
+		q.Set("server", activityServer)
+	}
+	if activityTool != "" {
+		q.Set("tool", activityTool)
+	}
+	if activityStatus != "" {
+		q.Set("status", activityStatus)
+	}
+	if activitySessionID != "" {
+		q.Set(sessionQueryParam(activitySessionID), activitySessionID)
+	}
+	if activityStartTime != "" {
+		q.Set("start_time", activityStartTime)
+	}
+	if activityEndTime != "" {
+		q.Set("end_time", activityEndTime)
+	}
+	// Activity transparency: export the sub-calls of one code_execution.
+	if activityParentID != "" {
+		q.Set("parent_id", activityParentID)
+	}
+	if activityIncludeBodies {
+		q.Set("include_bodies", "true")
+	}
+	return q
+}
+
 // runActivityExport implements the activity export command
 func runActivityExport(cmd *cobra.Command, _ []string) error {
 	// Setup logger
@@ -1568,34 +1930,7 @@ func runActivityExport(cmd *cobra.Command, _ []string) error {
 	transport, baseURL := activityTransport(endpoint, logger.Sugar())
 	exportURL := baseURL + "/api/v1/activity/export"
 
-	q := url.Values{}
-	q.Set("format", activityExportFormat)
-	if activityType != "" {
-		q.Set("type", activityType)
-	}
-	if activityServer != "" {
-		q.Set("server", activityServer)
-	}
-	if activityTool != "" {
-		q.Set("tool", activityTool)
-	}
-	if activityStatus != "" {
-		q.Set("status", activityStatus)
-	}
-	if activitySessionID != "" {
-		q.Set(sessionQueryParam(activitySessionID), activitySessionID)
-	}
-	if activityStartTime != "" {
-		q.Set("start_time", activityStartTime)
-	}
-	if activityEndTime != "" {
-		q.Set("end_time", activityEndTime)
-	}
-	if activityIncludeBodies {
-		q.Set("include_bodies", "true")
-	}
-
-	exportURL += "?" + q.Encode()
+	exportURL += "?" + activityExportQueryParams().Encode()
 
 	// Create HTTP request
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)

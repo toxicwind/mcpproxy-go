@@ -3,11 +3,20 @@
 package launcher
 
 import (
+	"io"
 	"os/exec"
 	"syscall"
 
 	"go.uber.org/zap"
 )
+
+// createJob is a no-op on Unix: applyProcAttrs' process-group setup already
+// gives terminateProcess/killProcess a way to reach grandchildren, so there
+// is nothing extra to track here. See launcher_windows.go for the platform
+// that actually needs this.
+func createJob(_ *exec.Cmd) io.Closer {
+	return nil
+}
 
 // applyProcAttrs places the child in its own process group so we can signal
 // the entire group (including grandchildren spawned via `sh -c …` or
@@ -47,3 +56,9 @@ func killProcess(cmd *exec.Cmd, log *zap.Logger) error {
 	}
 	return syscall.Kill(-pgid, syscall.SIGKILL)
 }
+
+// terminate and kill are the two escalation steps stopLocked drives. On
+// Unix they are the process-group signals above; the Job Object argument
+// the Windows build needs does not exist here.
+func (h *handle) terminate() error { return terminateProcess(h.cmd, h.log) }
+func (h *handle) kill() error      { return killProcess(h.cmd, h.log) }

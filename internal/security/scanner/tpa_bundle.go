@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
-	"sync"
 
 	"go.uber.org/zap"
 
@@ -42,11 +41,40 @@ const bundleEngineRegex = "regex"
 // keys are ignored by encoding/json, which is exactly the forward-compat
 // behavior the contract requires.
 type rawBundle struct {
-	BundleVersion  string    `json:"bundle_version"`
-	SchemaVersion  string    `json:"schema_version"`
-	SignatureCount int       `json:"signature_count"`
-	Rules          []rawRule `json:"rules"`
-	Skipped        []rawSkip `json:"skipped"`
+	BundleVersion  string `json:"bundle_version"`
+	SchemaVersion  string `json:"schema_version"`
+	SignatureCount int    `json:"signature_count"`
+	// GeneratedAt is an OPTIONAL additive freshness stamp (the v0.1.0 format
+	// does not emit one yet). When a corpus carries it, it is surfaced verbatim
+	// in BundleInfo so an operator can tell a stale corpus from a fresh export.
+	GeneratedAt string    `json:"generated_at"`
+	Rules       []rawRule `json:"rules"`
+	Skipped     []rawSkip `json:"skipped"`
+}
+
+// bundleMeta is the operator-facing header of a bundle, extracted without
+// re-compiling any rules.
+type bundleMeta struct {
+	BundleVersion  string
+	SchemaVersion  string
+	SignatureCount int
+	GeneratedAt    string
+}
+
+// bundleMetadata re-reads just the bundle header. It is only called on bytes
+// that loadBundleCheck already parsed successfully, so a decode error here is
+// impossible in practice and yields an empty header rather than a hard failure.
+func bundleMetadata(data []byte) bundleMeta {
+	var b rawBundle
+	if err := json.Unmarshal(data, &b); err != nil {
+		return bundleMeta{}
+	}
+	return bundleMeta{
+		BundleVersion:  b.BundleVersion,
+		SchemaVersion:  b.SchemaVersion,
+		SignatureCount: b.SignatureCount,
+		GeneratedAt:    b.GeneratedAt,
+	}
 }
 
 // rawRule is one rule object. Only the fields the offline tier consumes are
@@ -128,18 +156,30 @@ func (c *BundleCheck) Inspect(tool detect.ToolView, _ detect.RegistryView) []det
 		if loc == nil {
 			continue
 		}
+		checkID := "tpa." + r.id + "." + r.detector
+		// detect.CapEvidence is the render-safe contract every other check
+		// honors: it escapes control / zero-width / bidi runes to a visible
+		// \uXXXX form AND caps to MaxEvidenceLen. The bundle's dot-all regexes
+		// can match such runes from an attacker-controlled description, so the
+		// raw span must never land verbatim in Signal.Evidence — nor in the
+		// span's Snippet, which is the same value reused as the UI's staleness
+		// checksum.
+		evidence := detect.CapEvidence(tool.Description[loc[0]:loc[1]])
 		sigs = append(sigs, detect.Signal{
-			CheckID:    "tpa." + r.id + "." + r.detector,
+			CheckID:    checkID,
 			Tier:       detect.TierHard,
 			ThreatType: r.threatType,
 			Confidence: r.confidence,
-			// detect.CapEvidence is the render-safe contract every other check
-			// honors: it escapes control / zero-width / bidi runes to a visible
-			// \uXXXX form AND caps to MaxEvidenceLen. The bundle's dot-all regexes
-			// can match such runes from an attacker-controlled description, so the
-			// raw span must never land verbatim in Signal.Evidence.
-			Evidence: detect.CapEvidence(tool.Description[loc[0]:loc[1]]),
-			Detail:   fmt.Sprintf("bundle rule %s (%s, level=%s) matched tool description", r.id, r.detector, r.level),
+			Evidence:   evidence,
+			Detail:     fmt.Sprintf("bundle rule %s (%s, level=%s) matched tool description", r.id, r.detector, r.level),
+			// The regex already handed us the match location; converting it here
+			// is the whole cost of the inline highlight. Offsets that will not
+			// convert cleanly to UTF-16 yield no span rather than a wrong one,
+			// and a match longer than the snippet can pin down is CLAMPED to the
+			// verified prefix — these dot-all rules routinely match far more than
+			// MaxEvidenceLen runes, and an unverified tail is exactly how a mark
+			// ends up on prose no rule matched. See detect.DescriptionSpan.
+			Spans: detect.DescriptionSpan(checkID, detect.TierHard, tool.Description, loc[0], loc[1]),
 		})
 	}
 	return sigs
@@ -167,33 +207,24 @@ func loadEmbeddedBundleCheck() (*BundleCheck, bundleLoadStats, error) {
 	return loadBundleCheck(bundledScannerBundle)
 }
 
-var (
-	defaultBundleOnce  sync.Once
-	defaultBundleValue *BundleCheck
-)
-
-// defaultBundleCheck returns the process-wide embedded bundle check, loaded
-// exactly once. On a load failure it logs a warning and returns nil so callers
-// continue scanning WITHOUT the bundle — a bundle problem must never break the
-// scanner (spec 086 FR-005; edge case "bundle fails to load"). A successful
-// embedded-default load is the expected path.
+// defaultBundleCheck returns the ACTIVE bundle check — the corpus installed by
+// ConfigureBundle (configured path, else the embedded default). It returns nil
+// only when no corpus could be loaded at all, in which case callers continue
+// scanning WITHOUT bundle-backed checks; a bundle problem must never break the
+// scanner (spec 086 FR-005), and the trust_mode:scan gate independently fails
+// closed when the bundle is absent (FR-014).
+//
+// Configuration/logging live in tpa_bundle_source.go so this file stays about
+// parsing and matching.
 func defaultBundleCheck() *BundleCheck {
-	defaultBundleOnce.Do(func() {
-		check, stats, err := loadEmbeddedBundleCheck()
-		if err != nil {
-			zap.L().Named("security.scanner").Warn(
-				"embedded TPA scanner bundle failed to load; continuing without bundle-backed checks",
-				zap.Error(err))
-			return
-		}
-		defaultBundleValue = check
-		zap.L().Named("security.scanner").Info(
-			"loaded embedded TPA scanner bundle",
-			zap.Int("runnable_rules", stats.Runnable),
-			zap.Int("skipped_rules", stats.Skipped),
-			zap.Int("declared_skipped", stats.Declared))
-	})
-	return defaultBundleValue
+	if check, info := snapshotBundle(); check != nil || info.LoadError != "" {
+		return check
+	}
+	// Never configured (e.g. a unit test constructing the engine directly):
+	// lazily install the embedded default so behavior is unchanged.
+	ConfigureBundle("", zap.NewNop())
+	check, _ := snapshotBundle()
+	return check
 }
 
 // loadBundleCheck parses, version-checks, and compiles a scanner bundle into a
@@ -248,6 +279,20 @@ func loadBundleCheck(data []byte) (*BundleCheck, bundleLoadStats, error) {
 		})
 	}
 	stats.Runnable = len(compiled)
+
+	// A corpus that contributes NO runnable rule is an empty corpus, not a
+	// working one. Accepting it produced a non-nil BundleCheck with no rules,
+	// which made the scan gate's bundlePresent (and therefore coverageOK) true
+	// while zero signatures were actually being matched — a trust_mode:scan
+	// server could then be auto-approved on a rug-pulled description with the
+	// scanner effectively switched off. Fail the load instead, so the fail-closed
+	// fallback in ConfigureBundle keeps the last-known-good corpus live and the
+	// reason reaches BundleInfo.LoadError (FR-005/FR-014).
+	if stats.Runnable == 0 {
+		return nil, bundleLoadStats{}, fmt.Errorf(
+			"scanner bundle: no runnable rules (%d rules declared, %d not runnable offline, %d bundle-declared skipped)",
+			len(b.Rules), stats.Skipped, stats.Declared)
+	}
 
 	return &BundleCheck{rules: compiled}, stats, nil
 }

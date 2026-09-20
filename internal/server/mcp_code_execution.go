@@ -3,20 +3,86 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"math"
+	"reflect"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/audit"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/auth"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/codescripts"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/contracts"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/jsruntime"
-	"github.com/smart-mcp-proxy/mcpproxy-go/internal/profile"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/reqcontext"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/storage"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/telemetry"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/upstream"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/upstream/limiter"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/upstream/managed"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	mcpserver "github.com/mark3labs/mcp-go/server"
 	"go.uber.org/zap"
+)
+
+// The code_execution tool is registered on two surfaces — the default tool set
+// (registerTools) and the routing-mode builder (buildCodeExecutionTool) — which
+// must advertise exactly the same contract. They share these strings so the two
+// descriptions cannot drift apart.
+const (
+	codeExecutionToolDescription = "Execute JavaScript or TypeScript code that orchestrates multiple upstream MCP tools in a single request. " +
+		"Use this when you need to combine results from 2+ tools, implement conditional logic, loops, or data transformations " +
+		"that would require multiple round-trips otherwise.\n\n" +
+		"**When to use**: Multi-step workflows with data transformation, conditional logic, error handling, or iterating over results.\n" +
+		"**When NOT to use**: Single tool calls (use call_tool directly), long-running operations (>2 minutes).\n\n" +
+		"**Available in code**:\n" +
+		"- `input` global: Your input data passed via the 'input' parameter\n" +
+		"- `call_tool(serverName, toolName, args)`: Call upstream tools (returns {ok, result} or {ok, error})\n" +
+		"- `call_tools(requests, options)`: Call INDEPENDENT tools in parallel. `requests` is an array (max 100) of " +
+		"{server, tool, args} objects; `options` is optional and accepts `max_parallel` (1-32, defaults to the configured " +
+		"code_execution_max_parallel). Returns one {ok, result} / {ok, error} slot per request, in input order, so one " +
+		"failing call never fails the others. Malformed arguments return a single {ok:false, error} envelope and dispatch nothing.\n" +
+		"- Modern JavaScript (ES2020+): arrow functions, const/let, template literals, destructuring, classes, for-of, " +
+		"optional chaining (?.), nullish coalescing (??), spread/rest, Promises, Symbols, Map/Set, Proxy/Reflect " +
+		"(no require(), filesystem, or network access)\n\n" +
+		"**TypeScript support**: Set `language: \"typescript\"` to write TypeScript code with type annotations, interfaces, enums, and generics. " +
+		"Types are automatically stripped before execution.\n\n" +
+		"**Stored scripts**: Instead of `code`, pass `script: \"<name>\"` to run a script stored server-side in the `scripts/` directory next to mcpproxy's config file — " +
+		"a long workflow then costs a name per run instead of its full source. Provide exactly one of `code` or `script`. The stored-script listing is administrator-only " +
+		"(`mcpproxy code scripts list`, or the not-found error under the admin API key); an agent-token caller must already know the script name — " +
+		"a name that does not exist is refused without naming what is stored.\n\n" +
+		"**Important runtime rules**:\n" +
+		"- `call_tool` and `call_tools` are strictly SYNCHRONOUS. Do not use `await`.\n" +
+		"- Upstream tools usually return an MCP content array. To parse JSON results: `const data = JSON.parse(res.result.content[0].text);`\n" +
+		"- The last evaluated expression in your script is automatically returned as the final output.\n\n" +
+		"**Security**: Sandboxed execution with timeout enforcement. Respects existing quarantine and server restrictions."
+
+	codeExecutionCodeDescription = "JavaScript or TypeScript source code (ES2020+) to execute. Supports modern syntax: arrow functions, const/let, template literals, destructuring, " +
+		"optional chaining, nullish coalescing. Use `input` to access input data, `call_tool(serverName, toolName, args)` to invoke one upstream tool and " +
+		"`call_tools([{server, tool, args}, ...], {max_parallel})` to invoke independent tools in parallel. " +
+		"Both are SYNCHRONOUS — do not use await. Return value is the last evaluated expression and must be JSON-serializable. " +
+		"Example: `const res = call_tool('github', 'get_user', {username: input.username}); const data = JSON.parse(res.result.content[0].text); ({user: data, timestamp: Date.now()})`"
+
+	codeExecutionLanguageDescription = "Source code language. When set to 'typescript', the code is automatically transpiled to JavaScript before execution. " +
+		"Type annotations are stripped, enums and namespaces are converted to JavaScript equivalents. Default: 'javascript'."
+
+	codeExecutionScriptDescription = "Name of a STORED script to execute instead of sending `code` inline (Spec 097). Scripts live as `<name>.js` / `<name>.ts` files in the `scripts/` " +
+		"directory next to mcpproxy's active config file and are read fresh on every invocation, so an edited script takes effect immediately. " +
+		"Provide EXACTLY ONE of `code` or `script`. The name is a bare identifier (letters, digits, '-' and '_'; 1-64 chars) — never a path. " +
+		"The language comes from the file extension (.js → javascript, .ts → typescript); an explicit `language` that contradicts it is an error. " +
+		"ENUMERATION IS ADMINISTRATOR-ONLY: for an administrator (the admin API key, the tray, an in-process caller) a name that does not exist returns an error listing " +
+		"the available script names (first 20 alphabetically, plus the total); an agent-token caller must already know the script name — its not-found error " +
+		"names neither the stored scripts nor how many there are. Everything else — `input`, options, sandbox limits, results — behaves exactly as for inline code."
+
+	codeExecutionInputDescription = "Input data accessible as global `input` variable in code (default: {})"
+
+	codeExecutionOptionsDescription = "Execution options: timeout_ms (1-600000, default: 120000), max_tool_calls (>= 0, 0=unlimited), " +
+		"allowed_servers (array of server names, empty=all allowed). Batch concurrency is not an execution option: " +
+		"call_tools() defaults to the configured code_execution_max_parallel and is overridden per batch with call_tools(requests, {max_parallel})."
 )
 
 // handleCodeExecution executes JavaScript code that orchestrates multiple upstream tools
@@ -25,21 +91,44 @@ func (p *MCPProxyServer) handleCodeExecution(ctx context.Context, request mcp.Ca
 	p.recordBuiltinTool("code_execution")
 	p.logger.Debug("code_execution tool called")
 
-	// Parse arguments
-	var options jsruntime.ExecutionOptions
-
-	// Extract code (required)
-	code, err := request.RequireString("code")
-	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("Missing required parameter 'code': %v", err)), nil
+	// enable_code_execution is a FEATURE switch, so it is enforced where every
+	// surface passes rather than at registration. The MCP surfaces gate by
+	// omitting the tool or serving a disabled stub, but REST /api/v1/code/exec,
+	// REST /api/v1/tools/call and the tray all reach this handler through
+	// CallToolDirect — which routed straight here, letting an API-key holder run
+	// inline code and, since Spec 097, read and execute a server-side stored
+	// script while the operator believed the feature was off. The check reads
+	// the LIVE snapshot so a hot-reloaded flag takes effect on the next call;
+	// no config at all means nothing to disable.
+	if cfg := p.currentConfig(); cfg != nil && !cfg.EnableCodeExecution {
+		recordCodeExecRefusal(ctx, config.ErrCodeExecutionDisabled)
+		return mcp.NewToolResultError(config.CodeExecutionDisabledMessage), nil
 	}
+
+	// Parse arguments. MaxToolCalls starts at the unset sentinel so an explicit
+	// max_tool_calls: 0 — the documented unlimited override — survives default
+	// resolution instead of being floored to the configured limit.
+	options := jsruntime.ExecutionOptions{MaxToolCalls: codeExecMaxToolCallsUnset}
 
 	// Get all arguments
 	args := request.GetArguments()
 
 	// Extract language (optional, default: "javascript")
-	if language, ok := args["language"].(string); ok && language != "" {
-		options.Language = language
+	explicitLanguage, errMsg := codeExecStringArg(args, "language")
+	if errMsg != "" {
+		return mcp.NewToolResultError(errMsg), nil
+	}
+	if explicitLanguage != "" {
+		options.Language = explicitLanguage
+	}
+
+	// Spec 097: the source is EITHER inline code or a stored script name, never
+	// both and never neither. This is resolved before anything else runs — the
+	// handler is the only execution-time resolver on every surface (MCP, REST
+	// and both CLI modes send the NAME, never the content).
+	code, scriptName, errMsg := p.resolveCodeExecutionSource(ctx, args, &options)
+	if errMsg != "" {
+		return mcp.NewToolResultError(errMsg), nil
 	}
 
 	// Extract input (optional) - this is an object
@@ -51,45 +140,21 @@ func (p *MCPProxyServer) handleCodeExecution(ctx context.Context, request mcp.Ca
 
 	// Extract options object (optional)
 	if optionsObj, ok := args["options"].(map[string]interface{}); ok && optionsObj != nil {
-		// Parse timeout_ms
-		if timeoutMs, ok := optionsObj["timeout_ms"].(float64); ok {
-			options.TimeoutMs = int(timeoutMs)
-			// Validate timeout range
-			if options.TimeoutMs < 1 || options.TimeoutMs > 600000 {
-				return mcp.NewToolResultError("timeout_ms must be between 1 and 600000 milliseconds"), nil
-			}
-		}
-
-		// Parse max_tool_calls
-		if maxToolCalls, ok := optionsObj["max_tool_calls"].(float64); ok {
-			options.MaxToolCalls = int(maxToolCalls)
-			// Validate max_tool_calls
-			if options.MaxToolCalls < 0 {
-				return mcp.NewToolResultError("max_tool_calls cannot be negative"), nil
-			}
-		}
-
-		// Parse allowed_servers
-		if allowedServers, ok := optionsObj["allowed_servers"].([]interface{}); ok {
-			serverNames := make([]string, 0, len(allowedServers))
-			for _, serverVal := range allowedServers {
-				if serverName, ok := serverVal.(string); ok {
-					serverNames = append(serverNames, serverName)
-				} else {
-					return mcp.NewToolResultError("allowed_servers must be an array of strings"), nil
-				}
-			}
-			options.AllowedServers = serverNames
+		if errMsg := applyCodeExecutionOptions(optionsObj, &options); errMsg != "" {
+			return mcp.NewToolResultError(errMsg), nil
 		}
 	}
 
-	// Apply defaults from config if not specified in request
-	if options.TimeoutMs == 0 {
-		options.TimeoutMs = p.config.CodeExecutionTimeoutMs
+	// Read the LIVE snapshot, not the construction-time one: a hot-reloaded
+	// code_execution_* value must reach the executions that start after it.
+	// Without a config at all, every knob resolves to its built-in default.
+	var configTimeoutMs, configMaxToolCalls, configMaxParallel int
+	if cfg := p.currentConfig(); cfg != nil {
+		configTimeoutMs = cfg.CodeExecutionTimeoutMs
+		configMaxToolCalls = cfg.CodeExecutionMaxToolCalls
+		configMaxParallel = cfg.CodeExecutionMaxParallel
 	}
-	if options.MaxToolCalls == 0 {
-		options.MaxToolCalls = p.config.CodeExecutionMaxToolCalls
-	}
+	resolveCodeExecutionDefaults(&options, configTimeoutMs, configMaxToolCalls, configMaxParallel)
 
 	// Extract session information from context
 	var sessionID, clientName, clientVersion string
@@ -103,13 +168,18 @@ func (p *MCPProxyServer) handleCodeExecution(ctx context.Context, request mcp.Ca
 
 	// Generate parent call ID before execution
 	executionStart := time.Now()
-	parentCallID := fmt.Sprintf("%d-code_execution", executionStart.UnixNano())
+	parentCallID := mintCorrelationIDAt(executionStart, "code_execution")
 
-	// Get config path (handle nil mainServer for CLI mode)
-	var configPath string
-	if p.mainServer != nil {
-		configPath = p.mainServer.GetConfigPath()
-	}
+	// The execution id IS the parent call id. jsruntime.Execute takes options
+	// BY VALUE and only fills a missing ExecutionID on its own copy, so leaving
+	// this unset left every downstream consumer of options.ExecutionID —
+	// toolCaller.executionID, the parent history record's RequestID and the
+	// nested history records' RequestID — with the empty string, which broke
+	// exactly the correlation those fields exist for.
+	options.ExecutionID = parentCallID
+
+	// Config path for history records (empty when no authority was wired).
+	configPath := p.activeConfigFilePath()
 
 	// Create tool caller adapter that wraps the upstream manager
 	toolCaller := &upstreamToolCaller{
@@ -123,6 +193,7 @@ func (p *MCPProxyServer) handleCodeExecution(ctx context.Context, request mcp.Ca
 		clientName:      clientName,
 		clientVersion:   clientVersion,
 		mainServer:      p.mainServer,
+		proxy:           p,
 	}
 
 	// Log pool metrics before acquisition
@@ -187,38 +258,38 @@ func (p *MCPProxyServer) handleCodeExecution(ctx context.Context, request mcp.Ca
 			AllowedServers: authCtx.AllowedServers,
 			Permissions:    authCtx.Permissions,
 		}
-		// Provide tool annotation lookup function for permission tier resolution
-		options.ToolAnnotationFunc = p.lookupToolPermission
 	}
+	// Provide the tool annotation lookup for permission-tier resolution to
+	// EVERY execution, not only authenticated ones: it is also the sandbox's
+	// identity gate (Spec 105 FR-009, research D4 — jsruntime
+	// PermissionTierUnresolved), which applies to stdio / in-process callers
+	// that carry no AuthContext as much as to HTTP callers. The gate-capturing
+	// form is wired so the lookup's read is the nested call's ONE persisted
+	// read: the bridge (CallToolWithGate) dispatches on the gate it captured
+	// rather than taking a second one (codex r9 I1).
+	options.ToolGateFunc = p.lookupToolGate
 
 	// Spec 057 (Codex #621 finding 2): Intersect profile scope into code_execution.
-	// The jsruntime treats an empty AllowedServers as "allow all"; at a profile URL
-	// we must restrict to profile servers regardless of what the caller supplied.
-	if profileScope := profile.ProfileScopeFromContext(ctx); profileScope != nil {
-		// A profile is active: enforce its effective server set even when empty.
-		// A deny-all profile (servers: []) or a non-overlapping token∩profile
-		// yields an EMPTY allow-list, which the jsruntime would otherwise treat
-		// as "allow all" — leaking every server. RestrictToAllowed closes that.
-		options.RestrictToAllowed = true
-		// Build the effective allowed-servers list: profile servers only.
-		// If the caller also supplied allowed_servers, intersect the two sets.
-		profileServers := profileScope.AllowedServerNames()
-		if len(options.AllowedServers) == 0 {
-			// No caller-supplied restriction: use profile servers as the restriction.
-			options.AllowedServers = profileServers
-		} else {
-			// Intersect caller-supplied list with profile servers.
-			profileSet := make(map[string]struct{}, len(profileServers))
-			for _, s := range profileServers {
-				profileSet[s] = struct{}{}
-			}
-			var intersected []string
-			for _, s := range options.AllowedServers {
-				if _, ok := profileSet[s]; ok {
-					intersected = append(intersected, s)
-				}
-			}
-			options.AllowedServers = intersected
+	p.applyProfileScopeToExecution(ctx, &options)
+
+	// Spec 107 T103/T104: the wrapper itself writes no audit line (it is a
+	// built-in), but it captures the SCRIPT's caller for every nested line
+	// and installs the sandbox's authorization-decision observer so a
+	// scope/permission refusal decided inside jsruntime — which never
+	// reaches the bridge — still gets its `authz deny`, with parent_id.
+	if p.auditSink != nil {
+		scriptCaller := auditCallerFromContext(ctx)
+		toolCaller.auditCaller = &scriptCaller
+		toolCaller.auditProfile, _ = p.resolveActiveProfile(ctx)
+		options.ParentID = parentCallID
+		options.AuthzObserver = &nestedAuthzObserver{
+			proxy:         p,
+			parentCtx:     ctx,
+			caller:        scriptCaller,
+			sessionID:     sessionID,
+			clientName:    clientName,
+			clientVersion: clientVersion,
+			profile:       toolCaller.auditProfile,
 		}
 	}
 
@@ -226,6 +297,7 @@ func (p *MCPProxyServer) handleCodeExecution(ctx context.Context, request mcp.Ca
 	p.logger.Info("executing code",
 		zap.String("execution_id", options.ExecutionID),
 		zap.String("language", effectiveLanguage),
+		zap.String("script", scriptName), // empty for an inline call (Spec 097)
 		zap.Int("code_length", len(code)),
 		zap.Int("timeout_ms", options.TimeoutMs),
 		zap.Int("max_tool_calls", options.MaxToolCalls),
@@ -317,15 +389,11 @@ func (p *MCPProxyServer) handleCodeExecution(ctx context.Context, request mcp.Ca
 
 	// Record the parent code_execution call in history
 	codeExecRecord := &storage.ToolCallRecord{
-		ID:         parentCallID,
-		ServerID:   "code_execution", // Special server ID for built-in tool
-		ServerName: "mcpproxy",       // Built-in tool
-		ToolName:   "code_execution",
-		Arguments: map[string]interface{}{
-			"code":     code,
-			"input":    options.Input,
-			"language": effectiveLanguage,
-		},
+		ID:               parentCallID,
+		ServerID:         "code_execution", // Special server ID for built-in tool
+		ServerName:       "mcpproxy",       // Built-in tool
+		ToolName:         "code_execution",
+		Arguments:        codeExecRecordArguments(code, scriptName, effectiveLanguage, options.Input),
 		Response:         result,
 		Duration:         int64(executionDuration),
 		Timestamp:        executionStart,
@@ -360,7 +428,15 @@ func (p *MCPProxyServer) handleCodeExecution(ctx context.Context, request mcp.Ca
 		return nil, fmt.Errorf("failed to serialize result: %w", err)
 	}
 
-	// Spec 024: Emit internal tool call event for code_execution
+	// Spec 024: Emit internal tool call event for code_execution.
+	//
+	// This is the WRAPPER's own outcome and stays keyed on the JS runtime's
+	// result: a script that called a tool, got an isError answer and handled it
+	// has succeeded. The nested dispatches carry their own classification —
+	// upstreamToolCaller.CallTool records an isError:true answer as a failed
+	// tool call with the upstream's message (issue #935) — so a failure inside
+	// the sandbox is visible in the tool-call history rather than being folded
+	// into the wrapper.
 	var status, errorMsg string
 	if result.Ok {
 		status = "success"
@@ -370,11 +446,7 @@ func (p *MCPProxyServer) handleCodeExecution(ctx context.Context, request mcp.Ca
 			errorMsg = result.Error.Message
 		}
 	}
-	codeExecArgs := map[string]interface{}{
-		"code":     code,
-		"input":    options.Input,
-		"language": effectiveLanguage,
-	}
+	codeExecArgs := codeExecRecordArguments(code, scriptName, effectiveLanguage, options.Input)
 
 	// Spec 035: Determine content trust for code_execution based on tools called.
 	// If any tool called within the JS sandbox has openWorldHint=true (or nil, default true),
@@ -384,7 +456,8 @@ func (p *MCPProxyServer) handleCodeExecution(ctx context.Context, request mcp.Ca
 	if len(toolCallRecords) > 0 {
 		hasOpenWorldTool := false
 		for _, tc := range toolCallRecords {
-			toolAnnotations := p.lookupToolAnnotations(tc.ServerName, tc.ToolName)
+			// tc carries the split pair the script called; read it exactly.
+			toolAnnotations, _ := p.lookupExactToolAnnotations(tc.ServerName, tc.ToolName)
 			if contracts.IsOpenWorldTool(toolAnnotations) {
 				hasOpenWorldTool = true
 				break
@@ -404,6 +477,265 @@ func (p *MCPProxyServer) handleCodeExecution(ctx context.Context, request mcp.Ca
 			mcp.NewTextContent(string(resultJSON)),
 		},
 	}, nil
+}
+
+// codeExecutionSourceXORMessage explains the Spec 097 exactly-one-of rule.
+// JSON Schema cannot express XOR, so the schema marks both parameters optional
+// and the handler is the one place that enforces the rule — on every surface.
+const codeExecutionSourceXORMessage = "Provide exactly one of 'code' (inline source) or 'script' (the name of a script stored in the 'scripts' directory next to mcpproxy's config file) — not both, not neither."
+
+// codeExecStringArg reads an optional string argument, returning a user-facing
+// message when the value is present but is not a string.
+func codeExecStringArg(args map[string]interface{}, key string) (value, errMsg string) {
+	raw, present := args[key]
+	if !present || raw == nil {
+		return "", ""
+	}
+	str, ok := raw.(string)
+	if !ok {
+		return "", fmt.Sprintf("Parameter '%s' must be a string", key)
+	}
+	return str, ""
+}
+
+// resolveCodeExecutionSource applies the exactly-one-of rule and returns the
+// source to execute together with the stored-script name it came from (empty
+// for an inline call). For a stored script the language is derived from the
+// file extension and written back into options, so everything downstream —
+// transpilation, logging, records — sees what actually ran.
+func (p *MCPProxyServer) resolveCodeExecutionSource(ctx context.Context, args map[string]interface{}, options *jsruntime.ExecutionOptions) (code, scriptName, errMsg string) {
+	code, errMsg = codeExecStringArg(args, "code")
+	if errMsg != "" {
+		return "", "", errMsg
+	}
+	scriptName, errMsg = codeExecStringArg(args, "script")
+	if errMsg != "" {
+		return "", "", errMsg
+	}
+
+	if (code == "") == (scriptName == "") {
+		return "", "", codeExecutionSourceXORMessage
+	}
+	if scriptName == "" {
+		return code, "", ""
+	}
+
+	source, language, err := p.resolveStoredScript(ctx, scriptName, options.Language)
+	if err != nil {
+		// Keep the typed identity reachable for the REST surface (404 for a
+		// name that is not there, 400 for one that cannot run) — the text alone
+		// would force it to classify these by prose.
+		recordCodeExecRefusal(ctx, err)
+		return "", "", fmt.Sprintf("Cannot execute stored script: %v", err)
+	}
+	options.Language = language
+	return string(source), scriptName, ""
+}
+
+// resolveStoredScript applies the Spec 105 FR-012 caller-kind rule to
+// stored-script resolution. The Spec 097 FR-004 not-found error enumerates
+// the stored names and their count so an administrator recovers the set from
+// one failed call, and its sibling refusals (ambiguous, unusable, unreadable)
+// name the host path they are about; for a scoped caller (an agent token,
+// whatever its server scope — the caller KIND decides, never AllowedServers)
+// the listing is never even computed and every refusal is the non-disclosing
+// form (codescripts.ResolveScoped): the caller's own name and the reason,
+// independent of the directory's contents and location, so a failed call is
+// not an oracle for what is stored or where. An absent auth context
+// (in-process caller) or an administrator — including the anonymous,
+// admin-shaped /mcp caller under require_mcp_auth=false — keeps the
+// enumeration (SC-005: the named FR-012 admin exception).
+func (p *MCPProxyServer) resolveStoredScript(ctx context.Context, scriptName, explicitLanguage string) ([]byte, string, error) {
+	if !auth.IsScopedCaller(ctx) {
+		return codescripts.Resolve(p.scriptsDir(), scriptName, explicitLanguage)
+	}
+	source, language, err := codescripts.ResolveScoped(p.scriptsDir(), scriptName, explicitLanguage)
+	if err != nil {
+		// The refusal deliberately carries no count or path; the log line
+		// records only that a scoped probe was refused, for the same reason.
+		p.logger.Debug("Stored-script refusal delivered in non-disclosing form to scoped caller (Spec 105 FR-012)",
+			zap.String("script", scriptName),
+			zap.String("refusal", fmt.Sprintf("%T", err)))
+	}
+	return source, language, err
+}
+
+// activeConfigFilePath returns the configuration FILE this server belongs to:
+// the path declared at construction (WithConfigFilePath — every production
+// surface passes it), else the running server's own resolution.
+func (p *MCPProxyServer) activeConfigFilePath() string {
+	if p.configFilePath != "" {
+		return p.configFilePath
+	}
+	if p.mainServer != nil {
+		return p.mainServer.GetConfigPath()
+	}
+	return ""
+}
+
+// scriptsDir resolves the stored-scripts directory (Spec 097 FR-001): the
+// `scripts` directory beside the active config file. When no authority was
+// declared at all, the data dir's default config path is the documented
+// last-resort fallback — never a directory derived from --data-dir alone.
+func (p *MCPProxyServer) scriptsDir() string {
+	configFilePath := p.activeConfigFilePath()
+	if configFilePath == "" && p.config != nil {
+		configFilePath = config.GetConfigPath(p.config.DataDir)
+	}
+	dir := codescripts.DirFor(configFilePath)
+	if warmed := p.warmedScriptsDir.Load(); warmed != nil && *warmed != dir && p.warmedScriptsDir.CompareAndSwap(warmed, &dir) {
+		// The active config file moved: warm the new directory's index off
+		// this (possibly scoped) request's goroutine, once.
+		go p.warmStoredScripts(dir)
+	}
+	return dir
+}
+
+// warmStoredScripts builds the stored-name index of dir the scoped resolver
+// answers from (Spec 105 FR-012) — synchronously on the caller's goroutine,
+// which is never a request's: construction, or a goroutine of its own when
+// the directory moves. A directory that cannot be indexed (usually: not
+// created yet) refuses scoped callers until it changes; the administrator's
+// resolution does not depend on the index at all.
+func (p *MCPProxyServer) warmStoredScripts(dir string) {
+	if err := codescripts.Warm(dir); err != nil {
+		p.logger.Debug("Stored-script index not built; scoped callers are refused until the directory changes (Spec 105 FR-012)",
+			zap.String("dir", dir), zap.Error(err))
+	}
+}
+
+// codeExecRecordArguments builds the argument payload recorded for a
+// code_execution call. History and the activity event share it so they cannot
+// disagree: both keep the EXECUTED SOURCE under "code" (Spec 024 parity) and,
+// for a stored script, additionally name it.
+func codeExecRecordArguments(code, scriptName, language string, input map[string]interface{}) map[string]interface{} {
+	args := map[string]interface{}{
+		"code":     code,
+		"input":    input,
+		"language": language,
+	}
+	if scriptName != "" {
+		args["script"] = scriptName
+	}
+	return args
+}
+
+// applyCodeExecutionOptions parses the `options` object of a code_execution
+// call into opts, returning a user-facing message when a value is out of range
+// or the wrong type (empty string means the options were applied).
+//
+// Values arrive in two shapes: JSON-decoded over the MCP transport (float64,
+// []interface{}) and Go-typed from an in-process caller that builds the
+// arguments map directly — the REST handler behind POST /api/v1/code/exec is
+// one. Both are accepted; matching only the JSON shapes dropped every
+// restriction a REST caller set, so a request limited to specific servers ran
+// unrestricted.
+// codeExecMaxToolCallsUnset marks max_tool_calls as not supplied by the
+// caller. Zero cannot be the sentinel: an explicit 0 is the documented
+// unlimited override, distinct from "use the configured limit". Negative
+// caller values are rejected during parsing, so the sentinel can never arrive
+// from outside.
+const codeExecMaxToolCallsUnset = -1
+
+// resolveCodeExecutionDefaults fills config defaults for the options the
+// caller left unset. timeout_ms uses zero as its unset marker (0 is out of
+// range and rejected during parsing); max_tool_calls uses the sentinel so an
+// explicit zero survives. max_parallel has no request-level option — it is
+// the configured default for call_tools() batches, which a script overrides
+// per batch inside the sandbox.
+func resolveCodeExecutionDefaults(opts *jsruntime.ExecutionOptions, configTimeoutMs, configMaxToolCalls, configMaxParallel int) {
+	if opts.TimeoutMs == 0 {
+		opts.TimeoutMs = configTimeoutMs
+	}
+	if opts.MaxToolCalls == codeExecMaxToolCallsUnset {
+		opts.MaxToolCalls = configMaxToolCalls
+	}
+	if opts.MaxParallel == 0 {
+		opts.MaxParallel = configMaxParallel
+	}
+}
+
+func applyCodeExecutionOptions(optionsObj map[string]interface{}, opts *jsruntime.ExecutionOptions) string {
+	// Parse timeout_ms
+	if raw, present := optionsObj["timeout_ms"]; present && raw != nil {
+		timeoutMs, ok := codeExecOptionInt(raw)
+		if !ok {
+			// A fractional 1.9 silently becoming a 1ms budget is worse than an
+			// error; same for non-numeric values.
+			return "timeout_ms must be an integer"
+		}
+		opts.TimeoutMs = timeoutMs
+		// Validate timeout range
+		if opts.TimeoutMs < 1 || opts.TimeoutMs > 600000 {
+			return "timeout_ms must be between 1 and 600000 milliseconds"
+		}
+	}
+
+	// Parse max_tool_calls
+	if raw, present := optionsObj["max_tool_calls"]; present && raw != nil {
+		maxToolCalls, ok := codeExecOptionInt(raw)
+		if !ok {
+			// 0.5 truncated to 0 would flip a caller's limit into the
+			// unlimited override.
+			return "max_tool_calls must be an integer"
+		}
+		opts.MaxToolCalls = maxToolCalls
+		// Validate max_tool_calls
+		if opts.MaxToolCalls < 0 {
+			return "max_tool_calls cannot be negative"
+		}
+	}
+
+	// Parse allowed_servers
+	switch allowedServers := optionsObj["allowed_servers"].(type) {
+	case []string:
+		opts.AllowedServers = append(make([]string, 0, len(allowedServers)), allowedServers...)
+	case []interface{}:
+		serverNames := make([]string, 0, len(allowedServers))
+		for _, serverVal := range allowedServers {
+			serverName, ok := serverVal.(string)
+			if !ok {
+				return "allowed_servers must be an array of strings"
+			}
+			serverNames = append(serverNames, serverName)
+		}
+		opts.AllowedServers = serverNames
+	}
+
+	return ""
+}
+
+// codeExecOptionInt normalises the numeric shapes a code_execution option can
+// arrive in: float64 from a JSON decode, json.Number from a decoder using
+// UseNumber, and the integer types an in-process caller passes through.
+func codeExecOptionInt(value interface{}) (int, bool) {
+	switch v := value.(type) {
+	case float64:
+		if v != math.Trunc(v) {
+			return 0, false
+		}
+		return int(v), true
+	case float32:
+		f := float64(v)
+		if f != math.Trunc(f) {
+			return 0, false
+		}
+		return int(f), true
+	case int:
+		return v, true
+	case int32:
+		return int(v), true
+	case int64:
+		return int(v), true
+	case json.Number:
+		parsed, err := v.Int64()
+		if err != nil {
+			return 0, false
+		}
+		return int(parsed), true
+	default:
+		return 0, false
+	}
 }
 
 // toolCallRecord tracks information about a single tool call for observability
@@ -430,11 +762,98 @@ type upstreamToolCaller struct {
 	clientName      string  // MCP client name
 	clientVersion   string  // MCP client version
 	mainServer      *Server // Reference to main server for tokenizer access
+	// proxy is the policy authority for the shared dispatch gates (Spec 098
+	// FR-002). nil in unit tests that drive the caller directly, in which case
+	// the gate is skipped exactly as it was before the consolidation.
+	proxy *MCPProxyServer
+
+	// auditCaller is the SCRIPT's caller, captured by the wrapper before the
+	// sub-call context is tagged SourceInternal (Spec 107 T103/T104): every
+	// nested audit line keeps it, with surface code_execution and parent_id.
+	// nil when no sink is configured or the bridge is driven directly.
+	auditCaller *audit.Caller
+	// auditProfile is the active profile slug the wrapper resolved, stamped
+	// on the nested lines' `profile`.
+	auditProfile string
 }
 
-// CallTool implements jsruntime.ToolCaller interface
+// sandboxGate is the jsruntime.ToolGate the bridge hands from the sandbox's
+// pre-authorization lookup (lookupToolGate) to CallToolWithGate: the ONE
+// persisted read of a nested call (codex r9 I1), captured before the
+// JavaScript authorization and consumed by the dispatch, so the identity,
+// tier, policy verdict and persisted record all derive from it. gated is
+// dispatchGate's second result carried along: false means no gate was
+// evaluated (a proxy without storage).
+type sandboxGate struct {
+	gate  toolGate
+	gated bool
+}
+
+// CallTool implements jsruntime.ToolCaller. It takes the gate read itself,
+// for a caller that captured none (a sandbox wired with the tier-only
+// ToolAnnotationFunc, or a unit test driving the bridge directly).
 func (u *upstreamToolCaller) CallTool(ctx context.Context, serverName, toolName string, args map[string]interface{}) (interface{}, error) {
+	gate, gated := u.dispatchGate(serverName, toolName)
+	return u.callTool(ctx, serverName, toolName, args, gate, gated)
+}
+
+// CallToolWithGate implements jsruntime.GatedToolCaller: the dispatch runs
+// on the gate lookupToolGate captured for this very call, never on a read
+// of its own (codex r9 I1). A gate that is not the bridge's, that was
+// captured for another pair, or that is record-less while this bridge has
+// storage to read, is not trusted — the call falls back to CallTool's own
+// read, which is the pre-r9 behaviour, never a bypass of the policy gate.
+func (u *upstreamToolCaller) CallToolWithGate(ctx context.Context, serverName, toolName string, args map[string]interface{}, gate jsruntime.ToolGate) (interface{}, error) {
+	captured, ok := gate.(*sandboxGate)
+	switch {
+	case !ok || captured == nil:
+		return u.CallTool(ctx, serverName, toolName, args)
+	case captured.gated && (captured.gate.serverName != serverName || captured.gate.toolName != toolName):
+		return u.CallTool(ctx, serverName, toolName, args)
+	case !captured.gated && u.proxy != nil && u.proxy.storage != nil:
+		return u.CallTool(ctx, serverName, toolName, args)
+	}
+	return u.callTool(ctx, serverName, toolName, args, captured.gate, captured.gated)
+}
+
+// callTool is the dispatch proper, over an already-evaluated gate.
+func (u *upstreamToolCaller) callTool(ctx context.Context, serverName, toolName string, args map[string]interface{}, gate toolGate, gated bool) (interface{}, error) {
 	startTime := time.Now()
+	// One correlation id per sub-call: the sanitisation policy decision and
+	// the activity record must carry the same id, and mintCorrelationIDAt
+	// bumps a sequence on every call, so minting twice would never match.
+	requestID := mintCorrelationIDAt(startTime, serverName, toolName)
+
+	// Spec 093 FR-012: a call issued by a sandboxed script is an INTERNAL origin,
+	// whatever surface asked for the code_execution around it. Without this the
+	// context still carries the outer MCP (or REST) source, so a shed inside a
+	// script was attributed to the client that started the script rather than to
+	// the script itself.
+	ctx = reqcontext.WithRequestSource(ctx, reqcontext.SourceInternal)
+
+	// Spec 107 T103: the nested call's audit attempt, installed before its
+	// first gate (the policy refusal below). Operation is the tier of the
+	// gate's identity — the same read the sandbox authorized against.
+	if u.proxy != nil {
+		operation := ""
+		if gated && gate.identity.Found {
+			operation = tierForAnnotations(gate.identity.Annotations, true)
+		}
+		ctx = u.proxy.installAuditAttempt(ctx, auditAttemptSpec{
+			RequestID:     requestID,
+			ParentID:      u.parentCallID,
+			SessionID:     u.sessionID,
+			Server:        serverName,
+			Tool:          toolName,
+			Operation:     operation,
+			Surface:       auditSurfaceCodeExecution,
+			ClientName:    u.clientName,
+			ClientVersion: u.clientVersion,
+			Profile:       u.auditProfile,
+			Args:          args,
+			Caller:        u.auditCaller,
+		})
+	}
 
 	u.logger.Debug("calling upstream tool from JavaScript",
 		zap.String("execution_id", u.executionID),
@@ -442,30 +861,152 @@ func (u *upstreamToolCaller) CallTool(ctx context.Context, serverName, toolName 
 		zap.String("tool", toolName),
 	)
 
+	// Spec 098 FR-002: the sandbox is a dispatch path like any other, so it
+	// consumes the same shared gate primitive as call_tool_* and direct mode —
+	// a script must not reach a quarantined, disabled, config-denied or
+	// approval-locked tool that every other surface refuses. This covers both
+	// script surfaces: ad-hoc code_execution and stored scripts (spec 097).
+	//
+	// It is deliberately FAIL-OPEN for an unknown server (no stored record):
+	// dispatch has always been permissive about existence (FR-002 makes that
+	// guarantee one-way), and tightening it here would break in-process fixtures
+	// that register an upstream without a config record.
+	//
+	// The gate is this call's ONE persisted read (codex r7 H1): the policy
+	// verdict, the identity hydration and the live certification below all
+	// derive from the record it captured, exactly as handleCallToolVariant's
+	// do. On the sandbox path it was captured BEFORE the JavaScript
+	// authorization (lookupToolGate → CallToolWithGate; codex r9 I1), so the
+	// tier the script was authorized against and the verdict answered here
+	// are one read. gated is false only for a proxy without storage
+	// (pure-unit constructions), where no persisted record exists to read.
+	if refusal := policyRefusalFor(gate, gated); refusal != nil {
+		duration := time.Since(startTime)
+		u.recordToolCall(serverName, toolName, startTime, duration, false, refusal.Error())
+		u.storeToolCallInHistory(serverName, toolName, args, nil, refusal, startTime, duration)
+		if u.proxy != nil {
+			u.proxy.auditAuthz(ctx, "deny", policyRefusalReasonKey(gate))
+		}
+		u.emitSubCallRefused(ctx, serverName, toolName, requestID, args, refusal, startTime, duration)
+		return nil, refusal
+	}
+	if u.proxy != nil && u.proxy.dispatchGatePause != nil {
+		u.proxy.dispatchGatePause(serverName, toolName)
+	}
+
 	// Get the managed client for the server
 	client, exists := u.upstreamManager.GetClient(serverName)
 	if !exists {
 		err := fmt.Errorf("server not found: %s", serverName)
 		duration := time.Since(startTime)
-		u.recordToolCall(serverName, toolName, startTime, duration, false, err)
+		u.recordToolCall(serverName, toolName, startTime, duration, false, err.Error())
 		u.storeToolCallInHistory(serverName, toolName, args, nil, err, startTime, duration)
+		auditNoteErrorClass(ctx, audit.ErrorClassUpstreamUnavailable)
+		u.emitSubCallActivity(ctx, serverName, toolName, requestID, args, nil, err, startTime, duration)
 		return nil, err
 	}
 
-	// Call the tool
-	result, err := client.CallTool(ctx, toolName, args)
+	// Spec 105 FR-009 (research D4), astra r1 I3: the sandbox's identity
+	// read (lookupToolPermission) defers to the server-level verdicts when
+	// the StateView reads the server as not connected — but this path has no
+	// not-connected check of its own before client.CallTool, and the live
+	// client may be connected while the connected event is still in flight.
+	// Same closure as handleCallToolVariant: once the live client is found
+	// connected, only a CERTIFIED name dispatches (an unlisted name, or one
+	// the not-hydrated snapshot retains from a previous generation, is the
+	// discovery window — codex r4 E1). The deferred identity is the GATE's
+	// (hydrated from the record it captured) and the live certification is
+	// hydrated from that same record (codex r7 H1); only the StateView and
+	// the live client are re-read here.
+	var certified toolIdentity
+	if u.proxy != nil {
+		deferred := gate.identity
+		if !gated {
+			// No storage, so no persisted record: the snapshot's own flags
+			// stand, as they do for the shared gate on a record-less server.
+			deferred = u.proxy.resolveExactToolIdentityWith(nil, serverName, toolName)
+		}
+		live, msg, refuse := u.proxy.liveIdentityRefusal(gate.serverConfig, serverName, toolName, deferred, client)
+		if refuse {
+			refusal := errors.New(msg)
+			duration := time.Since(startTime)
+			u.recordToolCall(serverName, toolName, startTime, duration, false, refusal.Error())
+			u.storeToolCallInHistory(serverName, toolName, args, nil, refusal, startTime, duration)
+			u.proxy.auditAuthz(ctx, "deny", telemetry.BlockReasonToolNotCallable)
+			u.emitSubCallRefused(ctx, serverName, toolName, requestID, args, refusal, startTime, duration)
+			return nil, refusal
+		}
+		certified = live
+	}
+
+	// Call the tool — pinned to the generation the identity check above
+	// certified (Spec 105 FR-009 "stale generation"; codex r3 D2): the
+	// managed client re-checks the connection generation after the
+	// admission queue and immediately before the transport, so a name
+	// certified on connection A can never execute on connection B. The
+	// refusal is answered exactly as the pre-dispatch check answers a name
+	// whose generation is not certified: the discovery-window body, recorded
+	// as a refusal, zero upstream calls.
+	// Spec 107: every pre-dispatch gate has passed — the nested `authz allow`
+	// line is written HERE, ahead of the upstream call (no Started event is
+	// emitted for a nested call, so the funnel that writes it for the other
+	// paths never runs on this one).
+	if u.proxy != nil {
+		u.proxy.auditAuthz(ctx, "allow", "")
+	}
+	var (
+		result *mcp.CallToolResult
+		err    error
+	)
+	if certified.certified() {
+		result, err = client.CallToolOnEpoch(ctx, toolName, args, certified.DiscoveryEpoch)
+	} else {
+		result, err = client.CallTool(ctx, toolName, args)
+	}
+	if errors.Is(err, managed.ErrConnectionGenerationChanged) {
+		refusal := errors.New(unresolvedToolIdentityMessage(serverName, toolName, false))
+		duration := time.Since(startTime)
+		u.recordToolCall(serverName, toolName, startTime, duration, false, refusal.Error())
+		u.storeToolCallInHistory(serverName, toolName, args, nil, refusal, startTime, duration)
+		// Post-allow refusal (the managed client refused to send): the
+		// attempt's authz line is already written, so this is its tool_call
+		// — an error nothing reached the upstream for.
+		auditNoteErrorClass(ctx, audit.ErrorClassUpstreamUnavailable)
+		if u.proxy != nil {
+			u.proxy.auditToolCall(ctx, "error", "", "", duration.Milliseconds(), nil, nil)
+		}
+		u.emitSubCallRefused(ctx, serverName, toolName, requestID, args, refusal, startTime, duration)
+		return nil, refusal
+	}
+	if err == nil {
+		// Spec 054 Track B on the fourth dispatch path: redact or block
+		// BEFORE the result is recorded, stored in history, or handed to the
+		// script — a secret call_tool_* would never forward must not be
+		// readable from JavaScript either, where a script can copy it into
+		// another upstream's arguments or return it whole.
+		if _, sanErr := u.sanitiseSubCallResult(ctx, serverName, toolName, requestID, result); sanErr != nil {
+			result, err = nil, sanErr
+		}
+	}
 	duration := time.Since(startTime)
 
-	// Record the tool call with timing and result
-	u.recordToolCall(serverName, toolName, startTime, duration, err == nil, err)
+	// Record the tool call with timing and result. Issue #935: code_execution
+	// is a fourth upstream dispatch path, so it classifies an isError:true
+	// answer as a failure exactly like call_tool_* does — otherwise the same
+	// upstream rejection is a clean success here and an error there.
+	u.recordUpstreamCall(serverName, toolName, startTime, duration, result, err)
 	u.storeToolCallInHistory(serverName, toolName, args, result, err, startTime, duration)
+	if err != nil {
+		auditNoteError(ctx, err)
+	}
+	u.emitSubCallActivity(ctx, serverName, toolName, requestID, args, result, err, startTime, duration)
 
 	u.logger.Debug("upstream tool call completed",
 		zap.String("execution_id", u.executionID),
 		zap.String("server", serverName),
 		zap.String("tool", toolName),
 		zap.Duration("duration", duration),
-		zap.Bool("success", err == nil),
+		zap.Bool("success", err == nil && !upstreamAnsweredWithError(result)),
 	)
 
 	if err != nil {
@@ -475,24 +1016,345 @@ func (u *upstreamToolCaller) CallTool(ctx context.Context, serverName, toolName 
 	return result, nil
 }
 
+// sanitiseSubCallResult applies the operator's output_sanitisation policy to
+// one sandboxed sub-call's upstream result, exactly as handleCallToolVariant
+// applies it to a direct call. Redact/strip mutate the result's text blocks in
+// place (the returned value is the same pointer); block returns an error so the
+// script sees a failed call ({ok:false, error}) rather than the payload. The
+// opt-out default, a nil proxy (unit fixtures), and non-CallToolResult values
+// pass through untouched.
+func (u *upstreamToolCaller) sanitiseSubCallResult(ctx context.Context, serverName, toolName, requestID string, result interface{}) (interface{}, error) {
+	if u.proxy == nil {
+		return result, nil
+	}
+	// Same derivation as handleCallToolVariant: a tool with no annotations
+	// is open-world by the MCP spec default, hence untrusted — so strip mode
+	// applies to it here exactly as it does on a direct call.
+	annotations, _ := u.proxy.lookupExactToolAnnotations(serverName, toolName)
+	contentTrust := contracts.ContentTrustForTool(annotations)
+	if blocked := u.proxy.applyOutputSanitisation(ctx, serverName, toolName, requestID, contentTrust, result); blocked != nil {
+		return nil, errors.New(firstTextOf(blocked))
+	}
+	return result, nil
+}
+
+// firstTextOf returns the first text block of a result, or a generic
+// explanation when it carries none.
+func firstTextOf(r *mcp.CallToolResult) string {
+	for _, c := range r.Content {
+		if tc, ok := c.(mcp.TextContent); ok && tc.Text != "" {
+			return tc.Text
+		}
+	}
+	return "tool output blocked by sanitisation policy"
+}
+
+// subCallActivityResponseLimit caps the response text recorded for ONE
+// sandboxed sub-call. One execution can issue up to max_tool_calls of them, so
+// the per-record budget is deliberately far smaller than the 64KB a single
+// direct dispatch is allowed.
+const subCallActivityResponseLimit = 8 * 1024
+
+// emitSubCallActivity records one call issued from inside the JS sandbox as a
+// first-class tool_call activity record.
+//
+// Before this, a sandboxed call reached the in-memory tool list and the legacy
+// tool-call history and nothing else — so the activity log, which is what the
+// tray glance, GET /api/v1/activity and the usage aggregate all read, showed
+// the code_execution wrapper and none of the work it actually did. A script
+// that made twenty upstream calls was one row.
+//
+// Every sub-call gets a FRESH request id and carries ParentID = the parent
+// code_execution's correlation id, which makes navigation one query in each
+// direction:
+//
+//	parent → children:  /api/v1/activity?parent_id=<parent request_id>
+//	child  → parent:    /api/v1/activity?request_id=<child parent_id>
+//
+// The record is emitted on EVERY exit of CallTool — policy refusal, unknown
+// server, and dispatch (success or failure) — because a call the sandbox was
+// refused is exactly the kind of thing the transparency surfaces exist to show.
+//
+// Source is "internal" for the same reason the dispatch context is (Spec 093
+// FR-012): the call was issued by the script, not by whoever started it. No
+// `started` event is emitted: for a nested call it would arrive after the work
+// already finished, and it would double the SSE traffic of a busy script for
+// nothing — started events are never persisted anyway.
+//
+// ctx is the sub-call's context carrying its audit.Attempt (Spec 107).
+func (u *upstreamToolCaller) emitSubCallActivity(ctx context.Context, serverName, toolName, requestID string, args map[string]interface{}, result interface{}, callErr error, startTime time.Time, duration time.Duration) {
+	// nil in the unit tests that drive the caller directly (see the field
+	// comment on upstreamToolCaller.proxy) — there is no runtime to emit into.
+	if u.proxy == nil {
+		return
+	}
+
+	// A queue shed already produced its canonical "rejected" activity record
+	// at the admission point inside the managed client (spec 093 FR-012,
+	// installRejectionObserver) — that seam is origin-independent and fired
+	// for this very call. Emitting a second record here would count one
+	// refused attempt twice, once as rejected and once as an executed error.
+	// Only queue_full/queue_timeout reach the observer (reportRejection);
+	// server_unavailable is an ordinary error with no canonical record, so it
+	// must fall through and be recorded here like any other failure.
+	if shedHasCanonicalRecord(callErr) {
+		// The audit line is not the activity row: the shed is this attempt's
+		// `tool_call outcome:rejected` (research.md D6).
+		var limitErr *limiter.LimitError
+		if errors.As(callErr, &limitErr) {
+			u.proxy.auditToolCallShed(ctx, limitErr, duration.Milliseconds())
+		}
+		return
+	}
+
+	status, errMsg, responseText, truncated := subCallActivityOutcome(result, callErr)
+	// Detection is bounded by the detector's policy, not the activity display
+	// limit. Preserve the full upstream response and error, as direct tool calls
+	// do. Upstreams can reflect request data in an error after the 8 KiB display
+	// cap, so the error branch is as security-sensitive as a successful result.
+	detectionText := subCallDetectionText(result, callErr)
+
+	requestBytes, responseBytes := subCallByteSizes(args, result)
+	u.proxy.emitActivityToolCallCompleted(ctx,
+		serverName, toolName, u.sessionID, requestID, string(storage.ActivitySourceInternal),
+		status, errMsg, duration.Milliseconds(), args, responseText, truncated,
+		"", nil, "", "", requestBytes, responseBytes, detectionText, nil, u.parentCallID)
+}
+
+func subCallDetectionText(result interface{}, callErr error) string {
+	parts := make([]string, 0, 2)
+	if result != nil {
+		if encoded, err := json.Marshal(result); err == nil {
+			parts = append(parts, string(encoded))
+		}
+	}
+	if callErr != nil {
+		parts = append(parts, callErr.Error())
+	}
+	return strings.Join(parts, "\n")
+}
+
+// subCallByteSizes returns the pre-truncation JSON byte lengths of a sandbox
+// sub-call's arguments and result, the same way the top-level dispatch computes
+// them (mcp.go, spec 069 A1).
+//
+// These were hardcoded to 0 until now, and that zero was not harmless: the
+// convention throughout the activity log is that 0 bytes means UNKNOWN, not
+// free. Every code-execution sub-call therefore had an unaccountable cost with
+// bodies off, which is the gap bench records as ReasonSubCallZeroBytes — and it
+// is exactly the population needed to measure what code execution actually
+// saves, since the sub-call responses are the ones that never reach the model's
+// context. Without these lengths that saving cannot be computed at all with
+// bodies off.
+//
+// A nil result yields 0 response bytes. That is a TRUE zero rather than an
+// unknown: the caller only reaches this with a nil result when the upstream
+// never answered, and a call that produced no response contributed no response
+// tokens.
+// result is the untyped dispatch result, so a typed-nil pointer can arrive
+// inside a non-nil interface; that marshals to "null" rather than nothing, and
+// reflect is what tells the two apart.
+func subCallByteSizes(args map[string]interface{}, result interface{}) (requestBytes, responseBytes int) {
+	if result != nil {
+		if rv := reflect.ValueOf(result); rv.Kind() == reflect.Pointer && rv.IsNil() {
+			result = nil
+		}
+	}
+	return rawByteSize(args), rawByteSize(result)
+}
+
+// emitSubCallRefused records a sandbox sub-call that the policy gate refused
+// before dispatch (quarantined, disabled, approval-locked — spec 098 FR-002).
+// Status is "blocked", not "error": the upstream never saw the call, and the
+// aggregate routes blocked tool_calls off the executed-call statistics
+// (Calls/latency) while still giving the attempt a failed bar in the timeline,
+// the same treatment a direct-path policy_decision gets.
+//
+// ctx is the sub-call's context carrying its audit.Attempt (Spec 107): the
+// `authz deny` was written by the caller at the refusing gate, so the funnel
+// this goes through writes no further audit line for a blocked status.
+func (u *upstreamToolCaller) emitSubCallRefused(ctx context.Context, serverName, toolName, requestID string, args map[string]interface{}, refusal error, startTime time.Time, duration time.Duration) {
+	if u.proxy == nil {
+		return
+	}
+	u.proxy.emitActivityToolCallCompleted(ctx,
+		serverName, toolName, u.sessionID, requestID, string(storage.ActivitySourceInternal),
+		storage.ActivityStatusBlocked, refusal.Error(), duration.Milliseconds(), args, "", false,
+		// The policy gate refused this before dispatch, so there IS no response
+		// and 0 response bytes is a true zero, not an unmeasured one. The
+		// request was still formed and is measured like any other.
+		"", nil, "", "", rawByteSize(args), 0, "", nil, u.parentCallID)
+}
+
+// shedHasCanonicalRecord reports whether callErr is a limiter shed the
+// admission observer already recorded (managed.reportRejection forwards only
+// queue_full/queue_timeout; server_unavailable travels the ordinary error path
+// and has no canonical record).
+func shedHasCanonicalRecord(callErr error) bool {
+	var limitErr *limiter.LimitError
+	return errors.As(callErr, &limitErr) &&
+		(limitErr.Reason == limiter.ReasonQueueFull || limitErr.Reason == limiter.ReasonQueueTimeout)
+}
+
+// subCallActivityOutcome classifies one sandboxed sub-call for the activity log
+// and produces the response text to record with it.
+//
+// Split out of emitSubCallActivity so the classification is testable without a
+// runtime to emit into — and so the rule stays in ONE place: never hardcode a
+// status. An upstream that ANSWERED isError:true has failed even though the
+// transport hop succeeded (issue #935), and a Go error wins over the upstream's
+// own text because a call that never completed has no upstream text worth
+// keeping. This is the same precedence nestedCallFailure applies to the legacy
+// history record, so the two cannot disagree about one call.
+func subCallActivityOutcome(result interface{}, callErr error) (status, errMsg, response string, truncated bool) {
+	status, errMsg = activityStatusForResult(result)
+	if callErr != nil {
+		return storage.ActivityStatusError, callErr.Error(), "", false
+	}
+	if result == nil {
+		return status, errMsg, "", false
+	}
+	encoded, mErr := json.Marshal(result)
+	if mErr != nil {
+		return status, errMsg, "", false
+	}
+	response = string(encoded)
+	if len(response) > subCallActivityResponseLimit {
+		// safeTruncateBytes backs the cut up to a rune boundary, so the stored
+		// text is always valid UTF-8.
+		response = response[:safeTruncateBytes(response, subCallActivityResponseLimit)]
+		truncated = true
+	}
+	return status, errMsg, response, truncated
+}
+
+// dispatchGate is the sandbox bridge's ONE evaluation of the shared per-tool
+// policy gates for a call — the single persisted read of the dispatch (codex
+// r7 H1), which policyRefusalFor, the identity hydration and the live
+// certification in CallTool all consume. It reports false, with the zero
+// gate, for a proxy without storage (pure-unit constructions), where there
+// is no persisted record to read and the gate is skipped exactly as it was
+// before the consolidation.
+func (u *upstreamToolCaller) dispatchGate(serverName, toolName string) (toolGate, bool) {
+	if u.proxy == nil || u.proxy.storage == nil {
+		return toolGate{}, false
+	}
+	// The script named the server and the raw tool separately, so the pair
+	// is already split and is gated exactly (never re-normalized).
+	return u.proxy.evaluateExactToolGate(serverName, toolName), true
+}
+
+// policyRefusal evaluates the shared per-tool policy gates for a sandboxed call
+// and returns the refusal a script sees, or nil when the tool is callable. It
+// takes its own gate read; CallTool, which also needs the gate's record for
+// the identity steps that follow, reads once through dispatchGate and
+// answers through policyRefusalFor instead.
+func (u *upstreamToolCaller) policyRefusal(serverName, toolName string) error {
+	return policyRefusalFor(u.dispatchGate(serverName, toolName))
+}
+
+// policyRefusalFor is policyRefusal over an already-evaluated gate. gated is
+// dispatchGate's second result: false means no gate was evaluated (no
+// storage) and nothing is refused.
+// policyRefusalReasonKey classifies the refusal policyRefusalFor returns
+// onto the closed telemetry.BlockReason* enum, mirroring its branch order so
+// the audit `authz deny` reason always matches the refusal the script saw.
+func policyRefusalReasonKey(gate toolGate) string {
+	switch {
+	case gate.serverConfig == nil:
+		// Only the storage-error branch refuses here (an unknown server
+		// falls through to "server not found").
+		return telemetry.BlockReasonToolNotCallable
+	case gate.serverQuarantined():
+		return telemetry.BlockReasonServerQuarantined
+	case gate.lockStatus == storage.ToolApprovalStatusPending:
+		return telemetry.BlockReasonToolPendingApproval
+	case gate.lockStatus == storage.ToolApprovalStatusChanged:
+		return telemetry.BlockReasonToolChanged
+	default:
+		return telemetry.BlockReasonToolNotCallable
+	}
+}
+
+func policyRefusalFor(gate toolGate, gated bool) error {
+	if !gated {
+		return nil
+	}
+	serverName, toolName := gate.serverName, gate.toolName
+	if gate.serverConfig == nil {
+		if gate.storageErr != nil {
+			// The record exists as far as anyone knows — it just could not be
+			// read. Fail-open is licensed for a server that is genuinely
+			// UNKNOWN, not for one whose policy the proxy failed to load;
+			// treating a BBolt failure as "unknown server" would let a script
+			// through a quarantine gate by breaking the database.
+			return fmt.Errorf("cannot verify policy for server %q: %w", serverName, gate.storageErr)
+		}
+		// Unknown server: leave the existing "server not found" path to answer.
+		return nil
+	}
+	if gate.callable() {
+		return nil
+	}
+	if gate.serverQuarantined() {
+		return fmt.Errorf("server %q is quarantined for security review; its tools cannot be called until it is approved", serverName)
+	}
+	switch gate.lockStatus {
+	case storage.ToolApprovalStatusPending:
+		if isImplicitPendingApproval(gate.approval) {
+			// Spec 105 FR-009: no stored record yet, so there is nothing to
+			// approve — the server's next discovery pass files it.
+			return fmt.Errorf("tool %s:%s has no approval record yet and cannot be called while tool-level quarantine is active; re-discover server %q (upstream_servers operation=\"refresh\") and retry", serverName, toolName, serverName)
+		}
+		return fmt.Errorf("tool %s:%s is pending security approval and cannot be called", serverName, toolName)
+	case storage.ToolApprovalStatusChanged:
+		return fmt.Errorf("tool %s:%s changed since approval and is locked pending review", serverName, toolName)
+	}
+	return fmt.Errorf("%s", gate.blockedMessage())
+}
+
+// upstreamAnsweredWithError reports whether a dispatched result is an MCP
+// answer flagged isError:true — a failure the upstream reported over a
+// successful transport hop (issue #935).
+func upstreamAnsweredWithError(result interface{}) bool {
+	status, _ := activityStatusForResult(result)
+	return status != "success"
+}
+
+// nestedCallFailure classifies one nested dispatch from the JS sandbox,
+// returning (success, message). A Go error wins over the upstream's own text:
+// when the call never completed, that is the useful explanation.
+func nestedCallFailure(result interface{}, err error) (bool, string) {
+	if err != nil {
+		return false, err.Error()
+	}
+	status, msg := activityStatusForResult(result)
+	if status == "success" {
+		return true, ""
+	}
+	return false, msg
+}
+
+// recordUpstreamCall records a nested tool call with timing and its classified
+// outcome (thread-safe).
+func (u *upstreamToolCaller) recordUpstreamCall(serverName, toolName string, startTime time.Time, duration time.Duration, result interface{}, err error) {
+	success, errMsg := nestedCallFailure(result, err)
+	u.recordToolCall(serverName, toolName, startTime, duration, success, errMsg)
+}
+
 // recordToolCall records a tool call with timing and result information (thread-safe)
-func (u *upstreamToolCaller) recordToolCall(serverName, toolName string, startTime time.Time, duration time.Duration, success bool, err error) {
+func (u *upstreamToolCaller) recordToolCall(serverName, toolName string, startTime time.Time, duration time.Duration, success bool, errMsg string) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 
-	record := toolCallRecord{
+	u.toolCalls = append(u.toolCalls, toolCallRecord{
 		ServerName: serverName,
 		ToolName:   toolName,
 		StartTime:  startTime,
 		Duration:   duration,
 		Success:    success,
-	}
-
-	if err != nil {
-		record.Error = err.Error()
-	}
-
-	u.toolCalls = append(u.toolCalls, record)
+		Error:      errMsg,
+	})
 }
 
 // getToolCalls returns all recorded tool calls (thread-safe)
@@ -578,7 +1440,7 @@ func (u *upstreamToolCaller) storeToolCallInHistory(serverName, toolName string,
 
 	// Create tool call record for history
 	record := &storage.ToolCallRecord{
-		ID:               fmt.Sprintf("%d-%s", startTime.UnixNano(), toolName),
+		ID:               mintCorrelationIDAt(startTime, toolName),
 		ServerID:         storage.GenerateServerID(serverConfig),
 		ServerName:       serverName,
 		ToolName:         toolName,
@@ -596,8 +1458,11 @@ func (u *upstreamToolCaller) storeToolCallInHistory(serverName, toolName string,
 		Metrics:          tokenMetrics,
 	}
 
-	if callErr != nil {
-		record.Error = callErr.Error()
+	// Issue #935: an upstream that answered isError:true failed, even though the
+	// transport hop did not. Without this the nested history row was clean while
+	// the identical call through call_tool_read recorded the upstream's message.
+	if _, errMsg := nestedCallFailure(result, callErr); errMsg != "" {
+		record.Error = errMsg
 	}
 
 	// Store in database
@@ -618,36 +1483,179 @@ func (u *upstreamToolCaller) storeToolCallInHistory(serverName, toolName string,
 	}
 }
 
-// lookupToolPermission returns the required permission tier for a tool based on its annotations.
-// This is used by the JS runtime to enforce auth context permissions during code_execution.
-func (p *MCPProxyServer) lookupToolPermission(serverName, toolName string) string {
-	// Primary: exact match via StateView (no BM25 fuzzy matching)
-	annotations := p.lookupToolAnnotations(serverName, toolName)
-	if annotations != nil {
-		callWith := contracts.DeriveCallWith(annotations)
-		perm := contracts.ToolVariantToOperationType[callWith]
-		if perm != "" {
-			return perm
-		}
+// applyProfileScopeToExecution intersects the request's ACTIVE profile into the
+// sandbox's allow-list (Spec 057, Codex #621 finding 2).
+//
+// It resolves through resolveActiveProfile — token pin > /mcp/p/<slug> URL >
+// session set_profile — rather than reading the URL-injected scope alone. The
+// URL-only read was a scope hole: a profile-pinned agent token connected to the
+// base /mcp endpoint carried no URL scope, so the sandbox ran under the token's
+// full server scope and could call straight past its pin, including a stale pin
+// that every other session path now answers deny-all.
+//
+// The jsruntime treats an empty AllowedServers as "allow all", so an active
+// profile ALWAYS sets RestrictToAllowed: a deny-all profile, a stale pin, or a
+// non-overlapping token∩profile must yield an empty allow-list that denies
+// everything rather than leaking every server.
+func (p *MCPProxyServer) applyProfileScopeToExecution(ctx context.Context, options *jsruntime.ExecutionOptions) {
+	if options == nil {
+		return
+	}
+	_, profileScope := p.resolveActiveProfile(ctx)
+	if profileScope == nil {
+		return
 	}
 
-	// Fallback: search the index with enough candidates to find an exact match
-	if p.index != nil {
-		qualifiedName := serverName + ":" + toolName
-		results, err := p.index.Search(qualifiedName, 20)
-		if err == nil {
-			for _, r := range results {
-				if r.Tool != nil && r.Tool.ServerName == serverName && r.Tool.Name == toolName {
-					callWith := contracts.DeriveCallWith(r.Tool.Annotations)
-					perm := contracts.ToolVariantToOperationType[callWith]
-					if perm != "" {
-						return perm
-					}
-				}
+	options.RestrictToAllowed = true
+	profileServers := profileScope.AllowedServerNames()
+	if len(options.AllowedServers) == 0 {
+		// No caller-supplied restriction: the profile is the restriction.
+		// AllowedServerNames returns a non-nil empty slice for a deny-all
+		// scope, which RestrictToAllowed then enforces as "nothing".
+		options.AllowedServers = profileServers
+		return
+	}
+
+	// Intersect the caller-supplied list with the profile's servers.
+	profileSet := make(map[string]struct{}, len(profileServers))
+	for _, s := range profileServers {
+		profileSet[s] = struct{}{}
+	}
+	intersected := make([]string, 0, len(options.AllowedServers))
+	for _, s := range options.AllowedServers {
+		if _, ok := profileSet[s]; ok {
+			intersected = append(intersected, s)
+		}
+	}
+	options.AllowedServers = intersected
+}
+
+// lookupToolPermission returns the required permission tier for a tool based on
+// its annotations, as the StateView holds them. It is the one tier lookup shared
+// by the retrieve surface (call_tool_*), code execution, and — through the same
+// DeriveCallWith — direct mode.
+//
+// A tool the StateView has not seen on a server it DOES hold — connected,
+// with a populated snapshot — has no establishable tier (Spec 105 FR-009,
+// research D4): the sandbox is answered with jsruntime.PermissionTierUnresolved
+// and refuses the call for every caller, administrators included, so an
+// unverified name never reaches the upstream. When the proxy has no opinion —
+// the server is not in the snapshot, no runtime is wired, or the snapshot is
+// not authoritative because the server is quarantined, disabled, disconnected
+// or still connecting — the lookup falls back to the DESTRUCTIVE tier, the
+// top of the permission ladder, so a token reaches such a name only when it
+// holds that top tier (defaulting to read there once authorized every
+// undiscovered tool for read-only tokens); those cases are then answered by
+// the bridge's own server-existence path and by policyRefusal's server-level
+// verdicts, in their pre-105 order.
+//
+// The server-level verdicts run FIRST here, from the same shared gate read
+// the bridge's policyRefusal answers with (codex r6 G1): a server whose
+// PERSISTED record says quarantined or disabled — an operator's write the
+// StateView has not caught up with yet, so the snapshot still reads
+// connected and discovered and the live client is still connected — is
+// answered by that verdict for every name on it, listed or not, with zero
+// upstream calls. Without that, the identity read (hydrated on the lagging
+// StateView flags, or the live-client closure below, which refuses anything
+// short of certified once the client is connected) pre-empted it for the
+// absent name while the listed sibling answered the quarantine / blocked
+// body — two names, one server, two verdicts (SC-005 parity). The tier
+// returned for such a server is the pre-105 fallback (destructive for an
+// unlisted name, the annotations' tier for a listed one), so a scoped
+// token's own permission check answers exactly as it did before Spec 105
+// and policyRefusal then refuses with the server-level body. There is no
+// second read for a record to flip between: the gate this lookup captures
+// (lookupToolGate) IS the one the bridge dispatches on (codex r9 I1), so a
+// write that lands after it owns the next call, and the bridge still
+// admits only a certified identity on a connected client. Note
+// auth.HasPermission is exact-match, not hierarchical, so a token minted as
+// [read, destructive] without write is admitted here while call_tool_write
+// itself would refuse it. The BM25 index is deliberately not consulted: it
+// stores no annotations (and a "server:tool" query returns no hits), so the
+// former index fallback never resolved anything. A discovered tool that
+// publishes no annotations still derives to read via DeriveCallWith.
+//
+// The sandbox hands over the pair a script wrote — callTool(server, tool) —
+// which is already split, so the raw name is read exactly rather than
+// normalized a second time (a raw name may start with the server's prefix).
+func (p *MCPProxyServer) lookupToolPermission(serverName, toolName string) string {
+	tier, _ := p.lookupToolGate(serverName, toolName)
+	return tier
+}
+
+// lookupToolGate is lookupToolPermission with the gate it decided the tier
+// from — the jsruntime.ToolGateLookup the sandbox is wired with. The gate
+// it returns is the nested call's ONE persisted read (codex r9 I1): the
+// tier the sandbox authorizes against is derived from it here, and the
+// bridge's CallToolWithGate answers the policy verdict, hydrates the
+// identity and certifies the live client from the same capture, so an
+// operator's write that lands between the sandbox's authorization and its
+// dispatch owns every LATER call and never splits one call's verdict.
+// For a proxy without storage the gate is the record-less marker
+// (sandboxGate.gated=false), which the bridge treats exactly as its own
+// record-less read.
+func (p *MCPProxyServer) lookupToolGate(serverName, toolName string) (string, jsruntime.ToolGate) {
+	var (
+		identity toolIdentity
+		record   *config.ServerConfig
+		captured = &sandboxGate{}
+	)
+	if p.storage != nil {
+		captured.gate, captured.gated = p.evaluateExactToolGate(serverName, toolName), true
+		if p.sandboxPreflightPause != nil {
+			p.sandboxPreflightPause(serverName, toolName)
+		}
+		gate := captured.gate
+		if gate.serverQuarantined() || gate.serverDisabled() {
+			return tierForAnnotations(gate.identity.Annotations, gate.identity.Found), captured
+		}
+		identity, record = gate.identity, gate.serverConfig
+	} else {
+		// A proxy without storage (pure-unit constructions): no persisted
+		// record exists to read, so the snapshot's own flags stand.
+		identity = p.resolveExactToolIdentityWith(nil, serverName, toolName)
+	}
+	if identity.Unresolved() {
+		return jsruntime.PermissionTierUnresolved, captured
+	}
+	// Spec 105 FR-009 (research D4), astra r1 I3: the identity read defers
+	// when the StateView reads the server as not connected, relying on the
+	// server-level verdicts — but this path has no not-connected check of
+	// its own before client.CallTool, and the live client may be connected
+	// while the server_connected event is still in flight. Same closure as
+	// handleCallToolVariant (liveIdentityRefusal): once the live client is
+	// found connected, any name short of certified — unlisted, or retained
+	// from a previous generation on a not-hydrated snapshot — is unresolved,
+	// and the sandbox answers with the permission envelope before any
+	// AuthInfo check. The closure is hydrated from the gate's record above
+	// (codex r7 H1): this lookup, like a dispatch, reads the persisted
+	// record once.
+	if identity.ServerKnown && !identity.SnapshotHydrated && p.upstreamManager != nil {
+		if client, ok := p.upstreamManager.GetClient(serverName); ok {
+			if _, _, refuse := p.liveIdentityRefusal(record, serverName, toolName, identity, client); refuse {
+				return jsruntime.PermissionTierUnresolved, captured
 			}
 		}
 	}
+	return tierForAnnotations(identity.Annotations, identity.Found), captured
+}
 
-	// Default to read (safest)
+// tierForAnnotations maps one lookupToolAnnotationsFound result to the
+// permission tier it requires. It is split from lookupToolPermission so a
+// caller that already holds the StateView read (handleCallToolVariant, which
+// needs the same annotations for intent validation) classifies the tier from
+// THAT read rather than taking a second, independent snapshot. found=false
+// reaches it only when the proxy holds no snapshot for the server at all, or
+// when the snapshot is not authoritative because of the server's own state
+// (quarantined, disabled, not connected) and a server-level verdict owns the
+// name — an undiscovered name on a known, connected server is refused before
+// any tier is derived (toolIdentity.Unresolved).
+func tierForAnnotations(annotations *config.ToolAnnotations, found bool) string {
+	if !found {
+		return contracts.OperationTypeDestructive
+	}
+	if perm := contracts.ToolVariantToOperationType[contracts.DeriveCallWith(annotations)]; perm != "" {
+		return perm
+	}
 	return contracts.OperationTypeRead
 }

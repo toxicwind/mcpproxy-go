@@ -28,6 +28,19 @@ struct ActivityView: View {
     @State private var filterServer = "all"
     @State private var filterStatus = "all"
     @State private var filterText = ""
+    /// When set, the list shows only the sub-calls of this code_execution
+    /// (records whose parent_id equals it). Set by "View sub-calls" in the
+    /// detail panel; cleared by the filter chip or "View parent call".
+    @State private var filterParentId: String?
+    /// When set, the list shows only the records of one MCP session. Seeded by
+    /// a tray glance row (`.activityFilter`) so a click on "github:search ×12"
+    /// lands on that client's calls instead of the whole log (F10); cleared by
+    /// its own chip.
+    @State private var filterSessionId: String?
+    /// Monotonic ticket for loadActivities: only the NEWEST in-flight load may
+    /// publish its results, so a slow unfiltered fetch can never overwrite the
+    /// sub-call view the user just asked for (or vice versa).
+    @State private var loadGeneration = 0
 
     private var apiClient: APIClient? { appState.apiClient }
 
@@ -79,11 +92,68 @@ struct ActivityView: View {
 
     /// Build query string from current filter state.
     private var filterQueryString: String {
-        var parts: [String] = ["limit=100"]
-        if filterType != "all" { parts.append("type=\(filterType)") }
-        if filterServer != "all" { parts.append("server=\(filterServer)") }
-        if filterStatus != "all" { parts.append("status=\(filterStatus)") }
-        return parts.joined(separator: "&")
+        (["limit=100"] + activeFilterParams).joined(separator: "&")
+    }
+
+    /// The filters currently in force, as encoded `key=value` pairs.
+    ///
+    /// Shared with the export so a filtered view and its export can never
+    /// disagree — "Export with current filters" used to drop the sub-call and
+    /// session scopes and hand back the whole log. Values are escaped: a
+    /// server name with a space or `&` is otherwise a broken (or extra) query
+    /// parameter.
+    private var activeFilterParams: [String] {
+        var parts: [String] = []
+        if filterType != "all" { parts.append("type=\(APIClient.escapeQueryValue(filterType))") }
+        if filterServer != "all" { parts.append("server=\(APIClient.escapeQueryValue(filterServer))") }
+        if filterStatus != "all" { parts.append("status=\(APIClient.escapeQueryValue(filterStatus))") }
+        if let parentId = filterParentId, !parentId.isEmpty {
+            parts.append("parent_id=\(APIClient.escapeQueryValue(parentId))")
+        }
+        if let sessionId = filterSessionId, !sessionId.isEmpty {
+            parts.append("session_id=\(APIClient.escapeQueryValue(sessionId))")
+        }
+        return parts
+    }
+
+    /// Scope the list to one MCP session (a tray glance row's hand-off).
+    private func showSession(_ sessionId: String) {
+        filterSessionId = sessionId
+        filterParentId = nil
+        selectedActivityID = nil
+        Task { await loadActivities() }
+    }
+
+    // MARK: - Parent/child navigation (code_execution sub-calls)
+
+    /// Filter the list down to the children of one code_execution call.
+    /// The parent's own selection is dropped: it is not in the filtered list,
+    /// and keeping it would silently reopen its detail panel the moment the
+    /// chip is cleared and the parent scrolls back in.
+    private func showSubCalls(of parentRequestId: String) {
+        filterParentId = parentRequestId
+        selectedActivityID = nil
+        Task { await loadActivities() }
+    }
+
+    /// Jump from a child back to its parent code_execution record: drop the
+    /// sub-call filter, reload the normal list, and select the parent. When
+    /// the parent has already scrolled past the 100-row page, fetch it by
+    /// request_id and pin it to the top so the jump never dead-ends.
+    private func showParent(requestId: String) async {
+        filterParentId = nil
+        await loadActivities()
+        if let parent = activities.first(where: { $0.requestId == requestId }) {
+            selectedActivityID = parent.id
+            return
+        }
+        guard let client = apiClient else { return }
+        if let data = try? await client.fetchRaw(path: "/api/v1/activity?request_id=\(requestId)&limit=1"),
+           let wrapper = try? JSONDecoder().decode(APIResponse<ActivityListResponse>.self, from: data),
+           let parent = wrapper.data?.activities.first {
+            activities.insert(parent, at: 0)
+            selectedActivityID = parent.id
+        }
     }
 
     // MARK: - Column widths
@@ -160,13 +230,26 @@ struct ActivityView: View {
                 ActivityDetailView(
                     entry: selected,
                     recentSessions: appState.recentSessions,
-                    onDismiss: { selectedActivityID = nil }
+                    onDismiss: { selectedActivityID = nil },
+                    onShowSubCalls: { parentRequestId in
+                        showSubCalls(of: parentRequestId)
+                    },
+                    onShowParent: { parentRequestId in
+                        Task { await showParent(requestId: parentRequestId) }
+                    }
                 )
                 .frame(minWidth: 300, idealWidth: 380, maxWidth: 520, maxHeight: .infinity)
                 .layoutPriority(1)
             }
         }
         .task {
+            // A glance row that opened this window left its session here (F10);
+            // consume it before the first load so the list is never briefly
+            // unfiltered.
+            if let pending = appState.pendingActivitySessionFilter, !pending.isEmpty {
+                appState.pendingActivitySessionFilter = nil
+                filterSessionId = pending
+            }
             await loadSummary()
             await loadActivities()
         }
@@ -176,6 +259,14 @@ struct ActivityView: View {
                 await loadSummary()
                 await loadActivities()
             }
+        }
+        // F10: a tray glance row hands over the session it was derived from.
+        .onReceive(NotificationCenter.default.publisher(for: .activityFilter)) { note in
+            guard let sessionId = note.object as? String, !sessionId.isEmpty else { return }
+            // This view is live, so the hand-off is settled here — clear the
+            // pending value so a later-appearing view does not re-apply it.
+            appState.pendingActivitySessionFilter = nil
+            showSession(sessionId)
         }
     }
 
@@ -331,9 +422,75 @@ struct ActivityView: View {
                     .buttonStyle(.borderless)
                 }
             }
+
+            // Sub-call filter chip: the list is narrowed to one code_execution's
+            // children until the chip is dismissed.
+            if let parentId = filterParentId {
+                HStack(spacing: 6) {
+                    Image(systemName: "arrow.turn.down.right")
+                        .font(.scaled(.caption, scale: fontScale))
+                    Text("Sub-calls of \(Self.shortCorrelationId(parentId))")
+                        .font(.scaled(.caption, scale: fontScale))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Button {
+                        filterParentId = nil
+                        Task { await loadActivities() }
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Show all activity")
+                    .accessibilityLabel("Clear sub-call filter")
+                    .accessibilityIdentifier("activity-clear-parent-filter")
+                    Spacer()
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(Color.accentColor.opacity(0.12))
+                .clipShape(Capsule())
+                .accessibilityIdentifier("activity-parent-filter-chip")
+            }
+
+            // Session filter chip (F10): says which client's calls are on
+            // screen, and how to get back to everything.
+            if let sessionId = filterSessionId {
+                HStack(spacing: 6) {
+                    Image(systemName: "person.crop.circle")
+                        .font(.scaled(.caption, scale: fontScale))
+                    Text("Session \(Self.shortCorrelationId(sessionId))")
+                        .font(.scaled(.caption, scale: fontScale))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Button {
+                        filterSessionId = nil
+                        Task { await loadActivities() }
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Show all activity")
+                    .accessibilityLabel("Clear session filter")
+                    .accessibilityIdentifier("activity-clear-session-filter")
+                    Spacer()
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(Color.accentColor.opacity(0.12))
+                .clipShape(Capsule())
+                .accessibilityIdentifier("activity-session-filter-chip")
+            }
         }
         .padding(.horizontal)
         .padding(.bottom, 8)
+    }
+
+    /// Correlation ids are long ("<nanos>-code_execution-17"); the chip shows
+    /// the tail, which is the part a human can actually tell apart.
+    static func shortCorrelationId(_ id: String) -> String {
+        id.count <= 24 ? id : "…" + id.suffix(24)
     }
 
     // MARK: - Empty State
@@ -383,6 +540,8 @@ struct ActivityView: View {
     }
 
     private func loadActivities() async {
+        loadGeneration += 1
+        let ticket = loadGeneration
         isLoading = true
         defer { isLoading = false }
         guard let client = apiClient else {
@@ -392,6 +551,10 @@ struct ActivityView: View {
 
         do {
             let data = try await client.fetchRaw(path: "/api/v1/activity?\(filterQueryString)")
+            // A newer load was issued while this one was in flight (the user
+            // toggled the sub-call chip, changed a filter …) — its answer is
+            // the one the current filter state describes, not this one.
+            guard ticket == loadGeneration else { return }
             let decoder = JSONDecoder()
             if let wrapper = try? decoder.decode(APIResponse<ActivityListResponse>.self, from: data),
                let payload = wrapper.data {
@@ -402,6 +565,7 @@ struct ActivityView: View {
                 totalCount = direct.total
             }
         } catch {
+            guard ticket == loadGeneration else { return }
             activities = appState.recentActivity
         }
     }
@@ -425,11 +589,9 @@ struct ActivityView: View {
                 defer { isExporting = false }
                 guard let client = apiClient else { return }
                 do {
-                    // Build export query with current filters
-                    var exportQuery = "format=\(format)"
-                    if filterType != "all" { exportQuery += "&type=\(filterType)" }
-                    if filterServer != "all" { exportQuery += "&server=\(filterServer)" }
-                    if filterStatus != "all" { exportQuery += "&status=\(filterStatus)" }
+                    // Build export query with current filters — every one of
+                    // them, from the same source the list uses.
+                    let exportQuery = (["format=\(format)"] + activeFilterParams).joined(separator: "&")
                     let data = try await client.fetchRaw(path: "/api/v1/activity/export?\(exportQuery)")
                     try data.write(to: url)
                     NSWorkspace.shared.activateFileViewerSelecting([url])
@@ -483,6 +645,15 @@ struct ActivityTableRow: View {
 
             // Details column (tool name)
             HStack(spacing: 4) {
+                // A sub-call made inside a code_execution script: marked so the
+                // list reads as parent-with-children, not five unrelated calls.
+                if let parentId = entry.parentId, !parentId.isEmpty {
+                    Image(systemName: "arrow.turn.down.right")
+                        .foregroundStyle(.secondary)
+                        .font(.scaled(.caption2, scale: fontScale))
+                        .help("Sub-call of a code_execution")
+                        .accessibilityLabel("Sub-call of a code execution")
+                }
                 Text(entry.toolName ?? "-")
                     .font(.scaled(.caption, scale: fontScale))
                     .lineLimit(1)
@@ -704,8 +875,36 @@ struct ActivityDetailView: View {
     let entry: ActivityEntry
     var recentSessions: [APIClient.MCPSession] = []
     var onDismiss: (() -> Void)? = nil
+    /// Invoked with the entry's request_id when the user asks to see the
+    /// sub-calls of this code_execution record.
+    var onShowSubCalls: ((String) -> Void)? = nil
+    /// Invoked with the entry's parent_id when the user asks to jump from a
+    /// sub-call back to its parent code_execution record.
+    var onShowParent: ((String) -> Void)? = nil
     @Environment(\.fontScale) var fontScale
     @State private var copiedField: String?
+
+    /// The record is the PARENT of sandbox sub-calls: the built-in
+    /// code_execution call whose request_id its children carry as parent_id.
+    private var isCodeExecutionParent: Bool {
+        entry.type == "internal_tool_call"
+            && entry.toolName == "code_execution"
+            && !(entry.requestId ?? "").isEmpty
+    }
+
+    /// The `code` argument of a code_execution record, when present — pulled
+    /// out of the JSON so it can render as source instead of an escaped string.
+    private var codeArgument: String? {
+        guard case .string(let code)? = entry.arguments?["code"], !code.isEmpty else { return nil }
+        return code
+    }
+
+    /// Request arguments minus the extracted `code` field.
+    private var argumentsWithoutCode: [String: JSONValue]? {
+        guard var args = entry.arguments, codeArgument != nil else { return entry.arguments }
+        args.removeValue(forKey: "code")
+        return args.isEmpty ? nil : args
+    }
 
     /// Resolve a human-readable client name from the session ID.
     private var clientName: String? {
@@ -745,14 +944,25 @@ struct ActivityDetailView: View {
                 // Metadata grid
                 metadataGrid
 
+                // Parent/child navigation for code_execution records
+                if isCodeExecutionParent || !(entry.parentId ?? "").isEmpty {
+                    parentChildNavigation
+                }
+
                 // Intent Declaration
                 if entry.intent != nil {
                     Divider()
                     intentSection
                 }
 
-                // Request Arguments
-                if let args = entry.arguments, !args.isEmpty {
+                // Executed code, rendered as source (code_execution records)
+                if let code = codeArgument {
+                    Divider()
+                    codeSection(code: code)
+                }
+
+                // Request Arguments (minus the code, which has its own section)
+                if let args = argumentsWithoutCode, !args.isEmpty {
                     Divider()
                     jsonSection(
                         label: "Request Arguments",
@@ -922,6 +1132,142 @@ struct ActivityDetailView: View {
                 }
             }
         }
+    }
+
+    // MARK: - Parent/child navigation
+
+    @ViewBuilder
+    private var parentChildNavigation: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if isCodeExecutionParent, let requestId = entry.requestId, let onShowSubCalls {
+                Button {
+                    onShowSubCalls(requestId)
+                } label: {
+                    Label("View sub-calls", systemImage: "arrow.turn.down.right")
+                        .font(.scaled(.subheadline, scale: fontScale))
+                }
+                .help("Show only the tool calls this code_execution made")
+                .accessibilityIdentifier("activity-view-subcalls")
+            }
+            if let parentId = entry.parentId, !parentId.isEmpty {
+                HStack(spacing: 6) {
+                    Text("Sub-call of code_execution")
+                        .font(.scaled(.caption, scale: fontScale))
+                        .foregroundStyle(.secondary)
+                    if let onShowParent {
+                        Button {
+                            onShowParent(parentId)
+                        } label: {
+                            Label("View parent call", systemImage: "arrow.uturn.up")
+                                .font(.scaled(.subheadline, scale: fontScale))
+                        }
+                        .help("Jump to the code_execution that made this call")
+                        .accessibilityIdentifier("activity-view-parent")
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: - Code Section (code_execution source)
+
+    @ViewBuilder
+    private func codeSection(code: String) -> some View {
+        let language = languageBadge
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text("Code")
+                    .font(.scaled(.headline, scale: fontScale))
+                Text(language)
+                    .font(.scaled(.caption2, scale: fontScale).bold())
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(Color.orange.opacity(0.15))
+                    .foregroundStyle(.orange)
+                    .clipShape(Capsule())
+                Spacer()
+                copyButton(text: code, field: "code")
+            }
+
+            Text(Self.formatScriptForDisplay(code))
+                .font(.scaledMonospaced(.caption, scale: fontScale))
+                .textSelection(.enabled)
+                .padding(10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color(.controlBackgroundColor))
+                .cornerRadius(8)
+                .accessibilityIdentifier("activity-code-block")
+        }
+    }
+
+    private var languageBadge: String {
+        if case .string(let lang)? = entry.arguments?["language"], !lang.isEmpty {
+            return lang.uppercased()
+        }
+        return "JAVASCRIPT"
+    }
+
+    /// Break a one-line script into readable lines for display: agents send
+    /// `code` as a single line, and rendering it verbatim is an unreadable
+    /// wall. Statement ends (`;`) and block braces get a newline — but only
+    /// OUTSIDE string literals, so a semicolon inside 'a; b' never splits.
+    /// Scripts that already contain newlines are shown verbatim: their author
+    /// formatted them.
+    ///
+    /// DISPLAY-ONLY, deliberately conservative: regex literals and template
+    /// substitutions with nested backticks are not parsed (that needs a real
+    /// tokenizer), so a `/a;b/` regex may gain a line break on screen. The
+    /// Copy button always yields the verbatim original, never this rendering.
+    static func formatScriptForDisplay(_ code: String) -> String {
+        guard !code.contains("\n") else { return code }
+        var out = ""
+        var quote: Character?
+        var escaped = false
+        var depth = 0
+        var parenDepth = 0
+        var skipLeadingSpace = false
+        for ch in code {
+            if let q = quote {
+                out.append(ch)
+                if escaped {
+                    escaped = false
+                } else if ch == "\\" {
+                    escaped = true
+                } else if ch == q {
+                    quote = nil
+                }
+                continue
+            }
+            if skipLeadingSpace {
+                if ch == " " { continue }
+                skipLeadingSpace = false
+            }
+            switch ch {
+            case "'", "\"", "`":
+                quote = ch
+                out.append(ch)
+            case ";" where parenDepth == 0:
+                out.append(ch)
+                out.append("\n")
+                out.append(String(repeating: "  ", count: depth))
+                skipLeadingSpace = true
+            case "(":
+                parenDepth += 1
+                out.append(ch)
+            case ")":
+                parenDepth = max(0, parenDepth - 1)
+                out.append(ch)
+            case "{":
+                depth += 1
+                out.append(ch)
+            case "}":
+                depth = max(0, depth - 1)
+                out.append(ch)
+            default:
+                out.append(ch)
+            }
+        }
+        return out
     }
 
     // MARK: - JSON Section (colored)

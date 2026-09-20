@@ -11,6 +11,7 @@ import (
 	"github.com/mark3labs/mcp-go/client"
 	uptransport "github.com/mark3labs/mcp-go/client/transport"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/diagnostics"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/shellwrap"
 	"go.uber.org/zap"
 )
@@ -34,7 +35,13 @@ func validateStdioConfig(cfg *config.ServerConfig) error {
 	}
 	if len(cfg.Args) == 0 {
 		if hint, ok := packageRunnerNoArgs[cfg.Command]; ok {
-			return fmt.Errorf("server %q: command %q has no args — %s is required", cfg.Name, cfg.Command, hint)
+			// Attributed with WrapError rather than left to the classifier's
+			// free-text fallback. This is mcpproxy's OWN pre-spawn verdict —
+			// no subprocess has run, so nothing here can be a child's stderr —
+			// which makes it the kind of structured signal the retry policy is
+			// allowed to park a server on (diagnostics.ParkableCode, GH #1145).
+			return diagnostics.WrapError(diagnostics.ConfigInvalidCommand,
+				fmt.Errorf("server %q: command %q has no args — %s is required", cfg.Name, cfg.Command, hint))
 		}
 	}
 	return nil
@@ -102,7 +109,7 @@ func (c *Client) connectStdio(ctx context.Context) error {
 		c.logger.Debug("Docker command detected, setting up container ID tracking",
 			zap.String("server", c.config.Name),
 			zap.String("command", c.config.Command),
-			zap.Strings("original_args", shellwrap.RedactDockerArgs(args)))
+			zap.Strings("original_args", logSafeArgs(args)))
 
 		// CRITICAL: Clean up any existing containers first to prevent duplicates
 		// This makes container creation idempotent and safe to call multiple times
@@ -179,7 +186,7 @@ func (c *Client) connectStdio(ctx context.Context) error {
 			c.logger.Debug("Injected env vars into direct docker command",
 				zap.String("server", c.config.Name),
 				zap.Int("env_count", len(c.config.Env)),
-				zap.Strings("modified_args", shellwrap.RedactDockerArgs(argsToWrap)))
+				zap.Strings("modified_args", logSafeArgs(argsToWrap)))
 		}
 
 		var dockerShellWrapped bool
@@ -240,9 +247,9 @@ func (c *Client) connectStdio(ctx context.Context) error {
 	c.logger.Debug("Initialized stdio transport",
 		zap.String("server", c.config.Name),
 		zap.String("final_command", finalCommand),
-		zap.Strings("final_args", shellwrap.RedactDockerArgs(finalArgs)),
+		zap.Strings("final_args", logSafeArgs(finalArgs)),
 		zap.String("original_command", c.config.Command),
-		zap.Strings("original_args", shellwrap.RedactDockerArgs(args)),
+		zap.Strings("original_args", logSafeArgs(args)),
 		zap.String("working_dir", c.config.WorkingDir),
 		zap.Bool("docker_isolation", c.isDockerCommand))
 
@@ -251,6 +258,21 @@ func (c *Client) connectStdio(ctx context.Context) error {
 	persistentCtx := context.Background()
 	if err := c.client.Start(persistentCtx); err != nil {
 		return fmt.Errorf("failed to start stdio client: %w", err)
+	}
+
+	// Extract the process group ID (Windows: assign to a Job Object) IMMEDIATELY
+	// after Start() succeeds, not after initialize() below. A restart/disconnect
+	// that interrupts an in-progress handshake (slow npx download, bulk-add
+	// contention, a timeout) previously left processGroupID at its zero value
+	// the whole time initialize() was running, so the init-failure cleanup path
+	// a few lines down (`if c.processGroupID > 0 { killProcessGroup(...) }`)
+	// silently did nothing and the spawned process (and on Windows, everything
+	// IT spawns) leaked. Setting it here means that cleanup path — and any
+	// concurrent restart that arrives before initialize() returns — has a real
+	// PID/Job Object to kill. The later extraction below is now just a no-op
+	// (its own `if c.processGroupID <= 0` guard) for the normal success path.
+	if c.processCmd != nil && c.processCmd.Process != nil {
+		c.processGroupID = extractProcessGroupID(c.processCmd, c.logger, c.config.Name)
 	}
 
 	// CRITICAL FIX: Enable stderr monitoring IMMEDIATELY after starting the process
@@ -271,11 +293,13 @@ func (c *Client) connectStdio(ctx context.Context) error {
 		// CRITICAL FIX: Cleanup Docker containers when initialization fails
 		// This prevents container accumulation when servers timeout during startup
 		if c.isDockerCommand {
-			c.logger.Warn("Initialization failed for Docker command - cleaning up container",
-				zap.String("server", c.config.Name),
-				zap.String("container_name", c.containerName),
-				zap.String("container_id", c.containerID),
-				zap.Error(err))
+			// Spec 105 D8: name a container here only with evidence — see
+			// dockerContainerLogFields. c.containerName alone can be a
+			// generated name never observed from Docker.
+			fields := []zap.Field{zap.String("server", c.config.Name)}
+			fields = append(fields, dockerContainerLogFields(c.containerID, c.containerName, c.containerOwner)...)
+			fields = append(fields, zap.Error(err))
+			c.logger.Warn("Initialization failed for Docker command - cleaning up container", fields...)
 
 			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), dockerCleanupTimeout)
 			defer cleanupCancel()
@@ -301,7 +325,7 @@ func (c *Client) connectStdio(ctx context.Context) error {
 				zap.String("server", c.config.Name),
 				zap.Int("pgid", c.processGroupID))
 
-			if err := killProcessGroup(c.processGroupID, c.logger, c.config.Name); err != nil {
+			if err := killProcessGroup(c.processGroupID, c.processCmd, c.logger, c.config.Name); err != nil {
 				c.logger.Error("Failed to clean up process group after initialization failure",
 					zap.String("server", c.config.Name),
 					zap.Int("pgid", c.processGroupID),
@@ -427,7 +451,7 @@ func (c *Client) wrapWithUserShell(command string, args []string) (shellCommand 
 	c.logger.Debug("Wrapping command with user shell for full environment inheritance",
 		zap.String("server", c.config.Name),
 		zap.String("original_command", command),
-		zap.Strings("original_args", shellwrap.RedactDockerArgs(args)),
+		zap.Strings("original_args", logSafeArgs(args)),
 		zap.String("shell", shellCommand))
 	return shellCommand, shellArgs
 }

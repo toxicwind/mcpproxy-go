@@ -12,6 +12,8 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/logs"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/oauth"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/upstream/launcher"
 )
 
@@ -78,9 +80,10 @@ func (c *Client) connectWithLauncher(ctx context.Context) error {
 
 	sink := newLoggerWriter(c.upstreamLogger, c.logger)
 	spec := &launcher.Spec{
-		Cmd:     cmd,
-		LogSink: sink,
-		Name:    c.config.Name,
+		Cmd:        cmd,
+		LogSink:    sink,
+		Name:       c.config.Name,
+		RedactArgs: logSafeArgs,
 	}
 
 	handle, err := launcher.Spawn(ctx, spec, c.logger)
@@ -116,7 +119,7 @@ func (c *Client) connectWithLauncher(ctx context.Context) error {
 
 	c.logger.Info("waiting for upstream URL to become reachable",
 		zap.String("server", c.config.Name),
-		zap.String("url", c.config.URL),
+		zap.String("url", c.logSafeURL()),
 		zap.Duration("timeout", waitTimeout))
 
 	if err := launcher.WaitForURL(ctx, c.config.URL, waitTimeout); err != nil {
@@ -145,7 +148,7 @@ func (c *Client) connectWithLauncher(ctx context.Context) error {
 
 	c.logger.Info("upstream URL is reachable",
 		zap.String("server", c.config.Name),
-		zap.String("url", c.config.URL))
+		zap.String("url", c.logSafeURL()))
 	return nil
 }
 
@@ -316,7 +319,7 @@ func (c *Client) buildLauncherCmd(_ context.Context, willUseDocker bool) (*exec.
 	c.logger.Debug("launcher command prepared",
 		zap.String("server", c.config.Name),
 		zap.String("command", finalCommand),
-		zap.Strings("args", finalArgs),
+		zap.Strings("args", logSafeArgs(finalArgs)),
 		zap.String("working_dir", c.config.WorkingDir),
 		zap.Bool("docker", willUseDocker))
 
@@ -339,15 +342,46 @@ func newLoggerWriter(primary, fallback *zap.Logger) io.Writer {
 }
 
 func (w *loggerWriter) Write(p []byte) (int, error) {
-	line := strings.TrimRight(string(p), "\n")
-	if line == "" {
-		return len(p), nil
-	}
-	switch {
-	case w.primary != nil:
-		w.primary.Info(line)
-	case w.fallback != nil:
-		w.fallback.Info(line)
+	// One record per line: pumpLines already writes one line per call, and
+	// the split keeps that shape for any other producer (one record per
+	// child line is what `mcpproxy upstream logs` shows).
+	for _, line := range strings.Split(strings.TrimRight(string(p), "\n"), "\n") {
+		w.writeLine(strings.TrimRight(line, "\r"))
 	}
 	return len(p), nil
+}
+
+// writeLine records one child output line through the per-server logger.
+// The child's text is the `message` FIELD of a constant-message record
+// stamped child_output=true, never the record message (Spec 105 FR-007,
+// internal/logs research D8 rule 1): the console encoder writes a message
+// unescaped, so child text there could carry a record header or boundary,
+// and a docker CLI failure names another server's container — the
+// attributed reader withholds child-output records that mention a container
+// (codex round 2).
+func (w *loggerWriter) writeLine(line string) {
+	if line == "" {
+		return
+	}
+	// Issue #1158 (review round 2, investigation 3). This is the child
+	// process's own stdout/stderr, written verbatim into
+	// ~/.mcpproxy/logs/server-<name>.log — and that file is not local-only: it
+	// is tailed by `mcpproxy upstream logs`, returned by the
+	// `upstream_servers tail_log` MCP tool, and served over HTTP by
+	// GET /api/v1/servers/{id}/logs. An upstream that echoes its own
+	// configuration on startup ("connecting with token sk-live-…", a stack
+	// trace quoting the request URL) therefore puts a credential on a REST
+	// surface, and it is a credential mcpproxy itself handed the child.
+	//
+	// ScrubUpstreamText is the rule this exact class of string gets everywhere
+	// else in the tree: text originated OUTSIDE mcpproxy's own structured
+	// fields, with no enclosing key to judge it by, so both the name rule and
+	// the value-shaped detector run. Ordinary child output is untouched by it.
+	line = oauth.ScrubUpstreamText(line)
+	switch {
+	case w.primary != nil:
+		w.primary.Info("launcher", zap.String("message", line), logs.ChildOutputField())
+	case w.fallback != nil:
+		w.fallback.Info("launcher", zap.String("message", line), logs.ChildOutputField())
+	}
 }

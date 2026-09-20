@@ -96,15 +96,15 @@ Add to your `~/.mcpproxy/mcp_config.json`:
     "network_mode": "bridge",
     "registry": "docker.io",
     "default_images": {
-      "python": "python:3.11",
-      "python3": "python:3.11",
-      "uvx": "python:3.11",
-      "pip": "python:3.11",
-      "pipx": "python:3.11",
-      "node": "node:20",
-      "npm": "node:20",
-      "npx": "node:20",
-      "yarn": "node:20",
+      "python": "ghcr.io/astral-sh/uv:python3.13-bookworm-slim",
+      "python3": "ghcr.io/astral-sh/uv:python3.13-bookworm-slim",
+      "uvx": "ghcr.io/astral-sh/uv:python3.13-bookworm-slim",
+      "pip": "ghcr.io/astral-sh/uv:python3.13-bookworm-slim",
+      "pipx": "ghcr.io/astral-sh/uv:python3.13-bookworm-slim",
+      "node": "node:22",
+      "npm": "node:22",
+      "npx": "node:22",
+      "yarn": "node:22",
       "go": "golang:1.21-alpine",
       "cargo": "rust:1.75-slim",
       "rustc": "rust:1.75-slim",
@@ -131,8 +131,61 @@ Add to your `~/.mcpproxy/mcp_config.json`:
 | `timeout` | Container startup timeout | `"30s"` |
 | `network_mode` | Docker network mode | `"bridge"` |
 | `registry` | Docker registry to use | `"docker.io"` |
-| `default_images` | Runtime to image mappings | See above |
+| `default_images` | Runtime to image mappings. The optional `uvx-git` key (not shipped in the defaults) overrides the git-capable image used when a Python runner installs from a `git+` URL | See above |
 | `extra_args` | Additional docker run arguments | `[]` |
+
+### Git dependencies (`uvx-git`)
+
+The Python default image is Astral's **slim** `uv` image, which does not contain
+`git`. A server installed straight from a repository —
+
+```json
+{ "name": "my-server", "command": "uvx", "args": ["--from", "my-server@git+https://github.com/o/r", "my-server"] }
+```
+
+— cannot resolve without it, and fails with `Git executable not found` /
+`Git operation failed` ([`MCPX_DOCKER_MISSING_TOOLCHAIN`](errors/MCPX_DOCKER_MISSING_TOOLCHAIN.md)).
+
+MCPProxy detects the `git+` URL in a Python package runner's arguments and runs
+that server only on a git-capable image — everyone else keeps the small slim
+image. By default that is `ghcr.io/astral-sh/uv:python3.13-bookworm`, which
+ships git. Set the **`uvx-git`** key to use your own mirror or a custom build:
+
+```json
+{ "docker_isolation": { "default_images": { "uvx-git": "my-registry.example/uv-git:1" } } }
+```
+
+`default_images` from your config file is merged **over** the built-in map, so a
+partial map like the one above only changes the keys it lists — every other
+runtime keeps its built-in image.
+
+**Mirrored / air-gapped registries.** `uvx-git` is deliberately *not* part of
+the built-in map, so its presence in your config means exactly one thing: you
+chose that image, and it is used — even if you set it to the same public value
+MCPProxy ships. Two things follow:
+
+- If you set `registry`, the built-in git-capable image is pulled from **your**
+  registry (`<registry>/astral-sh/uv:python3.13-bookworm`) rather than from
+  `ghcr.io`.
+- If you retargeted `uvx`/`python` at your own registry and never set
+  `uvx-git`, the server runs on **your** image instead of MCPProxy reaching
+  outside your registry for a public one, and a warning naming this key is
+  logged. Point `uvx-git` at a git-capable image to get the substitution back:
+
+```json
+{ "docker_isolation": { "default_images": { "uvx-git": "mirror.internal/astral/uv:python3.13-bookworm" } } }
+```
+
+To turn the substitution off entirely, set the key to an empty string; those
+servers then keep whatever `uvx`/`python` image you configured:
+
+```json
+{ "docker_isolation": { "default_images": { "uvx-git": "" } } }
+```
+
+A per-server `isolation.image` override always wins over this selection, so a
+pinned image must ship git itself. `node`/`npx` need no equivalent: `node:22`
+already includes git, and the substitution never applies to them.
 
 ### Per-Server Configuration
 
@@ -172,6 +225,39 @@ You can override isolation settings per server:
 Per-server `isolation.enabled: true` only takes effect when the global `docker_isolation.enabled` flag is also `true`. If the global flag is `false`, MCPProxy runs the server on the host even if you explicitly opted it into isolation in its per-server config.
 
 Starting in this release, MCPProxy emits a one-time warning in the main log when it detects this configuration (look for `per-server docker isolation opt-in ignored` in `~/.mcpproxy/logs/main.log`). To actually isolate those servers, flip the global flag on.
+
+## Reading isolation state over the API
+
+Per-server `isolation.enabled` is a **tri-state** in the config file: `true`, `false`, or **absent** — and absent means *inherit the global setting*, not *off*.
+
+The API surfaces both halves of that, so a client never has to guess:
+
+| Field | Meaning |
+|-------|---------|
+| `isolation.enabled` | The **effective** state — is this server actually CONFINED right now, after the global setting, the per-server override, the structural gates and the host's capabilities. Always present for stdio servers. **Read-only** — see below. |
+| `isolation.enabled_override` | The **raw** per-server override, exactly as persisted. **Absent = inherit.** |
+| `isolation.mode_override` | The raw per-server `isolation.mode` override. Absent = inherit. |
+| `isolation_effective` | `{mode, isolated, global_mode, inherited, source}` — the resolved state plus *why*. |
+
+`isolation_effective.source` is a small, extensible vocabulary: `global`, `server-mode`, `server-opt-out`, `server-opt-in-ignored`, `not-stdio`, `already-docker`, `sandbox-unavailable`, `unsupported-mode`. **Treat an unrecognized value as `global`.**
+
+`isolated` is deliberately NOT just `mode != none`. The `sandbox` mode is enforced by Landlock, which is Linux-only and absent from some kernels; where it cannot be enforced the launcher runs the server **unconfined**, so `isolated` is `false` and `source` is `sandbox-unavailable` even though `mode` stays `sandbox` (the wrapper still applies its rlimits on Linux). A mode no version implements reports `unsupported-mode`. The read surface never claims isolation the spawn path will not deliver.
+
+> **Changed in this release (GH #1142):** `isolation.enabled` previously carried the raw override flattened to a bool, so a server that inherited global isolation — and was genuinely running in a container — was reported as `enabled: false` and displayed as unisolated everywhere. It now reports the effective state; read `enabled_override` for the raw value.
+
+### Writing the override
+
+Reads and writes use **different key names on purpose**. `isolation.enabled` is a derived, read-only value; the writable key is `isolation.enabled_override`, the same key reads return the raw override under. `POST /api/v1/servers` and `PATCH /api/v1/servers/{id}` accept the tri-state there:
+
+- **omit the key** → leave the persisted override alone;
+- **`null`** → clear the override, back to inheriting the global setting;
+- **`true` / `false`** → set an explicit opt-in / opt-out.
+
+Sending `isolation.enabled` on either verb returns **400**. That is deliberate: it is the effective state on the way out, so a read-modify-write client that echoed the whole isolation object back would silently convert "inherits the global setting" into a permanent explicit override — the same corruption the effective-state reporting exists to prevent. An unrecognized `mode_override` is likewise rejected with a 400 naming the accepted vocabulary, instead of being persisted and failing the next daemon start's config validation.
+
+Only send `enabled_override` when the user actually changed it. Fields the request omits (including `log_driver`, `log_max_size`, `log_max_files`) are preserved.
+
+> The MCP `upstream_servers` tool's `isolation_json` argument is the raw config object, so its `enabled` field is the raw tri-state there, matching the config file. Its `mode` is validated the same way.
 
 ## Telemetry
 

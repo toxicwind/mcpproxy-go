@@ -6,16 +6,29 @@
          state so the content fluidly reclaims space when the sidebar shrinks
          to its icon rail. -->
     <div
-      class="drawer-content grid grid-rows-[auto_1fr] h-screen bg-base-200 transition-[padding] duration-200 ease-out"
+      class="drawer-content grid grid-rows-[auto_1fr_auto] h-screen bg-base-200 transition-[padding] duration-200 ease-out"
       :class="systemStore.sidebarCollapsed ? 'lg:pl-14' : 'lg:pl-64'"
     >
       <!-- Top Header -->
       <TopHeader />
 
-      <!-- Page content -->
-      <main class="overflow-y-auto p-6">
-        <router-view />
+      <!-- Page content. `min-h-0` / `min-w-0`: a grid item defaults to
+           `min-height:auto`, so a tall page pushed this scroll container past
+           its track and the footer ended up overlapping the last row at 390px
+           (UX audit F14). -->
+      <main class="overflow-y-auto min-h-0 min-w-0 p-4 sm:p-6">
+        <!-- #1065: keyed on authEpoch so repairing a failed auth remounts the
+             current view. Views hold their load errors in component-local refs
+             that nothing outside can reach, so a successful sign-in used to
+             leave a stale red error panel and zero rows behind the recovered
+             header. Key on authEpoch ONLY -- folding in the route path would
+             remount ServerDetail on every :serverName change and break the
+             Dashboard's single instance across /, /usage and /overview. -->
+        <router-view :key="systemStore.authEpoch" />
       </main>
+
+      <!-- Persistent footer with project links (discussion #948) -->
+      <AppFooter />
     </div>
 
     <!-- Sidebar -->
@@ -29,7 +42,7 @@
 
     <!-- Authentication Error Modal -->
     <AuthErrorModal
-      :show="authModal.show"
+      :show="authModal.show || undefined"
       :can-close="authModal.canClose"
       :last-error="authModal.lastError"
       @close="handleAuthModalClose"
@@ -41,8 +54,10 @@
 
 <script setup lang="ts">
 import { onMounted, onUnmounted, reactive, ref } from 'vue'
+import { useRouter } from 'vue-router'
 import SidebarNav from '@/components/SidebarNav.vue'
 import TopHeader from '@/components/TopHeader.vue'
+import AppFooter from '@/components/AppFooter.vue'
 import ToastContainer from '@/components/ToastContainer.vue'
 import ConnectionStatus from '@/components/ConnectionStatus.vue'
 import AuthErrorModal from '@/components/AuthErrorModal.vue'
@@ -54,6 +69,7 @@ import api, { type APIAuthEvent } from '@/services/api'
 const systemStore = useSystemStore()
 const serversStore = useServersStore()
 const authStore = useAuthStore()
+const router = useRouter()
 
 // Authentication modal state
 const authModal = reactive({
@@ -69,31 +85,68 @@ let removeAPIListener: (() => void) | null = null
 function handleAuthModalClose() {
   authModal.show = false
   authModal.lastError = ''
+  systemStore.setAuthRequired(false)
+}
+
+// Re-prime everything that only loads at mount. The <router-view> key covers
+// the routed view, but these surfaces live outside it and would otherwise keep
+// their failed state until a full page reload (#1065).
+async function reloadAfterAuth() {
+  systemStore.connectEventSource()
+  serversStore.fetchServers()
+  systemStore.fetchInfo() // TopHeader version / update state
+  systemStore.fetchRouting() // TopHeader routing chip
+  // Server-edition role-based nav. The router guard does not run for a
+  // key-driven remount, so re-check here — and read with the repaired key,
+  // never by joining a probe that was issued before the key was replaced.
+  await authStore.checkAuth({ fresh: true })
 }
 
 function handleAuthModalAuthenticated() {
   authModal.show = false
   authModal.lastError = ''
+  // markAuthRecovered, not setAuthRequired(false): this path validated the key,
+  // so it is safe to invalidate every view that failed while auth was broken.
+  systemStore.markAuthRecovered()
 
-  // Refresh data now that we're authenticated
-  systemStore.connectEventSource()
-  serversStore.fetchServers()
+  void reloadAfterAuth()
 }
 
-function handleAuthModalRefresh() {
+function handleAuthModalRefresh(verified: boolean) {
+  if (!verified) {
+    // The reloaded key did not authenticate. Leave the modal and the
+    // auth-required flag in place rather than remounting every view onto a
+    // key that is still 401.
+    return
+  }
+
   authModal.show = false
   authModal.lastError = ''
+  // The modal verified the reloaded key, so this is a real recovery and the
+  // views holding stale auth errors must be invalidated too (#1065).
+  systemStore.markAuthRecovered()
 
-  // Reconnect with potentially new API key
-  systemStore.connectEventSource()
-  serversStore.fetchServers()
+  void reloadAfterAuth()
 }
 
 // Handle API authentication errors
 function handleAuthError(event: APIAuthEvent) {
   console.log('Global auth error received:', event)
+
+  // Spec 107 FR-041 / T088: a session principal (tenant or admin, no local
+  // API key) never holds an API key to type into the modal below — a 401
+  // there means the cookie/JWT went stale, and the fix is to sign in again
+  // via the IdP, not to prompt for a credential that does not exist.
+  if (authStore.isTeamsEdition && !api.hasAPIKey()) {
+    void router.push('/login')
+    return
+  }
+
   authModal.lastError = event.error
   authModal.show = true
+  // Audit F28: one cause, one message. The modal now suppresses the reconnect
+  // toast and the inline load errors it would otherwise compete with.
+  systemStore.setAuthRequired(true)
 }
 
 onMounted(async () => {
@@ -103,17 +156,25 @@ onMounted(async () => {
   // Set up API error listener
   removeAPIListener = api.addEventListener(handleAuthError)
 
-  // Connect to real-time updates
-  systemStore.connectEventSource()
+  // Spec 107 FR-041 / T088: these are all admin-only core doors (server
+  // status/version, routing mode, the full server list, the SSE event
+  // stream). A tenant principal is entitled to a narrow, per-user surface
+  // instead (their own servers/activity, fetched by the routed tenant
+  // views) — issuing these here would either 403 pointlessly or, worse,
+  // leak fleet-wide state into a tenant's browser.
+  if (authStore.principalKind !== 'tenant') {
+    // Connect to real-time updates
+    systemStore.connectEventSource()
 
-  // Initial data load
-  serversStore.fetchServers()
+    // Initial data load
+    serversStore.fetchServers()
 
-  // Fetch version info
-  systemStore.fetchInfo()
+    // Fetch version info
+    systemStore.fetchInfo()
 
-  // Fetch routing mode info
-  systemStore.fetchRouting()
+    // Fetch routing mode info
+    systemStore.fetchRouting()
+  }
 })
 
 onUnmounted(() => {

@@ -4,37 +4,66 @@
       <!-- Left: Mobile menu toggle + Search + Add Server -->
 <div class="flex items-center space-x-3 flex-1 min-w-0 overflow-x-hidden">
         <!-- Mobile menu toggle -->
-        <label for="sidebar-drawer" class="btn btn-ghost btn-square lg:hidden">
-          <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <label
+          for="sidebar-drawer"
+          class="btn btn-ghost btn-square lg:hidden"
+          aria-label="Open navigation menu"
+        >
+          <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16" />
           </svg>
         </label>
 
-        <!-- Search Box with Button -->
+        <!-- Search Box with Button.
+             The button stays enabled at rest (UX audit F32): a greyed-out
+             control next to an empty box reads as broken, when in fact the
+             search simply has nothing to run yet. Submitting an empty query
+             is a no-op. -->
         <div class="flex items-center space-x-2 flex-1 max-w-2xl min-w-0">
           <div class="relative flex-1">
             <input
-              type="text"
+              type="search"
               placeholder="Search tools, servers..."
               class="input input-bordered w-full pr-3"
+              aria-label="Search tools and servers"
+              data-test="header-search-input"
               v-model="searchQuery"
               @keydown.enter="handleSearch"
             />
           </div>
+          <!-- Always enabled: greyed out next to an empty box read as broken
+               (audit F20/F32). With nothing typed it simply opens Tools. -->
           <button
             @click="handleSearch"
             class="btn btn-primary"
-            :disabled="!searchQuery.trim()"
+            aria-label="Search"
+            data-test="header-search-button"
           >
-            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
             </svg>
             <span class="hidden sm:inline ml-2">Search</span>
           </button>
         </div>
 
-        <!-- Add Server Button -->
-        <button @click="showAddServerModal = true" class="btn btn-primary" data-test="header-add-server">
+        <!-- Add Server Button. Spec 107 cross-review round 3, chunk 4 P2:
+             this always submitted through the generic AddServerModal, whose
+             serversStore.addServer() calls the core POST /api/v1/tools/call
+             dispatch door — a mandatory tenant-session refusal
+             (rest-endpoints.md §8) — so a tenant clicking their own labeled
+             "Add Personal Server" button always drew a 403 the API client
+             mistakes for an auth failure. /my/servers (UserServers.vue) is
+             the working tenant flow, wired to POST /api/v1/user/servers;
+             hidden here rather than rewired, matching the ModeSwitcher
+             precedent below (FR-041: tenant-inapplicable controls are
+             hidden, never issued-and-403'd). -->
+        <button
+          v-if="authStore.principalKind !== 'tenant'"
+          @click="showAddServerModal = true"
+          class="btn btn-primary"
+          :aria-label="addServerLabel"
+          data-test="header-add-server"
+        >
           <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
           </svg>
@@ -44,8 +73,15 @@
 
       <!-- Right: Stats + Proxy Info -->
       <div class="hidden md:flex items-center space-x-3 shrink-0">
-        <!-- Profile switcher (Profiles v2 / MCP-3243) -->
-        <ProfileSwitcher />
+        <!-- Profile switcher (Profiles v2 / MCP-3243). Spec 107 cross-review
+             round 3, chunk 4 P2: selecting a profile calls
+             PUT /api/v1/profiles/active, which the tenant-session allowlist
+             rejects with 403 before the handler runs (rest-endpoints.md §8
+             lists only GET /profiles* as a tenant-reachable read) — so an
+             enabled control a tenant could open always failed to act. Hidden
+             for the same FR-041 reason as the button above; GET /profiles
+             stays reachable elsewhere (it is not this component's read). -->
+        <ProfileSwitcher v-if="authStore.principalKind !== 'tenant'" />
 
         <!-- Servers -->
         <div class="flex items-center space-x-2 px-3 py-2 bg-base-200 rounded-lg text-sm">
@@ -56,22 +92,33 @@
             ]"
           />
           <span class="font-bold">{{ serversStore.serverCount.connected }}</span>
-          <span class="opacity-60">/</span>
+          <span class="text-base-content/60">/</span>
           <span>{{ serversStore.serverCount.total }}</span>
-          <span class="text-xs opacity-60">Servers</span>
+          <span class="text-xs text-base-content/60">Servers</span>
         </div>
 
         <!-- Tools -->
         <div class="flex items-center space-x-2 px-3 py-2 bg-base-200 rounded-lg text-sm">
           <span class="font-bold">{{ serversStore.totalTools }}</span>
-          <span class="text-xs opacity-60">Tools</span>
+          <span class="text-xs text-base-content/60">Tools</span>
         </div>
 
-        <!-- Routing Mode -->
-        <div class="flex items-center space-x-2 px-3 py-2 bg-base-200 rounded-lg text-sm">
-          <span class="text-xs opacity-60">Mode:</span>
-          <span class="font-medium">{{ routingModeLabel }}</span>
-        </div>
+        <!-- Routing + serialization mode switcher. Was a read-only badge whose
+             `cursor-help` promised an explanation the browser only produced
+             after a long hover (audit F31 follow-up); now it explains and
+             switches, like the profile switcher beside it.
+
+             Spec 107 FR-041 / cross-review round 2, chunk 4 P1: routing_mode
+             lives under PATCH /config, an admin-only core door (named
+             must-refuse, rest-endpoints.md §8), and routing_mode itself is
+             read from GET /routing (also must-refuse). A tenant session has
+             nothing to switch — the panel would open on a permanently
+             unresolved state and every selection would draw a fixed 403.
+             Hidden entirely, matching the FR-041 promise for tenant-
+             inapplicable chips (round 1 already suppressed the fetch this
+             component would otherwise issue on mount; this hides the
+             control itself, including its mutation path). -->
+        <ModeSwitcher v-if="authStore.principalKind !== 'tenant'" />
 
         <!-- MCP Endpoints Dropdown -->
         <div v-if="systemStore.listenAddr" class="relative">
@@ -79,7 +126,7 @@
             @click="showEndpoints = !showEndpoints"
             class="flex items-center space-x-2 px-3 py-2 bg-base-200 rounded-lg cursor-pointer hover:bg-base-300 transition-colors"
           >
-            <span class="text-xs font-medium opacity-60">MCP:</span>
+            <span class="text-xs font-medium text-base-content/60">MCP:</span>
             <code class="text-xs font-mono">{{ systemStore.listenAddr }}</code>
             <svg class="w-3 h-3 opacity-60 transition-transform" :class="{ 'rotate-180': showEndpoints }" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" />
@@ -89,7 +136,7 @@
             v-if="showEndpoints"
             class="absolute right-0 top-full mt-2 p-3 shadow-lg bg-base-100 rounded-box w-96 border border-base-300 z-50"
           >
-            <div class="text-xs font-semibold opacity-60 mb-2 px-1">MCP Endpoints</div>
+            <div class="text-xs font-semibold text-base-content/60 mb-2 px-1">MCP Endpoints</div>
             <div class="space-y-1">
               <div
                 v-for="ep in mcpEndpoints"
@@ -101,7 +148,7 @@
                     <code class="text-xs font-mono truncate">{{ ep.url }}</code>
                     <span v-if="ep.isDefault" class="badge badge-xs badge-primary">default</span>
                   </div>
-                  <div class="text-xs opacity-50 mt-0.5">{{ ep.description }}</div>
+                  <div class="text-xs text-base-content/60 mt-0.5">{{ ep.description }}</div>
                 </div>
                 <button
                   @click.stop="copyEndpoint(ep)"
@@ -140,7 +187,9 @@ import { useSystemStore } from '@/stores/system'
 import { useServersStore } from '@/stores/servers'
 import { useAuthStore } from '@/stores/auth'
 import AddServerModal from './AddServerModal.vue'
+import { serverDetailPath } from '@/utils/serverRoute'
 import ProfileSwitcher from './ProfileSwitcher.vue'
+import ModeSwitcher from './ModeSwitcher.vue'
 
 const router = useRouter()
 const systemStore = useSystemStore()
@@ -148,18 +197,6 @@ const serversStore = useServersStore()
 const authStore = useAuthStore()
 
 const addServerLabel = computed(() => authStore.isTeamsEdition ? 'Add Personal Server' : 'Add Server')
-
-const routingModeLabel = computed(() => {
-  const mode = systemStore.routingMode
-  switch (mode) {
-    case 'direct':
-      return 'Direct'
-    case 'code_execution':
-      return 'Code Exec'
-    default:
-      return 'Retrieve'
-  }
-})
 
 const searchQuery = ref('')
 const showAddServerModal = ref(false)
@@ -222,14 +259,22 @@ async function copyEndpoint(ep: McpEndpoint) {
   }
 }
 
+// One canonical search surface (audit F20): the header box hands its query to
+// the Tools page instead of the retired /search view. An empty box is not an
+// error — it opens Tools unfiltered rather than leaving the button dead.
 function handleSearch() {
-  if (searchQuery.value.trim()) {
-    router.push({ path: '/search', query: { q: searchQuery.value } })
-  }
+  const q = searchQuery.value.trim()
+  router.push(q ? { path: '/tools', query: { q } } : { path: '/tools' })
 }
 
-function handleServerAdded() {
+function handleServerAdded(serverName?: string) {
   // Refresh servers list after adding
   serversStore.fetchServers()
+  // UX audit F07: a single add hands off to that server's detail view, where
+  // connect/scan/review/approve is already on screen. The bulk/import path
+  // emits no name and keeps the old refresh-in-place behaviour.
+  if (serverName) {
+    void router.push(serverDetailPath(serverName))
+  }
 }
 </script>

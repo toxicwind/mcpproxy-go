@@ -145,12 +145,64 @@ secrets.
 
 Setting `reveal_secret_headers: true` in
 [`mcp_config.json`](../configuration/config-file.md) disables redaction on
-all three channels. This is **not normally needed**: the Web UI / macOS
+all three channels **for an authenticated admin only** (issue #1167). An
+agent token, a server-edition non-admin user and an unauthenticated caller
+keep getting masked values no matter how the flag is set. The flag has no
+effect at all on the `/events` SSE stream or on the `upstream_stats` block of
+`GET /api/v1/status`: those payloads are produced once for a mixed-privilege
+audience with no caller to check, so they are always masked. An admin
+subscribed to `/events` with the flag on receives the notify-only form of
+`servers.changed` and re-fetches the raw values through `GET /api/v1/servers`. This is **not normally needed**: the Web UI / macOS
 tray / CLI can edit, delete, and convert-to-secret without ever seeing
 the plaintext, because the PATCH endpoint deep-merges (omitted keys are
 preserved) and the [`config-to-secret`](#post-apiv1serversnameconfig-to-secret)
 endpoint reads the real value server-side. Flip the flag only if you
 need to inspect a raw value through the API for debugging.
+
+On the MCP channel the flag also requires an **authenticated** caller
+(issue #1148): an unauthenticated `/mcp` client is admin only for backward
+compatibility, and gets the masked values regardless of the flag. The REST
+API always requires an API key, so it is unaffected.
+
+Redaction is not limited to headers. The same responses — and the `/events`
+SSE `servers.changed` payloads, which go through the identical redactor — also
+mask env values, URL query credentials, `oauth.extra_params`, `oauth.scopes`
+and credential-shaped **argv tokens** (`--api-key sk-…`, `--endpoint=ghp_…`),
+using one shared rule set so the REST, SSE and MCP doors cannot drift.
+
+Two rules decide, in that order, and **both** run on every field:
+
+1. The **field name** — `Authorization`, `GITHUB_TOKEN`, `?access_token=`,
+   `--api-key`. This is what keeps a payload readable: it says *which*
+   credential is configured without revealing it.
+2. The **value's own shape** — an AWS key, a GitHub token, a PEM block, a
+   high-entropy blob — wherever it sits. A credential under a benign name
+   (`env: {BUILD_ID: ghp_…}`, `?opaque=ghp_…`, a custom header) is invisible to
+   rule 1 and obvious to rule 2, so rule 2 runs over everything rule 1 left
+   alone. In a URL it runs per component, so the readable
+   `scheme://user:••••(N chars)@host/db` rendering survives while a second
+   credential elsewhere in the same URL is still masked.
+
+Three consequences for clients:
+
+- A masked value **echoed back on a write** is reverted only when it can be
+  bound to a key it cannot be moved away from — a map key for `env` / `headers`
+  / `oauth.extra_params`, a query-parameter name plus the stored scheme and
+  `host:port` for `url`, a field name for `oauth.client_secret` /
+  `client_id` / `redirect_uri`. So a read-modify-write that edits one field
+  never persists another field's mask over the real secret.
+- Everything else is **refused** with `400`, never reverted: `args`,
+  `oauth.scopes`, `isolation.extra_args`, a mask moved to a different key or
+  host, and any field added to the server config later. An argv slot (like a
+  scope) has no key to bind a stored secret to — only its index and its
+  neighbours, all of them caller-supplied in the same request — so an echoed
+  mask is refused rather than reverted. Resend the real value, or omit the
+  field to leave the stored one unchanged. `POST /api/v1/servers` refuses
+  *every* echoed mask, since on create there is no stored value to bind one to.
+  See [Upstream servers](../configuration/upstream-servers.md#how-you-edit-them).
+- `GET /api/v1/servers/{id}/logs` scrubs credentials out of the returned log
+  lines (mcpproxy logs the upstream URL with its query string, and a child MCP
+  server may print its own API key), matching the MCP `tail_log` operation.
 
 The MCP `upstream_servers` tool was the original motivator for redaction
 (see [PR #425](https://github.com/smart-mcp-proxy/mcpproxy-go/pull/425)) —
@@ -242,7 +294,7 @@ mask string.
   "enabled": true,
   "quarantined": false,
   "auto_approve_tool_changes": true,
-  "isolation": {"enabled": true, "image": "node:20"}
+  "isolation": {"enabled_override": true, "image": "node:20"}
 }
 ```
 
@@ -541,10 +593,26 @@ Get the current routing mode and available MCP endpoints.
       "code_execution": "/mcp/code",
       "retrieve_tools": "/mcp/call"
     },
-    "available_modes": ["retrieve_tools", "direct", "code_execution"]
+    "available_modes": ["retrieve_tools", "direct", "code_execution"],
+    "tool_response_mode": "full",
+    "direct_tool_response_mode": "full",
+    "pending_routing_mode": "",
+    "restart_required": false
   }
 }
 ```
+
+| Field | Meaning |
+|-------|---------|
+| `routing_mode` | The mode `/mcp` is **actually serving** — recorded when the server bound it at startup, not read back from the config. A config change (API or hand-edited file) cannot rebind `/mcp`. |
+| `pending_routing_mode` | The mode the next start will adopt, when it differs from the served one. Empty when nothing is pending. |
+| `restart_required` | True exactly when `pending_routing_mode` is set. |
+| `tool_response_mode` | Spec 085 serialization of `retrieve_tools` results, resolved (`full` when unset). Hot-reloadable. |
+| `direct_tool_response_mode` | Spec 102 serialization of direct-surface listings, resolved (`full` when unset). Hot-reloadable. |
+
+A restart-gated change is persisted immediately and reported as pending; later
+changes to other settings apply hot and leave it pending. Re-applying the mode
+that is already being served clears it.
 
 See [Routing Modes](../features/routing-modes.md) for details on each mode.
 
@@ -554,7 +622,8 @@ The MCP endpoints (not REST) additionally expose progressive-disclosure discover
 
 - **`tool_response_mode`** config (`full` default | `compact`, hot-reloadable via `POST /api/v1/config/apply`) controls `retrieve_tools` serialization only. In `compact` mode each entry is `{id, score, sig, desc, lossy}` — a one-line parameter signature (`*` = required, `~` = lossy) plus a first-sentence description — instead of full `inputSchema`, and the response carries one top-level `hint` line. Ranking is identical between modes.
 - **`detail`** — optional per-call `retrieve_tools` parameter (`compact` | `full`) overriding the configured mode for that call.
-- **`describe_tool`** — built-in second-stage tool (retrieve_tools mode only): accepts 1–5 `server:tool` ids and returns full definitions (`name`, `description`, `inputSchema`, `server`, `annotations`, `call_with`) with per-id errors for unknown/invisible ids. It applies the same visibility pipeline as search (profile scope, agent-token scope, quarantine, tool approval, disabled) and never returns a definition `retrieve_tools` could not.
+- **`describe_tool`** — built-in second-stage tool (retrieve_tools mode only): accepts 1–5 `server:tool` ids and returns full definitions (`name`, `description`, `inputSchema`, `server`, `annotations`, `call_with`) with per-id errors for ids that do not resolve. It applies the same visibility pipeline as search (profile scope, agent-token scope, quarantine, tool approval, disabled) and never returns a definition `retrieve_tools` could not. Per-id error codes: `not_found`, `quarantined`, `pending_approval`, `changed`, `disabled` (Spec 099 retired `invisible`: an out-of-scope id now reports `not_found`, indistinguishable from an id that does not exist — see the [breaking-change note](https://github.com/smart-mcp-proxy/mcpproxy-go/blob/main/CHANGELOG.md)).
+- **`describe_tool` check mode (Spec 099)** — the same built-in with `check: true` answers availability instead of definitions: up to 50 ids, an optional `filters` object (`read_only_only`, `exclude_destructive`, `exclude_open_world` — the REST body of `POST /api/v1/preflight` calls the same object `policy`), and a response of `{verdict, checked_at, request_id, results[]}` carrying the same reason codes this endpoint returns. It is the in-band twin of `POST /api/v1/preflight`, evaluated by the same evaluator, and differs deliberately: always the agent-token disclosure tier (never a hash, never `server_not_in_scope`), the session's own scope with no `profile` parameter, no hash pins (`expect_hashes` is a reserved field name and is rejected), and no wait budget. See [Required-Tools Preflight](../features/tools-preflight.md#in-band-describe_tool-check-mode).
 
 ### Tools
 
@@ -602,9 +671,175 @@ search/filter/sort over the full set. For relevance-ranked discovery use
 server cannot be read the endpoint still returns every tool it could gather and
 sets `partial: true` with `failed_servers` (it does not fail the whole request).
 
+Operator-tier callers (admin API key, Unix socket, named pipe) additionally
+receive each approved tool's current schema-hash pin in `hash`
+(`sha256/v{N}:{hex}`) — the authoring surface for `POST /api/v1/preflight`
+pins. Agent tokens never receive hashes.
+
 #### GET /api/v1/servers/{name}/tools
 
-List tools for a specific server.
+List tools for a specific server. Carries the same operator-tier `hash` pin
+field as the global listing.
+
+#### POST /api/v1/preflight
+
+Required-tools preflight (Spec 098): a deterministic, side-effect-free
+availability check for a caller-supplied list of tool IDs. It performs **zero
+upstream calls** and mutates no runtime state — verdicts are computed from
+local state only (tool index, approval records, connection-state snapshot,
+config policy). The HTTP status reports whether the **check executed**, never
+what it found: a fully blocked set is still a `200` carrying
+`verdict: "blocked"` in the body. See
+[Required-Tools Preflight](../features/tools-preflight.md) for the feature
+guide and `mcpproxy tools preflight` for the CLI wrapper.
+
+**Request Body:**
+```json
+{
+  "tools": [
+    { "id": "gh-ops:sync_issues" },
+    { "id": "ctl:echo", "pin_hash": "sha256/v1:9f86d081884c7d65..." }
+  ],
+  "profile": "work",
+  "policy": { "read_only_only": true },
+  "wait_ms": 5000
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `tools` | array | Required, 1–100 entries — the limit applies to the **raw** array, before dedup. Each entry carries `id` (`<server>:<tool>`) and optional `pin_hash`. Duplicate IDs are deduplicated (one result per unique ID); duplicates carrying **different** `pin_hash` values are a `400`. |
+| `profile` | string | Optional. Evaluate under this profile's server scope so verdicts match a profile-pinned session's view. Unknown profile: `400`. Omitted: unscoped operator view. |
+| `policy` | object | Optional annotation filters, Spec 094 semantics: `read_only_only`, `exclude_destructive`, `exclude_open_world` (evaluated in that fixed order; the first excluding filter owns the verdict). |
+| `wait_ms` | integer | Optional, 0–10000. Poll local state while every failure is retryable-class (see below). Values over the cap are a `400`, not a silent clamp. |
+
+**Response** (standard `APIResponse{data}` envelope):
+```json
+{
+  "success": true,
+  "data": {
+    "verdict": "blocked",
+    "checked_at": "2026-08-15T06:00:00Z",
+    "waited_ms": 0,
+    "tools": [
+      {
+        "id": "gh-ops:sync_issues",
+        "status": "ready",
+        "hash": "sha256/v1:9f86d081884c7d65..."
+      },
+      {
+        "id": "slack:post_message",
+        "status": "unavailable",
+        "reason": "server_disabled",
+        "retryable": false,
+        "action": "enable",
+        "detail": "Server \"slack\" is disabled.",
+        "remediation": "Enable the server (mcpproxy upstream enable <server>)."
+      }
+    ]
+  }
+}
+```
+
+Results are ordered by first occurrence of each unique ID in the request. A
+`ready` result omits all failure fields — `ready` is a status, not a reason. An
+`action` with no value is **omitted**, not `"none"` (matching the health-action
+vocabulary). A malformed ID (missing the `:` separator) gets a **per-ID**
+`not_found` with a format hint in `detail`, never a request-level error — one
+bad entry cannot mask verdicts for the rest. `not_found` results may carry
+`did_you_mean` (up to 3 nearest caller-visible IDs). `waited_ms` is present
+whenever `wait_ms` was requested, including as `0` (see wait semantics).
+
+**Failure reasons** (closed enum, Spec 098 FR-003). Evolution is additive-only;
+treat unknown codes as non-retryable. `server_saturated` is reserved and never
+emitted. When multiple states co-occur for one ID, exactly one reason is
+reported per the fixed precedence order (server-level states before tool-level;
+see the feature page).
+
+| `reason` | `retryable` | Default `action` | Set verdict | CLI exit |
+|---|---|---|---|---|
+| `server_initializing` | true | — (omitted) | `degraded_retryable` | 10 |
+| `server_unhealthy` | true | best-effort from diagnostics (`restart`/`login`/`view_logs`; default `view_logs`) | `degraded_retryable` | 10 |
+| `server_disabled` | false | `enable` | `blocked` | 11 |
+| `server_quarantined` | false | `approve` | `blocked` | 11 |
+| `tool_pending_approval` | false | `approve` | `blocked` | 11 |
+| `tool_changed` | false | `approve` | `blocked` | 11 |
+| `tool_blocked_by_user` | false | `enable` | `blocked` | 11 |
+| `oauth_required` | false | `login` | `blocked` | 11 |
+| `hash_mismatch` | false | `configure` | `blocked` | 11 |
+| `server_not_in_scope` (operator tier only) | false | `configure` | `blocked` | 11 |
+| `tool_denied_by_config` | false | `configure` | `blocked` | 11 |
+| `missing_annotation` | false | `configure` | `blocked` | 11 |
+| `policy_filtered` | false | — (omitted) | `blocked` | 11 |
+| `not_found` | false | `configure` | `unknown_ids` | 12 |
+| `server_not_configured` | false | `configure` | `unknown_ids` | 12 |
+
+A `tool_pending_approval` occurrence for a tool the server's discovery
+snapshot contains but that has **no stored approval record yet** carries
+`action: "restart"` instead of `approve`, with a detail/remediation that
+points at re-discovering the server (`upstream_servers operation="refresh"`
+or `mcpproxy upstream restart <server>`): nothing is listed to approve until
+the server's next discovery pass files the record. The reason code, exit code
+and telemetry counter are unchanged.
+
+The set-level `verdict` is the worst class present:
+`unknown_ids` > `blocked` > `degraded_retryable` > `ready`.
+
+**Status codes:**
+
+- `200` — the check executed; the availability verdict is data in the body.
+- `400` — validation error: invalid JSON, empty or oversized (>100 raw entries)
+  `tools`, a duplicate ID with conflicting `pin_hash` values, `wait_ms` out of
+  range, or an unknown `profile`. The body is read strictly — at most 1 MiB,
+  exactly one JSON object, and no unknown fields — so a mistyped key (`wait`
+  for `wait_ms`, `pin` for `pin_hash`) fails loudly instead of silently
+  weakening the check a pipeline then trusts.
+- `401` — missing or invalid credentials.
+- `503` — the check could not run honestly: the runtime is unavailable, an
+  index/storage/snapshot read failed (reduced-fidelity verdicts are never
+  emitted), or the activity record could not be persisted.
+
+A request rejected with `400`/`503` executed no preflight and writes **no**
+activity record.
+
+**`wait_ms` semantics:** polling happens only while **every** current failure
+is retryable-class (`server_initializing` / `server_unhealthy`). The endpoint
+re-evaluates local state on a floor interval of ≥250 ms until every tool is
+ready, a non-retryable failure appears (waiting cannot help, so it resolves
+immediately), or the deadline passes; it always resolves with current reasons —
+never hangs. Waiting capacity is a small fixed semaphore (4 slots) dedicated to
+preflight; when it is exhausted the request degrades gracefully — it resolves
+immediately with current verdicts and `waited_ms: 0` instead of queuing or
+failing.
+
+**Disclosure tiers:**
+
+- **Operator tier** (admin API key, Unix socket, Windows named pipe — plus the
+  server edition's OAuth **admin**): full results — `hash` pins on ready
+  results, `did_you_mean` suggestions, and the `server_not_in_scope` diagnosis
+  when a supplied `profile` excludes an existing server (with a `detail` noting
+  that a session under that profile sees `not_found`).
+- **Agent-token tier** (agent tokens, the server edition's ordinary OAuth users,
+  and the whole in-band `describe_tool` check surface): scope-silence — an
+  out-of-scope ID's entire result is
+  byte-indistinguishable from an ordinary `not_found` (same wording; no hashes;
+  no `did_you_mean` crossing the scope boundary). `did_you_mean` is computed
+  over the caller-visible index only and never suggests a quarantined server's
+  tools.
+
+**Activity-record guarantee:** every request answered `200` writes an activity
+record **synchronously, before the response is returned** — request ID,
+requested-ID count (unique IDs, after dedup), set verdict, and per-tool reason
+codes (tool IDs and enum
+codes only; no descriptions, no arguments, no hashes; local-only, never
+telemetry). Correlate via the `X-Request-Id` response header and
+`mcpproxy activity list --request-id <id>`.
+
+**Hash pins** (`pin_hash`): format `sha256/v{N}:{hex}`. The hash schema version
+is embedded so a proxy-side hash-algorithm bump is distinguishable from genuine
+upstream drift (both report `hash_mismatch`, with different `detail`). Current
+pins are discoverable on ready preflight results and on the operator-tier tool
+listings above.
 
 ### Registries
 
@@ -683,12 +918,22 @@ additive-compatible and gains two fields:
 | `connected` | bool | mcpproxy registered in the config. Authoritative **only** when `access_state == "accessible"`; `false`/unresolved in the overall listing. |
 | `access_state` | string | `"unknown"` in the overall listing (not content-checked); resolved to `"accessible"`, `"absent"`, `"malformed"`, or `"denied"` by an on-demand single-client read. |
 | `remediation` | string | Present only when `access_state == "denied"`; carries the actionable fix text (App Data toggle + `tccutil reset` command). |
+| `proxy_url` | string | **This** instance's MCP endpoint. Config-derived (no file read), so it is present on the overall listing too. |
+| `registered_url` | string | The endpoint the client's existing entry actually points at, projected through the same sanitizer as a connect preview's `existing_entry_summary.endpoint`: **scheme, host and path only** — query (the `?apikey=` carrier), userinfo and fragment are dropped, and a value that is not an absolute URL is not echoed at all. Resolved only by an on-demand read. |
+| `endpoint_match` | string | How `registered_url` relates to `proxy_url`: `"this"` (the entry addresses this instance), `"other"` (it addresses a different one), `"unknown"` (the entry has no comparable endpoint, e.g. a stdio command). Empty when `connected` is false or nothing was read. |
 
 A client that is installed but not yet content-checked reads as
 `exists=true, connected=false, access_state="unknown"`. Resolving `connected`
 requires an explicit per-client read (the per-client status route below,
 connect/disconnect, or the CLI `mcpproxy connect` command), which is where a
 privacy prompt may legitimately appear.
+
+**`connected` alone is not "connected to this instance."** It means an
+mcpproxy-shaped entry is present in that client's config — and an entry merely
+*named* `mcpproxy` counts, even when its URL addresses another instance on
+another port. Consumers that need the stronger claim must check
+`endpoint_match == "this"`; a UI showing a bare "Connected" on
+`endpoint_match == "other"` is reporting someone else's link as its own.
 
 #### GET /api/v1/connect/{client}
 
@@ -720,6 +965,29 @@ never overwritten. Backups accumulate one per operation and are **never
 deleted automatically**; there is no retention bound, so an undo (below) can
 always find its backup.
 
+`POST` optionally accepts `precondition_token` (Spec 091) — the opaque token
+from the preview this write was confirmed against:
+
+```json
+{ "server_name": "mcpproxy", "force": true, "precondition_token": "…" }
+```
+
+When supplied, the core recomputes the token at write time and, if it no longer
+matches, responds **`409 Conflict`** having written **nothing** (the check runs
+before any backup or write). `force=true` does not override a stale token. When
+omitted, behavior is exactly as before.
+
+The `409` body carries a top-level `action` discriminating the two conflict
+kinds:
+
+| `action` | Meaning | Caller should |
+|----------|---------|---------------|
+| `precondition_failed` | The preview is stale — the config file, the existing entry, or the entry mcpproxy would now write has changed. | Re-fetch the preview; do not blindly retry. |
+| `already_exists` | Pre-existing semantics: an entry with that name is present and `force` was not set. | Confirm with the user, then retry with `force=true` (and a fresh token). |
+
+See [Connect Clients](../features/connect-clients.md) for the token's contents
+and threat model.
+
 #### GET /api/v1/connect/{client}/preview
 
 Returns the exact change a subsequent connect would make — target config path,
@@ -731,6 +999,17 @@ same-named entry. Reads the config on demand to classify create-vs-overwrite,
 so on macOS this may raise an App-Data prompt; a denial returns `403` +
 remediation. Optional `?server_name=` mirrors the name a subsequent connect
 would use.
+
+Spec 091 adds three response fields:
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `existing_entry_summary` | object, present only when `entry_exists=true` | Sanitized description of the entry that would be **replaced**: `entry_name` (the key it actually lives under, which may differ from `server_name` when the write adopts an endpoint-equivalent entry), `type`, `endpoint` (query string, `user:pass@` userinfo and fragment stripped), `command`, `header_names` and `env_names` — **names only, never values**. Built by whitelist projection, so no other config content can reach the response. |
+| `precondition_token` | string, always present | Opaque keyed HMAC binding this preview to the exact pre-write state. Pass it to `POST` (above) to make a stale preview unwritable. Per-core-instance key, never persisted. |
+| `connect_refusal` | string, optional | The verbatim reason a subsequent connect would refuse regardless of user intent (today: a non-create-capable client such as **OpenCode** with no config present). Treat as "Connect unavailable". |
+
+The preview evaluates the refusal with the write's own guard, so the two cannot
+drift. Full semantics: [Connect Clients](../features/connect-clients.md).
 
 #### POST /api/v1/connect/{client}/undo
 
@@ -803,6 +1082,17 @@ Events include:
 - `activity.tool_call.completed` - Tool call finished
 - `activity.policy_decision` - Tool call blocked by policy
 
+The stream is rendered **per connection**. An admin subscriber (API key, Web UI,
+tray over the unix socket) receives every event exactly as the event bus
+published it. For an agent token limited by `allowed_servers` (issue #1166):
+
+| Event | Delivered to a scoped subscriber |
+|-------|----------------------------------|
+| Names a server outside the scope, through `server_name`, `server`, `target_server` or `affected_entity` — every `activity.*`, `oauth.*` and `security.*` event | **No.** The whole frame is dropped: blanking the name still discloses the mutation, its timing, and how many servers are hidden. |
+| `servers.changed` | **Yes, always** — it is coalesced last-write-wins and carries renderable state. The embedded server list is narrowed, `stats` recomputed, and a coalescer extra naming an out-of-scope server is removed. |
+| `config.reloaded`, `config.saved`, `secrets.changed` | **No.** They announce mutations of the admin config document, which `GET /api/v1/config` already answers `403` for this caller. |
+| Everything else (`active_profile.changed`, `activity.system.*`, `sensitive_data.detected`, `security.scanner_changed`, …) | **Yes**, unchanged: no server identity to scope. |
+
 ## Error Responses
 
 ```json
@@ -858,6 +1148,13 @@ Get application info, version, and update availability.
       "http": "127.0.0.1:8080",
       "socket": "/Users/user/.mcpproxy/mcpproxy.sock"
     },
+    "launched_by": "tray",
+    "pid": 4711,
+    "update_policy": {
+      "enabled": true,
+      "channel": "stable",
+      "nudges_suppressed": false
+    },
     "update": {
       "available": true,
       "latest_version": "v1.3.0",
@@ -865,7 +1162,10 @@ Get application info, version, and update availability.
       "checked_at": "2025-01-15T10:30:00Z",
       "is_prerelease": false,
       "install_channel": "homebrew",
-      "update_command": "brew upgrade mcpproxy"
+      "update_command": "brew upgrade mcpproxy",
+      "behind_summary": "8 releases / ~14 weeks behind",
+      "releases_behind": 8,
+      "weeks_behind": 14
     }
   }
 }
@@ -880,6 +1180,12 @@ Get application info, version, and update availability.
 | `listen_addr` | string | Server listen address |
 | `endpoints.http` | string | HTTP API endpoint address |
 | `endpoints.socket` | string | Unix socket path (empty if disabled) |
+| `launched_by` | string | Durable launch provenance of the running core (Spec 092 FR-001a): `tray` when a tray spawned it, `installer` when the macOS PKG postinstall did, `""` when user-launched or unknown. Always present. A tray uses this to decide whether it may stop and respawn a stale core it did not itself start — an empty value means consent is required. |
+| `pid` | integer | OS process id of the running core (Spec 092 FR-002). A tray that only *attached* to a core holds no process handle for it and the core exposes no shutdown endpoint, so this is the mechanism behind the consent-gated "restart the stale core" action. |
+| `update_policy` | object | Effective, hot-reloadable update policy (Spec 092 FR-015). **Always present**, including every field, because the `update` object below is absent both when checking is disabled *and* when no check has produced a result yet — its absence cannot tell a client whether it is allowed to check. |
+| `update_policy.enabled` | boolean | Whether **automatic** update checks are allowed: `update_check.enabled`, with `MCPPROXY_DISABLE_AUTO_UPDATE=true` winning over it. A *user-initiated* "Check for Updates" stays available even when this is `false`. The macOS tray gates its Sparkle feed checks on this field. |
+| `update_policy.channel` | string | Tracked release channel: `stable` or `rc`. **Derived from the running build's own version** — a released stable build always reports `stable` (never RC) and a released RC build always reports `rc`, regardless of `update_check.channel` / `MCPPROXY_ALLOW_PRERELEASE_UPDATES` (those only affect dev/unstamped builds). The tray maps `rc` onto the Sparkle `beta` feed channel, and additionally clamps to `stable` when its own app bundle is a stable release. |
+| `update_policy.nudges_suppressed` | boolean | The core runs in a CI / non-interactive context: UI surfaces must stay quiet while machine-readable fields keep reporting the facts. |
 | `update` | object | Update information (may be null if not checked yet; omitted entirely when update checking is disabled via `update_check.enabled: false` or `MCPPROXY_DISABLE_AUTO_UPDATE=true`) |
 | `update.available` | boolean | Whether a newer version is available |
 | `update.latest_version` | string | Latest version available on GitHub |
@@ -889,6 +1195,14 @@ Get application info, version, and update availability.
 | `update.check_error` | string | Error message if update check failed |
 | `update.install_channel` | string | Detected install channel: `homebrew`, `dmg`, `deb`, `rpm`, `docker`, `go-install`, `windows-installer`, `tarball`, or `unknown`. Always present once detected, even when no update is available. See [Version Updates](/features/version-updates) for how detection works. |
 | `update.update_command` | string | Exact one-line update command for the detected channel. Only present when an update is available **and** the channel has a safe command (`homebrew`, `deb`, `rpm`, `go-install`); omitted for `dmg`/`windows-installer`/`tarball`/`docker`/`unknown` so a possibly-wrong command is never suggested. |
+| `update.behind_summary` | string | Human-readable delta clause, e.g. `8 releases / ~14 weeks behind` (Spec 079 FR-002). **Render this verbatim** rather than rebuilding it from the numbers below — it is authored once in the core so the CLI, Web UI banner and both trays cannot word it differently. Only present when an update is available and the delta could be resolved. |
+| `update.releases_behind` | integer | Releases on the offered channel between the running version and the offered one. Absent when unknown. |
+| `update.releases_behind_saturated` | boolean | `releases_behind` is a **lower bound**: the running build predates the scanned release window, so older releases were never counted. Clients render `N+`. Omitted when false. |
+| `update.weeks_behind` | integer | Whole weeks between the two releases' publish dates. `0` is a real value (a same-week release); *absent* means unknown, so do not conflate them. |
+
+:::note Delta fields degrade silently
+The four `behind_*` / `*_behind` fields are best-effort enrichment: resolving them needs the release list and publish dates, which is a second GitHub request. When that request fails, is rate-limited, or the running build has no release record, the fields are simply **absent** and every surface renders exactly the message it rendered before the delta existed. A missing delta never sets `check_error` and never suppresses the nudge.
+:::
 
 :::tip Update Checking
 MCPProxy automatically checks for updates every 4 hours. The update information is exposed via this endpoint and used by the tray application and web UI to show update notifications. Use `?refresh=true` to force an immediate re-check. Checking is controlled by the `update_check` config block (`enabled`, `channel`) — see [Version Updates](/features/version-updates); when disabled, `?refresh=true` performs no check and the `update` object is omitted.
@@ -927,7 +1241,24 @@ Get secret metadata (not the value).
 
 #### GET /api/v1/sessions
 
-List active MCP sessions.
+List recent MCP sessions.
+
+**Query Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `limit` | integer | Max sessions (1-100, default: 10) |
+| `offset` | integer | Pagination offset (default: 0) |
+| `parent_id` | string | Return only the sub-calls of one `code_execution` (value = the parent record's `request_id`) |
+| `status` | string | Filter by session status: `active`, `closed`. Any other value returns `400`. |
+
+The `status` filter is applied during the storage walk, **before** the `limit`
+truncation, so a long-running session that is still active is returned even when
+newer sessions would otherwise fill the page. When `status` is set, `total`
+counts the matching sessions rather than every stored session.
+
+Caveat (spec 082): handshake-only sessions are not persisted, so a connected but
+idle client does not appear until its first tool call.
 
 #### GET /api/v1/sessions/{id}
 
@@ -945,7 +1276,7 @@ List activity records with filtering and pagination.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `type` | string | Filter by type: `tool_call`, `policy_decision`, `quarantine_change`, `server_change` |
+| `type` | string | Filter by type: `tool_call`, `policy_decision`, `quarantine_change`, `server_change`, `preflight` |
 | `server` | string | Filter by server name |
 | `tool` | string | Filter by tool name |
 | `session_id` | string | Filter by MCP session ID |

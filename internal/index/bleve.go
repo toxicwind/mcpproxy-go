@@ -9,6 +9,7 @@ import (
 	"github.com/blevesearch/bleve/v2"
 	"github.com/blevesearch/bleve/v2/analysis/analyzer/keyword"
 	"github.com/blevesearch/bleve/v2/analysis/analyzer/standard"
+	bquery "github.com/blevesearch/bleve/v2/search/query"
 	"go.uber.org/zap"
 
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
@@ -19,6 +20,13 @@ import (
 // number of docs in a single page; pagination loops over as many pages as
 // needed, so total coverage is never bounded by this value (MCP-3319).
 const defaultSearchPageSize = 10000
+
+const (
+	// maxUnderscoreSearchSegments bounds the extra wildcard clauses generated for
+	// identifier-style queries. Typical MCP tool names stay well below this cap.
+	maxUnderscoreSearchSegments = 16
+	underscoreSegmentBoost      = 5.0
+)
 
 // BleveIndex wraps Bleve index operations
 type BleveIndex struct {
@@ -153,13 +161,32 @@ func (b *BleveIndex) Close() error {
 	return b.index.Close()
 }
 
-// IndexTool indexes a tool document
-func (b *BleveIndex) IndexTool(toolMeta *config.ToolMetadata) error {
-	// Extract just the tool name (remove server prefix)
-	toolName := toolMeta.Name
-	if parts := strings.SplitN(toolMeta.Name, ":", 2); len(parts) == 2 {
-		toolName = parts[1]
-	}
+// toolDocument projects tool metadata onto the stored document and its docID.
+//
+// Identity (Spec 105 FR-009): the docID is "<server>:<raw name>" where the raw
+// name is the exact upstream-reported name (config.RawToolName), so "erase"
+// and "ns:erase" on one server are two documents. The previous derivation
+// split ToolMetadata.Name at its FIRST colon, which read the namespace prefix
+// of a raw "ns:erase" as if it were a server prefix and collapsed both tools
+// onto "<server>:erase" (last writer wins). A document written under the old
+// derivation is not migrated by hand: the runtime's differential index update
+// (applyDifferentialToolUpdate) keys both sides by raw name, so the first
+// discovery after upgrade re-hashes the collapsed document under its docID
+// and adds the namespaced sibling under its own exact id.
+//
+// The STORED fields are byte-for-byte what they were before FR-009 for every
+// metadata shape that does not carry a colon in its raw name: tool_name is the
+// raw name and full_tool_name is ToolMetadata.Name verbatim (the raw name for
+// discovery-shaped metadata, the canonical id for index-read or fixture
+// metadata). Both are SCORED fields — the exact-match TermQuery on
+// full_tool_name (boost 4.0) and the field-less _all MatchQuery in SearchTools
+// — so storing the canonical id there instead moved every administrator
+// retrieve_tools score for production-shaped documents (SC-005). The tool's
+// identity is therefore never derived from full_tool_name on read-back;
+// readToolMetadata takes it from the docID.
+func toolDocument(toolMeta *config.ToolMetadata) (string, *ToolDocument) {
+	toolName := config.RawToolName(toolMeta)
+	docID := toolDocID(toolMeta.ServerName, toolName)
 
 	// Create combined searchable text for better full-text search
 	searchableText := fmt.Sprintf("%s %s %s %s",
@@ -180,16 +207,56 @@ func (b *BleveIndex) IndexTool(toolMeta *config.ToolMetadata) error {
 		SearchableText:   searchableText,
 	}
 
-	// Use server:tool format as document ID for uniqueness
-	docID := fmt.Sprintf("%s:%s", toolMeta.ServerName, toolName)
+	return docID, doc
+}
 
-	b.logger.Debug("Indexing tool", zap.String("doc_id", docID), zap.String("tool_name", toolName))
+// toolDocID is the single place the "<server>:<raw name>" docID is spelled, so
+// IndexTool, BatchIndex and DeleteTool can never disagree on a tool's identity.
+func toolDocID(serverName, rawName string) string {
+	return config.CanonicalToolName(serverName, rawName)
+}
+
+// readToolMetadata rebuilds tool metadata from a stored hit. Identity comes
+// from the docID alone (Spec 105 FR-009): the docID is "<server>:<raw name>"
+// for documents written by toolDocument, so the canonical Name (#871) IS the
+// docID and RawName is the docID with exactly this server's own prefix
+// trimmed once — never re-derived from the stored tool_name or
+// full_tool_name fields. Those are search fields, not identity: for a
+// document written before FR-009 tool_name holds the collapsed suffix
+// ("erase" for a raw "ns:erase") and full_tool_name the raw name, and a raw
+// name that begins with the server's own prefix ("a:erase" on server "a",
+// docID "a:a:erase") would be mistaken by the CanonicalToolName guard for an
+// already-canonical "a:erase".
+func readToolMetadata(docID string, fields map[string]interface{}) *config.ToolMetadata {
+	serverName := getStringField(fields, "server_name")
+	canonical := docID
+	if canonical == "" {
+		// Defensive only: bleve always reports hit.ID. Fall back to the stored
+		// name so a malformed hit still renders rather than vanishing.
+		canonical = CanonicalToolName(serverName, getStringField(fields, "full_tool_name"))
+	}
+	return &config.ToolMetadata{
+		Name:             canonical,
+		RawName:          strings.TrimPrefix(canonical, serverName+":"),
+		ServerName:       serverName,
+		Description:      getStringField(fields, "description"),
+		ParamsJSON:       getStringField(fields, "params_json"),
+		OutputSchemaJSON: getStringField(fields, "output_schema_json"),
+		Hash:             getStringField(fields, "hash"),
+	}
+}
+
+// IndexTool indexes a tool document
+func (b *BleveIndex) IndexTool(toolMeta *config.ToolMetadata) error {
+	docID, doc := toolDocument(toolMeta)
+
+	b.logger.Debug("Indexing tool", zap.String("doc_id", docID), zap.String("tool_name", doc.ToolName))
 	return b.index.Index(docID, doc)
 }
 
-// DeleteTool removes a tool from the index
+// DeleteTool removes a tool from the index, addressed by its exact raw name.
 func (b *BleveIndex) DeleteTool(serverName, toolName string) error {
-	docID := fmt.Sprintf("%s:%s", serverName, toolName)
+	docID := toolDocID(serverName, toolName)
 
 	b.logger.Debug("Deleting tool from index", zap.String("doc_id", docID))
 	return b.index.Delete(docID)
@@ -223,12 +290,12 @@ func (b *BleveIndex) DeleteServerTools(serverName string) error {
 	return nil
 }
 
-// SearchTools searches for tools using multiple query strategies for better results
-func (b *BleveIndex) SearchTools(queryStr string, limit int) ([]*config.SearchResult, error) {
-	if queryStr == "" {
-		return nil, fmt.Errorf("search query cannot be empty")
-	}
-
+// buildToolSearchQuery is the ONE boolean query both SearchTools and
+// SearchToolsScoped run (Spec 107 T075a): every clause is a Should, so
+// matching is boolean and corpus-independent, and no scoped variant may add
+// a Must term on server_name — that would change BM25 scores, and the scoped
+// path must return the unfiltered search's scores for the hits it keeps.
+func buildToolSearchQuery(queryStr string) *bquery.BooleanQuery {
 	// Create a boolean query to combine multiple search strategies
 	boolQuery := bleve.NewBooleanQuery()
 
@@ -269,9 +336,16 @@ func (b *BleveIndex) SearchTools(queryStr string, limit int) ([]*config.SearchRe
 	searchableTextQuery.SetBoost(1.5)
 	boolQuery.AddShould(searchableTextQuery)
 
-	// Create search request
-	searchReq := bleve.NewSearchRequest(boolQuery)
-	searchReq.Size = limit
+	return boolQuery
+}
+
+// newToolSearchRequest builds the ranked-window request SearchTools and
+// SearchToolsScoped share: the same fields, highlight and the deterministic
+// score-then-id sort, over the window [from, from+size).
+func newToolSearchRequest(q bquery.Query, from, size int) *bleve.SearchRequest {
+	searchReq := bleve.NewSearchRequest(q)
+	searchReq.From = from
+	searchReq.Size = size
 	searchReq.Fields = []string{"tool_name", "full_tool_name", "server_name", "description", "params_json", "output_schema_json", "hash"}
 	searchReq.Highlight = bleve.NewHighlight()
 
@@ -283,6 +357,17 @@ func (b *BleveIndex) SearchTools(queryStr string, limit int) ([]*config.SearchRe
 	// SortBy is applied before truncating to Size, so it also stabilizes which
 	// tied hits survive the limit boundary.
 	searchReq.SortBy([]string{"-_score", "_id"})
+	return searchReq
+}
+
+// SearchTools searches for tools using multiple query strategies for better results
+func (b *BleveIndex) SearchTools(queryStr string, limit int) ([]*config.SearchResult, error) {
+	if queryStr == "" {
+		return nil, fmt.Errorf("search query cannot be empty")
+	}
+
+	boolQuery := buildToolSearchQuery(queryStr)
+	searchReq := newToolSearchRequest(boolQuery, 0, limit)
 
 	b.logger.Debug("Searching tools with enhanced query", zap.String("query", queryStr), zap.Int("limit", limit))
 
@@ -291,27 +376,157 @@ func (b *BleveIndex) SearchTools(queryStr string, limit int) ([]*config.SearchRe
 		return nil, fmt.Errorf("search failed: %w", err)
 	}
 
+	// Identifier queries often include only the meaningful segments of a
+	// longer tool name. If the legacy query did not find a canonical exact
+	// match, repeat it with an additional segment-aware signal. This preserves
+	// exact-name scores while letting boundary matches outrank substring hits.
+	segmentQuery := underscoreSegmentQuery(queryStr)
+	if segmentQuery != nil {
+		hasExactToolName := false
+		for _, hit := range searchResult.Hits {
+			if fieldsContainExactToolName(hit.Fields, queryStr) {
+				hasExactToolName = true
+				break
+			}
+		}
+
+		if !hasExactToolName {
+			boolQuery.AddShould(segmentQuery)
+			searchResult, err = b.index.Search(searchReq)
+			if err != nil {
+				return nil, fmt.Errorf("underscore segment search failed: %w", err)
+			}
+		}
+	}
+
 	// Convert results
 	var results []*config.SearchResult
 	for _, hit := range searchResult.Hits {
-		serverName := getStringField(hit.Fields, "server_name")
-		toolMeta := &config.ToolMetadata{
-			Name:             CanonicalToolName(serverName, getStringField(hit.Fields, "full_tool_name")),
-			ServerName:       serverName,
-			Description:      getStringField(hit.Fields, "description"),
-			ParamsJSON:       getStringField(hit.Fields, "params_json"),
-			OutputSchemaJSON: getStringField(hit.Fields, "output_schema_json"),
-			Hash:             getStringField(hit.Fields, "hash"),
-		}
-
 		results = append(results, &config.SearchResult{
-			Tool:  toolMeta,
+			Tool:  readToolMetadata(hit.ID, hit.Fields),
 			Score: hit.Score,
 		})
 	}
 
 	b.logger.Debug("Found tools matching query", zap.Int("count", len(results)), zap.String("query", queryStr))
 	return results, nil
+}
+
+// scopedSearchMinPage is the smallest page SearchToolsScoped walks the ranked
+// result with; the page is max(limit, scopedSearchMinPage).
+const scopedSearchMinPage = 256
+
+// SearchToolsScoped is SearchTools for a caller who may see only some servers
+// (Spec 107 T075a; Spec 105 "Ranking under scope"): the result is the top-
+// `limit` of the SAME ranked search, filtered to servers `inScope` admits
+// BEFORE the cut, with the unfiltered scores. It runs the identical boolean
+// query (no extra clause — a Must term on server_name would change scores)
+// and the identical score-then-id sort, and pages through the ranked result
+// EXHAUSTIVELY with From/Size: each page is filtered through inScope, and
+// paging stops only when `limit` in-scope hits have been collected or the
+// window has passed searchResult.Total. There is deliberately NO result cap:
+// any cap would let a hidden population larger than the cap displace an
+// entitled hit, and make membership and `total` differ between a corpus that
+// contains the hidden servers and one that does not — the existence oracle
+// FR-010 forbids. A caller whose predicate is nil sees nothing (fail closed)
+// without a search.
+func (b *BleveIndex) SearchToolsScoped(queryStr string, limit int, inScope func(serverName string) bool) ([]*config.SearchResult, error) {
+	if queryStr == "" {
+		return nil, fmt.Errorf("search query cannot be empty")
+	}
+	if inScope == nil || limit <= 0 {
+		return []*config.SearchResult{}, nil
+	}
+
+	q := buildToolSearchQuery(queryStr)
+	pageSize := limit
+	if pageSize < scopedSearchMinPage {
+		pageSize = scopedSearchMinPage
+	}
+
+	b.logger.Debug("Searching tools with scoped query", zap.String("query", queryStr), zap.Int("limit", limit))
+
+	results := make([]*config.SearchResult, 0, limit)
+	for from := 0; ; from += pageSize {
+		searchResult, err := b.index.Search(newToolSearchRequest(q, from, pageSize))
+		if err != nil {
+			return nil, fmt.Errorf("search failed: %w", err)
+		}
+		for _, hit := range searchResult.Hits {
+			tool := readToolMetadata(hit.ID, hit.Fields)
+			if !inScope(tool.ServerName) {
+				continue
+			}
+			results = append(results, &config.SearchResult{Tool: tool, Score: hit.Score})
+			if len(results) >= limit {
+				return results, nil
+			}
+		}
+		if len(searchResult.Hits) == 0 || uint64(from+pageSize) >= searchResult.Total {
+			break
+		}
+	}
+
+	b.logger.Debug("Found scoped tools matching query", zap.Int("count", len(results)), zap.String("query", queryStr))
+	return results, nil
+}
+
+func fieldsContainExactToolName(fields map[string]interface{}, queryStr string) bool {
+	for _, field := range []string{"tool_name", "full_tool_name"} {
+		if value, ok := fields[field].(string); ok && value == queryStr {
+			return true
+		}
+	}
+	return false
+}
+
+// underscoreSegmentQuery matches each underscore-delimited query segment at a
+// complete segment boundary in the keyword-indexed tool_name field. Segment
+// order is intentionally irrelevant, but every segment is required.
+func underscoreSegmentQuery(queryStr string) bquery.Query {
+	segments := strings.Split(queryStr, "_")
+	if len(segments) < 2 || len(segments) > maxUnderscoreSearchSegments {
+		return nil
+	}
+
+	segmentQueries := make([]bquery.Query, 0, len(segments))
+	for _, segment := range segments {
+		if !isASCIIAlphanumeric(segment) {
+			return nil
+		}
+
+		exact := bleve.NewTermQuery(segment)
+		exact.SetField("tool_name")
+		exact.SetBoost(underscoreSegmentBoost)
+
+		prefix := bleve.NewPrefixQuery(segment + "_")
+		prefix.SetField("tool_name")
+		prefix.SetBoost(underscoreSegmentBoost)
+
+		middle := bleve.NewWildcardQuery("*_" + segment + "_*")
+		middle.SetField("tool_name")
+		middle.SetBoost(underscoreSegmentBoost)
+
+		suffix := bleve.NewWildcardQuery("*_" + segment)
+		suffix.SetField("tool_name")
+		suffix.SetBoost(underscoreSegmentBoost)
+
+		segmentQueries = append(segmentQueries, bleve.NewDisjunctionQuery(exact, prefix, middle, suffix))
+	}
+
+	return bleve.NewConjunctionQuery(segmentQueries...)
+}
+
+func isASCIIAlphanumeric(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, r := range value {
+		if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') {
+			return false
+		}
+	}
+	return true
 }
 
 // GetDocumentCount returns the number of documents in the index
@@ -356,32 +571,7 @@ func (b *BleveIndex) BatchIndex(tools []*config.ToolMetadata) error {
 	batch := b.index.NewBatch()
 
 	for _, toolMeta := range tools {
-		// Extract just the tool name (remove server prefix)
-		toolName := toolMeta.Name
-		if parts := strings.SplitN(toolMeta.Name, ":", 2); len(parts) == 2 {
-			toolName = parts[1]
-		}
-
-		// Create combined searchable text
-		searchableText := fmt.Sprintf("%s %s %s %s",
-			toolName,
-			toolMeta.Name,
-			toolMeta.Description,
-			toolMeta.ParamsJSON)
-
-		doc := &ToolDocument{
-			ToolName:         toolName,
-			FullToolName:     toolMeta.Name,
-			ServerName:       toolMeta.ServerName,
-			Description:      toolMeta.Description,
-			ParamsJSON:       toolMeta.ParamsJSON,
-			OutputSchemaJSON: toolMeta.OutputSchemaJSON,
-			Hash:             toolMeta.Hash,
-			Tags:             "",
-			SearchableText:   searchableText,
-		}
-
-		docID := fmt.Sprintf("%s:%s", toolMeta.ServerName, toolName)
+		docID, doc := toolDocument(toolMeta)
 		_ = batch.Index(docID, doc)
 	}
 
@@ -430,16 +620,7 @@ func (b *BleveIndex) GetToolsByServer(serverName string) ([]*config.ToolMetadata
 		}
 
 		for _, hit := range searchResult.Hits {
-			serverName := getStringField(hit.Fields, "server_name")
-			toolMeta := &config.ToolMetadata{
-				Name:             CanonicalToolName(serverName, getStringField(hit.Fields, "full_tool_name")),
-				ServerName:       serverName,
-				Description:      getStringField(hit.Fields, "description"),
-				ParamsJSON:       getStringField(hit.Fields, "params_json"),
-				OutputSchemaJSON: getStringField(hit.Fields, "output_schema_json"),
-				Hash:             getStringField(hit.Fields, "hash"),
-			}
-			tools = append(tools, toolMeta)
+			tools = append(tools, readToolMetadata(hit.ID, hit.Fields))
 		}
 
 		if len(searchResult.Hits) < b.searchPageSize {

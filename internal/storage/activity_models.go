@@ -37,6 +37,21 @@ const (
 	// event: acquisition, refresh, injection, or connect (Spec 074 T10). It
 	// carries attribution (UserID, ServerName) and never any token/secret value.
 	ActivityTypeCredentialBroker ActivityType = "credential_broker"
+	// ActivityTypePreflight represents one executed required-tools preflight
+	// (Spec 098 FR-014). The record is written SYNCHRONOUSLY before the
+	// preflight is answered — see runtime.ActivityService.RecordPreflight — so a
+	// caller that got a verdict can always find the run that produced it.
+	//
+	// A preflight is set-scoped, not server-scoped: ServerName and ToolName stay
+	// empty and the per-tool detail lives in Metadata under the MetadataKeyPreflight*
+	// keys. RequestID is the correlation handle (`activity list --request-id`).
+	ActivityTypePreflight ActivityType = "preflight"
+
+	// ActivityTypePromptGet represents an upstream prompts/get fetch (Finding F10).
+	// Mirrors the tool-call path: ServerName is the upstream server, ToolName is
+	// the prompt name, Arguments are the prompt arguments (scanned for sensitive
+	// data like tool args), RequestID is the correlation handle.
+	ActivityTypePromptGet ActivityType = "prompt_get"
 )
 
 // ValidActivityTypes is the list of all valid activity types for filtering (Spec 024)
@@ -52,7 +67,110 @@ var ValidActivityTypes = []string{
 	string(ActivityTypeToolQuarantineChange),
 	string(ActivityTypeSecurityScan),
 	string(ActivityTypeCredentialBroker),
+	string(ActivityTypePreflight),
+	string(ActivityTypePromptGet),
 }
+
+// Activity status vocabulary. Activity status is a CLOSED vocabulary: every
+// consumer (filters, summaries, usage aggregation, exports, Web UI badges)
+// switches on these values, so a new status has to be threaded through all of
+// them — see spec 093 FR-012.
+const (
+	// ActivityStatusSuccess is a call the upstream answered normally.
+	ActivityStatusSuccess = "success"
+	// ActivityStatusError is a call that failed (transport, upstream error, or
+	// an isError:true answer).
+	ActivityStatusError = "error"
+	// ActivityStatusBlocked is a call a policy prevented from running.
+	ActivityStatusBlocked = "blocked"
+	// ActivityStatusRejected is a call shed by a concurrency limiter before it
+	// ever reached the upstream (spec 093). Distinct from "error" on purpose:
+	// nothing went wrong upstream, the proxy applied backpressure. The record's
+	// metadata carries rejection_reason (queue_full | queue_timeout) and
+	// rejection_scope (server | global).
+	ActivityStatusRejected = "rejected"
+)
+
+// ValidActivityStatuses is the closed status vocabulary, for filter validation
+// and API documentation.
+var ValidActivityStatuses = []string{
+	ActivityStatusSuccess,
+	ActivityStatusError,
+	ActivityStatusBlocked,
+	ActivityStatusRejected,
+}
+
+// InternalCallToolPrefix marks the internal_tool_call records that MIRROR a
+// direct upstream dispatch (call_tool_read / _write / _destructive). Every one
+// of them is paired with a tool_call record for the same dispatch, which is why
+// both the list filter and the usage aggregate key off this prefix to avoid
+// counting one call twice. Internal records WITHOUT it (retrieve_tools,
+// describe_tool, code_execution, upstream_servers, quarantine_security …) are
+// mcpproxy's own work and have no paired record.
+const InternalCallToolPrefix = "call_tool_"
+
+// Metadata keys carried by an ActivityStatusRejected record (spec 093 FR-012).
+const (
+	// MetadataKeyRejectionReason is "queue_full" or "queue_timeout".
+	MetadataKeyRejectionReason = "rejection_reason"
+	// MetadataKeyRejectionScope is "server" or "global".
+	MetadataKeyRejectionScope = "rejection_scope"
+	// MetadataKeyRejectionLimit is the cap that was in force in that scope.
+	MetadataKeyRejectionLimit = "rejection_limit"
+	// MetadataKeyRejectionRetryAfterMs is the Retry-After hint in milliseconds.
+	MetadataKeyRejectionRetryAfterMs = "rejection_retry_after_ms"
+)
+
+// Metadata keys carried by an ActivityTypePreflight record (spec 098 FR-014,
+// data-model.md "Activity record"). The payload is deliberately small and
+// enum-only: reason CODES and counts, never tool descriptions or arguments.
+const (
+	// MetadataKeyPreflightVerdict is the set-level verdict
+	// (ready|degraded_retryable|blocked|unknown_ids).
+	MetadataKeyPreflightVerdict = "verdict"
+	// MetadataKeyPreflightIDsCount is the number of unique tool ids evaluated.
+	MetadataKeyPreflightIDsCount = "ids_count"
+	// MetadataKeyPreflightReasons is a {reason_code: count} rollup over the
+	// unavailable results — the shape a dashboard or CLI summary reads.
+	MetadataKeyPreflightReasons = "reasons"
+	// MetadataKeyPreflightPerTool is the ordered per-tool detail:
+	// [{id, status, reason?}] using the PreflightPerTool* keys below.
+	MetadataKeyPreflightPerTool = "per_tool"
+	// MetadataKeyPreflightSurface names the surface that ran the preflight when
+	// it is not the REST endpoint — currently only "mcp-check", the in-band
+	// describe_tool check mode (spec 099 FR-013). It is OMITTED for the REST
+	// surface, whose records predate it and stay byte-identical.
+	MetadataKeyPreflightSurface = "surface"
+
+	// MetadataKeyPreflightArguments records the in-band caller's request AS
+	// SENT, so the raw requested-id count stays recoverable from the record
+	// even though MetadataKeyPreflightIDsCount is the UNIQUE count both
+	// surfaces agree on (spec 099 FR-013). It carries the PreflightArgumentsKey*
+	// members below: still ids and enum-valued filter names, never descriptions
+	// or upstream arguments. OMITTED for the REST surface, whose records
+	// predate it and stay byte-identical.
+	MetadataKeyPreflightArguments = "arguments"
+
+	// Keys inside MetadataKeyPreflightArguments.
+	//
+	// PreflightArgumentsKeyToolIDs is the raw tool_ids array: request order,
+	// untrimmed, duplicates intact — len() is the raw requested count.
+	PreflightArgumentsKeyToolIDs = "tool_ids"
+	// PreflightArgumentsKeyFilters lists the annotation filters that were in
+	// effect, in the order describe_tool declares them. Absent when none were.
+	PreflightArgumentsKeyFilters = "filters"
+
+	// PreflightSurfaceMCPCheck marks a record written by describe_tool check
+	// mode. It matches the `surface` value the spec-099 sabotage-matrix rows
+	// carry, so a matrix row and an activity record name the surface the same
+	// way.
+	PreflightSurfaceMCPCheck = "mcp-check"
+
+	// Keys inside one MetadataKeyPreflightPerTool entry.
+	PreflightPerToolKeyID     = "id"
+	PreflightPerToolKeyStatus = "status"
+	PreflightPerToolKeyReason = "reason"
+)
 
 // ActivitySource indicates how the activity was triggered
 type ActivitySource string
@@ -78,13 +196,25 @@ type ActivityRecord struct {
 	Arguments         map[string]interface{} `json:"arguments,omitempty"`          // Tool call arguments
 	Response          string                 `json:"response,omitempty"`           // Tool response (potentially truncated)
 	ResponseTruncated bool                   `json:"response_truncated,omitempty"` // True if response was truncated
-	Status            string                 `json:"status"`                       // Result status: "success", "error", "blocked"
+	Status            string                 `json:"status"`                       // Result status: "success", "error", "blocked", "rejected"
 	ErrorMessage      string                 `json:"error_message,omitempty"`      // Error details if status is "error"
 	DurationMs        int64                  `json:"duration_ms,omitempty"`        // Execution duration in milliseconds
 	Timestamp         time.Time              `json:"timestamp"`                    // When activity occurred
 	SessionID         string                 `json:"session_id,omitempty"`         // MCP transport session ID (regenerated on every reconnect)
 	RequestID         string                 `json:"request_id,omitempty"`         // HTTP request ID for correlation
 	Metadata          map[string]interface{} `json:"metadata,omitempty"`           // Additional context-specific data
+
+	// ParentID is the correlation id of the record that CAUSED this one: today
+	// the code_execution call whose sandbox issued this sub-call. It equals the
+	// parent record's RequestID, so the two directions are one query each:
+	//   parent → children:  /api/v1/activity?parent_id=<parent request_id>
+	//   child  → parent:    /api/v1/activity?request_id=<child parent_id>
+	//
+	// First-class rather than metadata for the same reason as WorkSessionID:
+	// ActivityFilter.Matches compares struct fields, so a value tucked into
+	// Metadata would be stored but not filterable. Empty for every top-level
+	// call and for every record written before this field existed.
+	ParentID string `json:"parent_id,omitempty"`
 
 	// WorkSessionID groups records into one unit of USER WORK (Spec 082): one
 	// client, in one project, under one principal, across reconnects. Unlike
@@ -124,13 +254,17 @@ type ActivityFilter struct {
 	Server     string    // Filter by server name
 	Tool       string    // Filter by tool name
 	SessionID  string    // Filter by MCP transport session
-	Status     string    // Filter by status (success/error/blocked)
+	Status     string    // Filter by status (success/error/blocked/rejected)
 	StartTime  time.Time // Activities after this time
 	EndTime    time.Time // Activities before this time
 	Limit      int       // Max records to return (default 50, max 100)
 	Offset     int       // Pagination offset
 	IntentType string    // Filter by intent operation type: read, write, destructive (Spec 018)
 	RequestID  string    // Filter by HTTP request ID for correlation (Spec 021)
+
+	// ParentID selects the CHILDREN of one parent call (exact match on
+	// ActivityRecord.ParentID) — the sub-calls a code_execution script issued.
+	ParentID string
 
 	// WorkSessionID filters by a unit of user work (Spec 082) — one client, one
 	// project, across reconnects. This is what the UI's "Session" filter means;
@@ -146,9 +280,41 @@ type ActivityFilter struct {
 	AgentName string // Filter by agent token name in metadata
 	AuthType  string // Filter by auth type: "admin" or "agent"
 
-	// ExcludeCallToolSuccess filters out successful call_tool_* internal tool calls.
-	// These appear as duplicates since the actual upstream tool call is also logged.
-	// Failed call_tool_* calls are still shown (no corresponding tool_call entry).
+	// AllowedServers is an AUTHORIZATION filter, not a user-facing one (#1166
+	// follow-up): nil means unrestricted, a non-nil slice restricts matches to
+	// records attributable to one of these server names ("*" is a wildcard, as
+	// in auth.AuthContext.AllowedServers).
+	//
+	// It lives HERE, in the predicate ListActivities and StreamActivities both
+	// run, rather than as a post-filter over a returned page. A post-filter
+	// shrinks the page while `total` keeps counting the records it removed —
+	// which is its own count oracle for exactly what was hidden, and breaks
+	// pagination for the caller besides.
+	//
+	// An empty non-nil slice matches NOTHING, deliberately: it is the shape a
+	// token allowed no servers produces, and treating it as unrestricted would
+	// open the door it exists to close. A record with no ServerName (system
+	// start/stop, config change) is likewise not matched — those are
+	// operator-plane events with no server to be entitled to.
+	AllowedServers []string
+
+	// UserID is an AUTHORIZATION filter (Spec 107 FR-002, T086), evaluated
+	// beside AllowedServers: empty means unrestricted (every existing caller
+	// of ListActivities/StreamActivities), a non-empty value restricts
+	// matches to records whose UserID equals this exactly. It exists so
+	// GET /api/v1/user/activity can select "my own records on servers I am
+	// entitled to" inside ONE storage query, rather than fetching a page and
+	// post-filtering it — which shrinks the returned page while `total` keeps
+	// counting the records that were dropped.
+	UserID string
+
+	// ExcludeCallToolSuccess filters out call_tool_* internal tool calls, which
+	// are always paired with a canonical record carrying the same request_id:
+	// successful and failed ones with the upstream tool_call record
+	// (mcp.go emits both on every dispatched outcome), rejected ones with the
+	// concurrency limiter's shed record (spec 093). Pre-dispatch failures
+	// (arg validation, server not found) emit ONLY a tool_call record, so no
+	// call_tool_* row is ever the sole witness of a call.
 	// Default: true (to avoid duplicate entries in UI/CLI)
 	ExcludeCallToolSuccess bool
 }
@@ -190,7 +356,25 @@ func (f *ActivityFilter) ValidateForExport() {
 	}
 }
 
-// Matches checks if an activity record matches the filter criteria
+// serverAllowed applies the AllowedServers authorization filter. nil means
+// unrestricted; see the field comment for why empty-but-non-nil matches nothing
+// and why an unattributed record is not matched.
+func (f *ActivityFilter) serverAllowed(serverName string) bool {
+	if f.AllowedServers == nil {
+		return true
+	}
+	if serverName == "" {
+		return false
+	}
+	for _, allowed := range f.AllowedServers {
+		if allowed == "*" || allowed == serverName {
+			return true
+		}
+	}
+	return false
+}
+
+// Matches checks if an activity record matches the filter criteria.
 func (f *ActivityFilter) Matches(record *ActivityRecord) bool {
 	// Check types filter (Spec 024: OR logic for multiple types)
 	if len(f.Types) > 0 {
@@ -204,6 +388,15 @@ func (f *ActivityFilter) Matches(record *ActivityRecord) bool {
 		if !typeMatches {
 			return false
 		}
+	}
+
+	// Authorization filter first: a caller must never be able to widen its own
+	// visibility with any of the query-string filters below it.
+	if !f.serverAllowed(record.ServerName) {
+		return false
+	}
+	if f.UserID != "" && record.UserID != f.UserID {
+		return false
 	}
 
 	// Check server filter
@@ -252,13 +445,23 @@ func (f *ActivityFilter) Matches(record *ActivityRecord) bool {
 		return false
 	}
 
-	// Exclude successful call_tool_* internal tool calls to avoid duplicates
-	// These have a corresponding tool_call entry that shows the actual upstream call.
-	// Failed call_tool_* calls are shown since they have no corresponding tool_call.
+	// Check parent_id filter: the sub-calls one code_execution issued.
+	if f.ParentID != "" && record.ParentID != f.ParentID {
+		return false
+	}
+
+	// Exclude call_tool_* internal tool calls that are already represented by a
+	// canonical tool_call entry, so one dispatch is never counted twice.
+	//
+	// A SUCCESSFUL or FAILED call_tool_* has the upstream's own tool_call
+	// record (mcp.go emits both on every dispatched outcome, sharing one
+	// request_id); a REJECTED one has the record the concurrency limiter wrote
+	// at the shed (spec 093 FR-012), which every origin produces — the variant
+	// handler merely adds a second, MCP-flavoured row on top of it. So every
+	// call_tool_* row duplicates a canonical record and is hidden by default.
 	if f.ExcludeCallToolSuccess {
 		if record.Type == ActivityTypeInternalToolCall &&
-			record.Status == "success" &&
-			strings.HasPrefix(record.ToolName, "call_tool_") {
+			strings.HasPrefix(record.ToolName, InternalCallToolPrefix) {
 			return false
 		}
 	}

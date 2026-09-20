@@ -340,6 +340,42 @@ func MergeServerConfig(base, patch *ServerConfig, opts MergeOptions) (*ServerCon
 		merged.InitTimeout = &it
 	}
 
+	// ExposePrompts: same tri-state patch semantics as InitTimeout — a
+	// non-nil pointer sets/replaces the per-server override (including an
+	// explicit false = opt out), nil leaves the base value untouched.
+	if patch.ExposePrompts != nil {
+		v := *patch.ExposePrompts
+		if diff != nil && (base.ExposePrompts == nil || *base.ExposePrompts != v) {
+			diff.Modified["expose_prompts"] = FieldChange{Path: "expose_prompts", From: base.ExposePrompts, To: patch.ExposePrompts}
+		}
+		merged.ExposePrompts = &v
+	}
+
+	// Per-server concurrency overrides (spec 093, FR-020(c)): same tri-state
+	// patch semantics as InitTimeout — a non-nil pointer sets/replaces the
+	// override (including an explicit 0 = opt out), nil leaves the base value.
+	if patch.MaxConcurrentRequests != nil {
+		v := *patch.MaxConcurrentRequests
+		if diff != nil && (base.MaxConcurrentRequests == nil || *base.MaxConcurrentRequests != v) {
+			diff.Modified["max_concurrent_requests"] = FieldChange{Path: "max_concurrent_requests", From: base.MaxConcurrentRequests, To: patch.MaxConcurrentRequests}
+		}
+		merged.MaxConcurrentRequests = &v
+	}
+	if patch.QueueSize != nil {
+		v := *patch.QueueSize
+		if diff != nil && (base.QueueSize == nil || *base.QueueSize != v) {
+			diff.Modified["queue_size"] = FieldChange{Path: "queue_size", From: base.QueueSize, To: patch.QueueSize}
+		}
+		merged.QueueSize = &v
+	}
+	if patch.QueueTimeout != nil {
+		v := *patch.QueueTimeout
+		if diff != nil && (base.QueueTimeout == nil || *base.QueueTimeout != v) {
+			diff.Modified["queue_timeout"] = FieldChange{Path: "queue_timeout", From: base.QueueTimeout, To: patch.QueueTimeout}
+		}
+		merged.QueueTimeout = &v
+	}
+
 	// Always update the Updated timestamp
 	merged.Updated = time.Now()
 
@@ -460,6 +496,15 @@ func MergeIsolationConfig(base, patch *IsolationConfig, removeIfNil bool) *Isola
 	// This allows distinguishing between "not set" and "set to false"
 	if patch.Enabled != nil {
 		result.Enabled = patch.Enabled
+	}
+
+	// Mode (*IsolationMode) has the same tri-state semantics as Enabled: nil
+	// means "not set in the patch", so only a non-nil value overrides. Missing
+	// this case silently dropped the per-server isolation mode on every
+	// unrelated patch (GH #1142).
+	if patch.Mode != nil {
+		mode := *patch.Mode
+		result.Mode = &mode
 	}
 
 	if patch.Image != "" {
@@ -615,19 +660,51 @@ func CopyServerConfig(src *ServerConfig) *ServerConfig {
 		dst.InitTimeout = &it
 	}
 
-	// Copy the per-upstream auth-broker block by value (spec 074, server edition).
-	// In the personal edition AuthBrokerConfig is an empty stub struct, so this is
-	// a no-op there; copying by value keeps the pointer from being shared.
-	if src.AuthBroker != nil {
-		broker := *src.AuthBroker
-		dst.AuthBroker = &broker
+	// Per-server concurrency overrides (spec 093): tri-state pointers copied by
+	// value so a copy-on-write snapshot never shares state with the live config.
+	if src.MaxConcurrentRequests != nil {
+		v := *src.MaxConcurrentRequests
+		dst.MaxConcurrentRequests = &v
+	}
+	if src.QueueSize != nil {
+		v := *src.QueueSize
+		dst.QueueSize = &v
+	}
+	if src.QueueTimeout != nil {
+		v := *src.QueueTimeout
+		dst.QueueTimeout = &v
+	}
+
+	// Deep-copy the per-upstream auth-broker block (spec 074, server edition).
+	// In the personal edition AuthBrokerConfig is a raw-JSON carrier (Spec 107
+	// FR-040); a value copy would alias its backing array, so both editions
+	// clone through the build-tagged Clone().
+	dst.AuthBroker = src.AuthBroker.Clone()
+
+	// Copy *bool by value (not pointer) to avoid shared state
+	if src.ExposePrompts != nil {
+		exposePrompts := *src.ExposePrompts
+		dst.ExposePrompts = &exposePrompts
 	}
 
 	// Copy nested structs
 	dst.Isolation = copyIsolationConfig(src.Isolation)
 	dst.OAuth = copyOAuthConfig(src.OAuth)
 
+	// Carry the unexported "quarantined key was present" bit (issue #937).
+	// Dropping it here would make an explicitly-opted-out server look un-stated
+	// to the config-load admission gate on the next sync.
+	dst.quarantineExplicitlySet = src.quarantineExplicitlySet
+
 	return dst
+}
+
+// CopyIsolationConfig returns a deep copy of an isolation override set, or nil
+// for a nil input. Exported so the REST PATCH seam can start from the persisted
+// overrides and apply only the fields the request actually carried, instead of
+// dropping the ones it does not expose (GH #1142).
+func CopyIsolationConfig(src *IsolationConfig) *IsolationConfig {
+	return copyIsolationConfig(src)
 }
 
 func copyIsolationConfig(src *IsolationConfig) *IsolationConfig {
@@ -648,6 +725,13 @@ func copyIsolationConfig(src *IsolationConfig) *IsolationConfig {
 	if src.Enabled != nil {
 		enabled := *src.Enabled
 		dst.Enabled = &enabled
+	}
+
+	// Same for *IsolationMode — copying the pointer would alias the source and
+	// let a later in-place edit leak across configs.
+	if src.Mode != nil {
+		mode := *src.Mode
+		dst.Mode = &mode
 	}
 
 	if src.ExtraArgs != nil {

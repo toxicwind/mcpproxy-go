@@ -28,6 +28,12 @@ const (
 	EventTypeActivityToolCallStarted EventType = "activity.tool_call.started"
 	// EventTypeActivityToolCallCompleted is emitted when a tool execution finishes.
 	EventTypeActivityToolCallCompleted EventType = "activity.tool_call.completed"
+	// EventTypeActivityToolCallRejected is emitted when a concurrency limiter
+	// sheds a tool call before it reaches the upstream (spec 093 FR-012). It is
+	// published from the limiter's origin-independent seam, so it also covers
+	// the dispatch paths that never pass through the MCP layer (sandboxed code
+	// execution, activity replay).
+	EventTypeActivityToolCallRejected EventType = "activity.tool_call.rejected"
 	// EventTypeActivityPolicyDecision is emitted when a policy blocks a tool call.
 	EventTypeActivityPolicyDecision EventType = "activity.policy_decision"
 	// EventTypeActivityQuarantineChange is emitted when a server's quarantine state changes.
@@ -42,6 +48,13 @@ const (
 	EventTypeActivityInternalToolCall EventType = "activity.internal_tool_call.completed"
 	// EventTypeActivityConfigChange is emitted when configuration changes (server add/remove/update).
 	EventTypeActivityConfigChange EventType = "activity.config_change"
+	// EventTypeActivityPromptGet is emitted when an upstream prompts/get completes (Finding F10).
+	EventTypeActivityPromptGet EventType = "activity.prompt_get.completed"
+	// EventTypeUpstreamPromptsChanged is emitted (debounced) when a connected
+	// upstream sends notifications/prompts/list_changed, so the aggregated prompt
+	// set is rebuilt without waiting for an unrelated servers.changed (F13).
+	// Carries no payload — RefreshPrompts re-aggregates from live state.
+	EventTypeUpstreamPromptsChanged EventType = "upstream.prompts_changed"
 
 	// Spec 026: Sensitive data detection event
 	// EventTypeSensitiveDataDetected is emitted when sensitive data is detected in a tool call.

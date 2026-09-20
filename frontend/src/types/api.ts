@@ -57,6 +57,38 @@ export interface SecurityScanSummary {
 export type ThreatType = 'tool_poisoning' | 'prompt_injection' | 'rug_pull' | 'supply_chain' | 'malicious_code' | 'uncategorized'
 export type ThreatLevel = 'dangerous' | 'warning' | 'info'
 
+// FindingSpan locates ONE check's match inside ONE raw (un-normalized) tool text
+// field — the backend mirror is `detect.Span` (internal/security/detect/span.go).
+//
+// `start`/`end` are half-open [start, end) offsets in UTF-16 code units, i.e.
+// plain JavaScript string indices, so `description.slice(start, end)` is exactly
+// the matched text including across surrogate pairs. The backend converts its
+// byte offsets before emitting them.
+//
+// `snippet` is the backend's CapSpanSnippet() of the matched text (control and
+// Cf runes escaped to a visible \uXXXX form, a literal backslash doubled, capped
+// at 200 runes). It is a STALENESS CHECKSUM only: the UI renders the tool's own
+// LIVE description sliced by the offsets and never renders `snippet` itself. The
+// escaping is injective on purpose — see utils/spanSnippet.ts.
+//
+// `truncated` says the snippet stopped short of the matched text, so it is
+// compared as a prefix rather than exactly. It is a declared field and not an
+// inference from a trailing ellipsis, because a description can legitimately end
+// a matched passage with one. See utils/highlightSpans.ts.
+//
+// `check_id`/`tier` are per-span because `aggregate()` emits exactly one Finding
+// per tool with the PRIMARY signal's rule_id/threat_level — a mark must be
+// labelled from its own span, never from the finding-level fields.
+export interface FindingSpan {
+  field: 'description' | 'input_schema' | 'output_schema'
+  start: number
+  end: number
+  check_id: string
+  tier: 'hard' | 'soft'
+  snippet?: string
+  truncated?: boolean
+}
+
 export interface SecurityScanFinding {
   rule_id?: string
   severity?: string             // critical, high, medium, low, info
@@ -80,6 +112,10 @@ export interface SecurityScanFinding {
   tier?: string                 // "hard" (gates approval) | "soft" (review-only)
   confidence?: number           // 0.0–1.0; raised when independent sources agree
   signals?: string[]            // Deterministic detect check ids that fired
+  // Exact text ranges inside the tool's raw description that triggered this
+  // finding, unioned across every contributing signal. Absent for checks that
+  // match normalized text, and for external/Docker scanners.
+  spans?: FindingSpan[]
 }
 
 export interface SecurityScanReport {
@@ -156,7 +192,15 @@ export interface SecurityScanReportSummary {
 
 // Server types
 export interface ServerIsolationConfig {
+  // EFFECTIVE isolation state, after global + per-server + structural
+  // resolution. NOT the raw per-server override — read enabled_override for
+  // that. Always present on stdio servers.
   enabled: boolean
+  // RAW per-server override. Absent = inherit the global setting, which is a
+  // distinct state from an explicit false.
+  enabled_override?: boolean
+  // RAW per-server mode override. Absent = inherit.
+  mode_override?: string
   image?: string
   network_mode?: string
   extra_args?: string[]
@@ -169,6 +213,20 @@ export interface ServerIsolationConfig {
 // IsolationDefaults reports the resolved baseline Docker isolation
 // values the backend will apply when no per-server override is set.
 // Used as placeholders so "empty = inherit" is discoverable in the UI.
+// IsolationEffective reports the resolved isolation state of a server and the
+// rule that produced it, so the UI can explain "inherits global: docker"
+// instead of rendering an ambiguous toggle. Read-only; never sent on PATCH.
+export interface ServerIsolationEffective {
+  mode: string // 'docker' | 'sandbox' | 'none' — what the spawn path branches on
+  isolated: boolean // actually CONFINED; not simply mode !== 'none' (see 'sandbox-unavailable')
+  global_mode?: string
+  inherited: boolean
+  // 'global' | 'server-mode' | 'server-opt-out' | 'server-opt-in-ignored' |
+  // 'not-stdio' | 'already-docker' | 'sandbox-unavailable' | 'unsupported-mode'.
+  // Treat unknown values as 'global'.
+  source?: string
+}
+
 export interface ServerIsolationDefaults {
   runtime_type?: string
   image?: string
@@ -203,6 +261,12 @@ export interface Server {
   // Optional because the REST status payload only includes it once the
   // backend exposes the flag; absent/undefined is treated as OFF (protected).
   auto_approve_tool_changes?: boolean
+  // Per-server approval trust mode (spec 086: 'auto' | 'scan' | 'manual').
+  // Raw configured value exactly as delivered — absent when unset, possibly a
+  // value migrated from the legacy flags above, possibly an unrecognized
+  // hand-edited string. Resolve with utils/trustMode.ts (fail-closed to
+  // 'manual') before making any UI decision (spec 088 FR-001).
+  trust_mode?: string
   connected: boolean
   connecting: boolean
   authenticated?: boolean
@@ -214,6 +278,7 @@ export interface Server {
   reconnect_count?: number
   isolation?: ServerIsolationConfig // Per-server Docker isolation override
   isolation_defaults?: ServerIsolationDefaults // Resolved baseline values (read-only)
+  isolation_effective?: ServerIsolationEffective // Resolved isolation state + why (read-only)
   oauth?: {
     client_id: string
     auth_url: string
@@ -272,6 +337,13 @@ export interface GlobalTool {
   usage: number
   last_used?: string       // ISO 8601; omitted if never used in window
   annotations?: ToolAnnotation
+  // Hold evidence (Spec 086 FR-018, surfaced by Spec 088 FR-008): present only
+  // on tools the trust gate refused to auto-approve. GET /api/v1/tools emits
+  // these alongside the approval status (internal/httpapi/server.go); records
+  // predating Spec 086 omit them entirely, which must render unchanged.
+  held_reason?: string     // "scan_findings" (threat) | "scan_coverage" (precaution)
+  held_verdict?: string    // "dangerous" | "warnings" | "clean"
+  held_signals?: string[]  // matched deterministic check ids, producer order, ≤16
   // derived locally: enabled = !disabled && !config_denied
 }
 
@@ -357,6 +429,17 @@ export interface ToolApproval {
   current_output_schema?: string
   enabled?: boolean
   disabled?: boolean
+  // Scan-gate hold evidence (spec 086 FR-018, surfaced by spec 088). The
+  // durable export payload does NOT carry these — api.getToolApprovals joins
+  // them on from GET /api/v1/servers/{id}/tools; the diff endpoint returns them
+  // directly. Absent on records that are not currently held by the scan gate
+  // and on every record written before spec 086, which must render unchanged.
+  //   held_reason:  'scan_findings' | 'scan_coverage'
+  //   held_verdict: 'dangerous' | 'warnings' | 'clean'
+  //   held_signals: matched check ids, e.g. 'tpa.TPA-2026-0001.hidden_instruction'
+  held_reason?: string
+  held_verdict?: string
+  held_signals?: string[]
 }
 
 // Search result types
@@ -386,10 +469,14 @@ export interface StatusUpdate {
   }
   status: Record<string, any>
   timestamp: number
+  // Unix seconds at which the core process started. Absent on older cores and
+  // on SSE status frames that don't carry it — treat it as optional.
+  started_at?: number
 }
 
 // Routing mode types
 export interface RoutingInfo {
+  /** The mode /mcp is ACTUALLY serving (in-memory config), not the configured intent. */
   routing_mode: string
   description: string
   endpoints: {
@@ -399,6 +486,23 @@ export interface RoutingInfo {
     retrieve_tools: string
   }
   available_modes: string[]
+  /** Spec 085 serialization of retrieve_tools results — resolved, never empty. */
+  tool_response_mode?: string
+  /** Spec 102 serialization of direct-surface listings — resolved, never empty. */
+  direct_tool_response_mode?: string
+  /**
+   * Routing mode persisted on disk when it differs from the served one, i.e.
+   * the mode a restart would adopt. Empty when there is nothing pending.
+   */
+  pending_routing_mode?: string
+  /** True when pending_routing_mode is set — a restart is needed to apply it. */
+  restart_required?: boolean
+  /**
+   * Whether the code_execution tool is enabled. The code-execution surface has
+   * no other tool-calling path, so this gates whether that routing mode can
+   * work at all. Absent on daemons that predate the field.
+   */
+  code_execution_enabled?: boolean
 }
 
 // Dashboard stats
@@ -487,13 +591,19 @@ export interface UsageToolStat {
   errors: number
   error_rate: number
   blocked: number
+  rejected: number                // Spec 093: shed by a concurrency limit; never executed
   total_resp_bytes: number
   avg_resp_bytes: number | null   // null when only legacy 0-byte calls exist
   total_req_bytes: number
   avg_req_bytes: number | null
   sized_calls: number
+  // Bucket BOUNDS, not measurements: the true percentile is at or below the
+  // value, except in the unbounded overflow bucket, where *_exceeds flips it to
+  // a floor. Render through formatLatencyBound (audit finding F22, #1046).
   p50_ms: number
+  p50_exceeds: boolean
   p95_ms: number
+  p95_exceeds: boolean
   last_used: string
 }
 
@@ -520,11 +630,17 @@ export interface UsageAggregateResponse {
   tools: UsageToolStat[]
   other?: UsageOtherBucket | null   // present only when list truncated to top-N
   timeline: UsageTimeBucket[]
+  // Headline counts for the window, computed server-side as the sum of the
+  // timeline above. NOT a sum of `tools`: that list is lifetime-cumulative,
+  // upstream-only and truncated to top-N. Same population as
+  // ActivitySummaryResponse.call_count (audit finding F1, #1046).
+  total_calls: number
+  total_errors: number
 }
 
 export type UsageWindow = '24h' | '7d' | 'all'
 export type UsageSort = 'calls' | 'resp_bytes' | 'error_rate' | 'p95'
-export type UsageStatus = 'success' | 'error' | 'blocked'
+export type UsageStatus = 'success' | 'error' | 'blocked' | 'rejected'
 
 export interface ToolCallRecord {
   id: string
@@ -699,10 +815,27 @@ export type ActivityType =
   | 'policy_decision'
   | 'quarantine_change'
   | 'server_change'
+  /**
+   * Spec 098: one executed required-tools preflight. Set-scoped, not
+   * server-scoped — server_name/tool_name are empty and the verdict,
+   * requested-id count and per-tool reason codes live in `metadata`
+   * ({verdict, ids_count, reasons{code:count}, per_tool[{id,status,reason?}]}).
+   */
+  | 'preflight'
 
 export type ActivitySource = 'mcp' | 'cli' | 'api'
 
-export type ActivityStatus = 'success' | 'error' | 'blocked'
+/**
+ * Closed activity-status vocabulary. 'rejected' (Spec 093) means the call was
+ * shed by a concurrency limit before it reached the upstream — proxy
+ * backpressure, not an upstream failure.
+ */
+export type ActivityStatus = 'success' | 'error' | 'blocked' | 'rejected'
+
+/** Spec 093: machine-readable cause of a rejection (activity metadata). */
+export type RejectionReason = 'queue_full' | 'queue_timeout'
+/** Spec 093: which limiter tier shed the call (activity metadata). */
+export type RejectionScope = 'server' | 'global'
 
 export interface ActivityRecord {
   id: string
@@ -721,6 +854,14 @@ export interface ActivityRecord {
   /** Spec 082: one client, one project, across reconnects. Absent on pre-082 records. */
   work_session_id?: string
   request_id?: string
+  /**
+   * Correlation id of the parent `code_execution` call this record was
+   * dispatched from — equal to the parent record's `request_id`. Present only on
+   * sandboxed sub-calls; a top-level call omits it. Navigate parent → children
+   * with `?parent_id=<parent request_id>`, child → parent with
+   * `?request_id=<child parent_id>`.
+   */
+  parent_id?: string
   metadata?: Record<string, any>
   // Spec 026: Sensitive data detection fields
   has_sensitive_data?: boolean
@@ -756,6 +897,21 @@ export interface ActivitySummaryResponse {
   success_count: number
   error_count: number
   blocked_count: number
+  rejected_count: number
+  // Rows whose status is outside the tool-call vocabulary — a quarantine
+  // change's action, a policy decision's verdict. Present so that
+  // success + error + blocked + rejected + other == total_count, which is what
+  // makes the status tiles a partition instead of four numbers that add up to
+  // less than the denominator printed beside them (audit finding F2, #1046).
+  other_count: number
+  // total_count is how many ROWS the log has in the period; call_count is how
+  // many of them are calls the user made (the rest — system starts, security
+  // scans, quarantine auto-approvals, management chatter — are events). The
+  // Usage tab counts the second population, so the header must label the two
+  // apart or the same instance reports different totals on two screens
+  // (audit finding F1/F24, #1046).
+  call_count: number
+  call_error_count: number
   top_servers?: ActivityTopServer[]
   top_tools?: ActivityTopTool[]
   start_time: string
@@ -859,7 +1015,25 @@ export interface ClientStatus {
   // privacy fix including the exact tccutil reset command).
   access_state?: AccessState
   remediation?: string
+  // Every config location the existence check consults, highest precedence
+  // first (e.g. OpenCode's opencode.jsonc then opencode.json).
+  checked_paths?: string[]
+  // This instance's own MCP endpoint. Config-derived, so it is present on both
+  // the stat-only listing and the on-demand per-client read.
+  proxy_url?: string
+  // The endpoint the client's existing entry actually points at, projected
+  // through the same sanitizer as a connect preview's entry summary: scheme,
+  // host and path only (query — the ?apikey= carrier — userinfo and fragment
+  // are dropped). Resolved only by the on-demand read.
+  registered_url?: string
+  // How registered_url relates to proxy_url. `connected` only ever meant "an
+  // mcpproxy-shaped entry exists", and an entry merely NAMED mcpproxy counts —
+  // so a row can be connected to a different instance entirely (audit F18).
+  endpoint_match?: EndpointMatch
 }
+
+// How a client's registered endpoint relates to this instance (audit F18).
+export type EndpointMatch = 'this' | 'other' | 'unknown'
 
 export interface ConnectResult {
   success: boolean

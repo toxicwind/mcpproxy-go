@@ -3,14 +3,37 @@
 package oauth
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"net/http"
 	"net/url"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"go.uber.org/zap"
+)
+
+// Mask MARKERS — the substrings this package's own mask renderings are built
+// from. They exist as constants, and every renderer below is written in terms
+// of them, because the fail-closed write-path net has to RECOGNISE what the
+// read doors rendered: MaskMarkers in redactview.go is assembled from exactly
+// these constants (plus security's), so a rendering cannot be added or changed
+// without the net learning about it in the same edit.
+//
+// Issue #1148, round 7 finding 1: the marker list used to be hand-maintained
+// beside the renderers and did not know about `***REDACTED***`, so an echoed
+// RedactSensitiveData rendering was accepted on a write and persisted over the
+// live credential.
+const (
+	// redactedMarker is what the REGEX scrubbers (RedactSensitiveData,
+	// RedactURL, RedactHeaders) put in place of a matched secret.
+	redactedMarker = "***REDACTED***"
+
+	// bulletMarker opens every MaskValue / AuditMaskValue rendering.
+	bulletMarker = "••••"
 )
 
 // Sensitive header names that should be redacted in logs.
@@ -23,6 +46,70 @@ var sensitiveHeaders = map[string]bool{
 	"x-refresh-token":     true,
 	"x-auth-token":        true,
 	"proxy-authorization": true,
+}
+
+// sensitiveHeaderSegments catch credential-bearing custom header names that
+// cannot be enumerated exhaustively (for example access_token or
+// X-Client-Credential). Matching complete delimiter-separated segments avoids
+// false positives such as X-Author-ID and X-Monkey-ID.
+var sensitiveHeaderSegments = map[string]bool{
+	"auth":          true,
+	"authorization": true,
+	"bearer":        true,
+	"cookie":        true,
+	"token":         true,
+	"secret":        true,
+	"key":           true,
+	"apikey":        true,
+	"password":      true,
+	"passwd":        true,
+	"credential":    true,
+	"private":       true,
+	"session":       true,
+}
+
+var headerNameSegmentPattern = regexp.MustCompile(`[a-z0-9]+`)
+
+// headerNameCamelSegmentPattern splits a CamelCase header name on its case
+// transitions. Issue #1146 (review round 3): the delimiter-based pass above
+// only ever sees whole `-`/`_`-separated segments, so `X-AuthToken` collapsed
+// to the single segment "authtoken", matched nothing, and a credential under a
+// custom header name was recorded and logged in the clear. Splitting on case
+// transitions as well recovers "Auth" and "Token" without reopening the
+// substring false positives the segment rule exists to prevent: "Author" and
+// "Monkey" are still single segments that equal no marker.
+//
+// Only mixed-case words are extracted here — an all-caps run like
+// `X-CUSTOM-TOKEN` has no case transition to split on and is already covered by
+// the delimiter pass.
+var headerNameCamelSegmentPattern = regexp.MustCompile(`[A-Z][a-z0-9]*`)
+
+// IsSensitiveHeaderName reports whether an HTTP header NAME looks like it
+// carries a credential. Exported for callers that must decide masking from a
+// name they hold apart from the value (the activity/audit redactor, issue
+// #1146) so the rule stays defined in exactly one place.
+func IsSensitiveHeaderName(name string) bool {
+	return isSensitiveHeaderKey(name)
+}
+
+func isSensitiveHeaderKey(name string) bool {
+	if sensitiveHeaders[strings.ToLower(name)] {
+		return true
+	}
+
+	for _, segment := range headerNameSegmentPattern.FindAllString(strings.ToLower(name), -1) {
+		if sensitiveHeaderSegments[segment] {
+			return true
+		}
+	}
+
+	for _, segment := range headerNameCamelSegmentPattern.FindAllString(name, -1) {
+		if sensitiveHeaderSegments[strings.ToLower(segment)] {
+			return true
+		}
+	}
+
+	return false
 }
 
 // Sensitive parameter names in request bodies or URLs.
@@ -56,6 +143,40 @@ var tokenPattern = regexp.MustCompile(`(?i)(bearer\s+)[a-zA-Z0-9\-_\.]+`)
 // secretPattern matches common secret patterns.
 var secretPattern = regexp.MustCompile(`(?i)(secret|password|token|key)["']?\s*[:=]\s*["']?[a-zA-Z0-9\-_\.]+`)
 
+// urlUserinfoPattern matches the `scheme://user:password@` prefix of a URL
+// embedded in free-form text (issue #1148, review round 2).
+//
+// RedactURLQueryParams has masked the userinfo password since #872, but that
+// function only ever sees a value the caller already knows is a URL. The
+// free-form scrubbers — connection errors, tailed log lines, health.detail —
+// see a URL buried in a sentence, and neither tokenPattern (bearer only) nor
+// secretPattern (`<name>=<value>`) nor the `<param>=` sweep below has any
+// `user:pass@` shape, so a basic-auth password travelled through all of them in
+// the clear.
+//
+// The username is deliberately kept: it is the operator's signal for WHICH
+// credential failed, and it is not the secret.
+var urlUserinfoPattern = regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.\-]*://)([^\s/:@]+):([^\s/@]+)@`)
+
+// redactURLUserinfo masks the password half of every `scheme://user:pass@`
+// prefix in s, keeping the username. Shared by RedactSensitiveData (free-form
+// text) and RedactURL (the parse-failure fallback) so the two cannot disagree
+// about whether a basic-auth password is a secret.
+func redactURLUserinfo(s string) string {
+	return urlUserinfoPattern.ReplaceAllStringFunc(s, func(match string) string {
+		groups := urlUserinfoPattern.FindStringSubmatch(match)
+		if len(groups) != 4 {
+			return match
+		}
+		// A ${keyring:…}/${env:…} reference is a label, not a secret; masking
+		// it would erase exactly what makes the line diagnosable.
+		if isConfigReference(groups[3]) {
+			return match
+		}
+		return groups[1] + groups[2] + ":" + redactedMarker + "@"
+	})
+}
+
 // RedactSensitiveData redacts sensitive information from a string.
 // It replaces tokens, secrets, and other sensitive data with redacted placeholders.
 func RedactSensitiveData(data string) string {
@@ -63,24 +184,27 @@ func RedactSensitiveData(data string) string {
 		return data
 	}
 
+	// Redact URL userinfo passwords (scheme://user:pass@host).
+	result := redactURLUserinfo(data)
+
 	// Redact Bearer tokens
-	result := tokenPattern.ReplaceAllString(data, "${1}***REDACTED***")
+	result = tokenPattern.ReplaceAllString(result, "${1}"+redactedMarker)
 
 	// Redact secrets and passwords
 	result = secretPattern.ReplaceAllStringFunc(result, func(match string) string {
 		// Find the position of = or : and redact everything after
 		for _, sep := range []string{"=", ":"} {
 			if idx := strings.Index(match, sep); idx != -1 {
-				return match[:idx+1] + "***REDACTED***"
+				return match[:idx+1] + redactedMarker
 			}
 		}
-		return "***REDACTED***"
+		return redactedMarker
 	})
 
 	// Redact sensitive URL parameters
 	for _, param := range sensitiveParams {
 		pattern := regexp.MustCompile(`(?i)(` + param + `=)[^&\s]+`)
-		result = pattern.ReplaceAllString(result, "${1}***REDACTED***")
+		result = pattern.ReplaceAllString(result, "${1}"+redactedMarker)
 	}
 
 	return result
@@ -92,9 +216,8 @@ func RedactHeaders(headers http.Header) map[string]string {
 	redacted := make(map[string]string)
 
 	for key, values := range headers {
-		lowerKey := strings.ToLower(key)
-		if sensitiveHeaders[lowerKey] {
-			redacted[key] = "***REDACTED***"
+		if isSensitiveHeaderKey(key) {
+			redacted[key] = redactedMarker
 		} else {
 			// Join multiple values and redact any sensitive data within
 			value := strings.Join(values, ", ")
@@ -124,14 +247,28 @@ func RedactHeaders(headers http.Header) map[string]string {
 // "Convert to secret" affordance work on the UI side because the user
 // can confirm a recognisable suffix before approving.
 func RedactStringHeaders(headers map[string]string) map[string]string {
+	return RedactStringHeadersWith(headers, MaskValue)
+}
+
+// RedactStringHeadersWith is RedactStringHeaders with a caller-chosen mask.
+//
+// Issue #1146 (review round 3): MaskValue's `••••<last2> (<N> chars)` rendering
+// is a deliberate trade for the INTERACTIVE surfaces — it lets an operator
+// recognise which token is configured, and the write path (UnmaskHeaders)
+// depends on being able to recognise it when a client echoes it back. On the
+// AUDIT surfaces that trade is wrong: those rows are persisted, streamed and
+// exported, so the length and trailing bytes become a durable fingerprint of
+// every credential. Those callers pass AuditMaskValue instead. Splitting the
+// mask out — rather than forking the "which name is sensitive" rules — keeps
+// one definition of sensitivity behind both renderings.
+func RedactStringHeadersWith(headers map[string]string, mask func(string) string) map[string]string {
 	if headers == nil {
 		return nil
 	}
 	redacted := make(map[string]string, len(headers))
 	for key, value := range headers {
-		lowerKey := strings.ToLower(key)
-		if sensitiveHeaders[lowerKey] {
-			redacted[key] = MaskValue(value)
+		if isSensitiveHeaderKey(key) {
+			redacted[key] = mask(value)
 		} else {
 			redacted[key] = RedactSensitiveData(value)
 		}
@@ -155,6 +292,16 @@ var sensitiveEnvMarkers = []string{
 	"TOKEN", "SECRET", "KEY", "PASSWORD", "PASSWD", "PASS",
 	"CREDENTIAL", "AUTH", "BEARER", "PRIVATE", "CERT",
 	"DSN", "CONNECTION_STRING", "CONN_STR",
+}
+
+// IsSensitiveKeyName reports whether a NAME looks like it holds a secret, using
+// the same case-insensitive marker match RedactEnvValues applies to env-var
+// keys. Exported for callers that have to decide masking from a name they hold
+// separately from the value — e.g. a command-line flag naming the argv token
+// that follows it (issue #1146), where there is no map to hand to
+// RedactEnvValues.
+func IsSensitiveKeyName(name string) bool {
+	return isSensitiveEnvKey(name)
 }
 
 // isSensitiveEnvKey reports whether an env var name looks like it holds a
@@ -184,12 +331,18 @@ func isSensitiveEnvKey(name string) bool {
 // with a RedactSensitiveData pass over the value as a defence-in-depth fallback
 // for embedded secrets (it leaves ordinary values like `debug` untouched).
 func RedactEnvValues(env map[string]string) map[string]string {
+	return RedactEnvValuesWith(env, MaskValue)
+}
+
+// RedactEnvValuesWith is RedactEnvValues with a caller-chosen mask. See
+// RedactStringHeadersWith for why the audit surfaces need a different one.
+func RedactEnvValuesWith(env map[string]string, mask func(string) string) map[string]string {
 	if env == nil {
 		return nil
 	}
 	redacted := make(map[string]string, len(env))
 	for key, value := range env {
-		redacted[key] = maskedEnvValue(key, value)
+		redacted[key] = maskedEnvValueWith(key, value, mask)
 	}
 	return redacted
 }
@@ -205,11 +358,15 @@ func RedactEnvValues(env map[string]string) map[string]string {
 // embedded userinfo password and any credential query params are masked while
 // scheme/host/db stay readable.
 func maskedEnvValue(key, value string) string {
+	return maskedEnvValueWith(key, value, MaskValue)
+}
+
+func maskedEnvValueWith(key, value string, mask func(string) string) string {
 	if isSensitiveEnvKey(key) {
-		return MaskValue(value)
+		return mask(value)
 	}
 	if strings.Contains(value, "://") {
-		return RedactURLQueryParams(value)
+		return RedactURLQueryParamsWith(value, mask)
 	}
 	return RedactSensitiveData(value)
 }
@@ -268,6 +425,12 @@ func isSensitiveQueryParam(name string) bool {
 // are labels, not secrets. A URL with no query, or no sensitive params, is
 // returned unchanged. On parse failure it falls back to the regex RedactURL.
 func RedactURLQueryParams(rawURL string) string {
+	return RedactURLQueryParamsWith(rawURL, MaskValue)
+}
+
+// RedactURLQueryParamsWith is RedactURLQueryParams with a caller-chosen mask.
+// See RedactStringHeadersWith for why the audit surfaces need a different one.
+func RedactURLQueryParamsWith(rawURL string, mask func(string) string) string {
 	if rawURL == "" {
 		return rawURL
 	}
@@ -284,7 +447,7 @@ func RedactURLQueryParams(rawURL string) string {
 	// below.
 	if u.User != nil {
 		if pw, hasPW := u.User.Password(); hasPW && !isConfigReference(pw) {
-			u.User = url.UserPassword(u.User.Username(), MaskValue(pw))
+			u.User = url.UserPassword(u.User.Username(), mask(pw))
 			changed = true
 		}
 	}
@@ -317,7 +480,7 @@ func RedactURLQueryParams(rawURL string) string {
 			if isConfigReference(decVal) {
 				continue
 			}
-			parts[i] = key + "=" + url.QueryEscape(MaskValue(decVal))
+			parts[i] = key + "=" + url.QueryEscape(mask(decVal))
 			queryChanged = true
 		}
 		if queryChanged {
@@ -348,6 +511,39 @@ func isConfigReference(v string) bool {
 	return configRefPattern.MatchString(v)
 }
 
+// IsConfigReference is the exported form of isConfigReference, for callers
+// outside this package that must decide whether a value is a secret-store
+// LABEL rather than a secret (issue #1146: the activity redactor runs a
+// value-shaped detector over everything the name rules pass through, and a
+// reference must not be mangled by it).
+func IsConfigReference(v string) bool {
+	return isConfigReference(v)
+}
+
+// AuditMaskValue is the mask for surfaces that PERSIST and EXPORT what they
+// redact — the activity store, its SSE payloads and `mcpproxy activity list`
+// (issue #1146, review round 3).
+//
+// Unlike MaskValue it carries no length and no trailing bytes. On an
+// interactive surface those help an operator recognise which token is
+// configured and are re-read within seconds; written into an audit row they
+// become a durable fingerprint of the credential — a correlation handle across
+// records and a materially smaller search space for a low-entropy secret. The
+// audit surfaces have no need for the affordance, so they do not pay for it.
+//
+// ${keyring:…} / ${env:…} references still pass through unchanged: they are
+// labels pointing at the secret store, and masking them would erase exactly the
+// information the audit row exists to carry.
+func AuditMaskValue(v string) string {
+	if v == "" {
+		return "(empty)"
+	}
+	if isConfigReference(v) {
+		return v
+	}
+	return bulletMarker
+}
+
 // MaskValue renders a string secret as `••••<last2> (<N> chars)` for
 // human display. Returns "(empty)" for empty input, a 4-bullet preview
 // for values up to 4 characters (where revealing the last two would
@@ -365,9 +561,9 @@ func MaskValue(v string) string {
 		return v
 	}
 	if len(v) <= 4 {
-		return "••••"
+		return bulletMarker
 	}
-	return "••••" + v[len(v)-2:] + " (" + strconv.Itoa(len(v)) + " chars)"
+	return bulletMarker + v[len(v)-2:] + " (" + strconv.Itoa(len(v)) + " chars)"
 }
 
 // UnmaskURL protects the write path from a client that echoes a masked URL
@@ -546,8 +742,14 @@ func UnmaskHeaders(incoming, stored map[string]string) map[string]string {
 // renders one (key, value) pair; reused by UnmaskHeaders to recognise echoed
 // masks.
 func maskedHeaderValue(key, value string) string {
-	if sensitiveHeaders[strings.ToLower(key)] {
-		return MaskValue(value)
+	return maskedHeaderValueWith(key, value, MaskValue)
+}
+
+// maskedHeaderValueWith is maskedHeaderValue with a caller-chosen mask. See
+// RedactStringHeadersWith for why the audit surfaces need a different one.
+func maskedHeaderValueWith(key, value string, mask func(string) string) string {
+	if isSensitiveHeaderKey(key) {
+		return mask(value)
 	}
 	return RedactSensitiveData(value)
 }
@@ -571,15 +773,24 @@ func unmaskMapValues(incoming, stored map[string]string, rendered func(k, v stri
 }
 
 // RedactURL redacts sensitive query parameters from a URL string.
+//
+// Issue #1148, round 4: this is not only a standalone helper — it is the
+// fallback RedactURLQueryParams takes when url.Parse FAILS, and a URL that
+// fails to parse is precisely the URL a connection error is being logged
+// about. It masked the query params but had no `user:pass@` rule, so the
+// basic-auth password survived every logSafeURL() site in
+// internal/upstream/core, internal/upstream/managed and internal/transport
+// whenever the configured URL was malformed. Reuse RedactSensitiveData's
+// urlUserinfoPattern so the two scrubbers cannot drift apart.
 func RedactURL(urlStr string) string {
 	if urlStr == "" {
 		return urlStr
 	}
 
-	result := urlStr
+	result := redactURLUserinfo(urlStr)
 	for _, param := range sensitiveParams {
 		pattern := regexp.MustCompile(`(?i)(` + param + `=)[^&]+`)
-		result = pattern.ReplaceAllString(result, "${1}***REDACTED***")
+		result = pattern.ReplaceAllString(result, "${1}"+redactedMarker)
 	}
 
 	return result
@@ -735,4 +946,189 @@ func LogOAuthFlowEnd(logger *zap.Logger, serverName string, correlationID string
 			zap.Duration("total_duration", duration),
 		)
 	}
+}
+
+// logSafeURL renders a URL for a LOG FIELD written from inside this package
+// (issue #1158).
+//
+// Every other package already masked its URL log fields — internal/transport
+// through cfg.logSafeURL, internal/upstream/core through Client.logSafeURL —
+// while internal/oauth, which handles URLs for a living, wrote the configured
+// upstream URL and every URL derived from it (RFC 8414 / RFC 9728 metadata
+// candidates, the RFC 8707 resource, the token-store key) verbatim. A
+// `?token=…` in the configured URL therefore reached ~/.mcpproxy/logs/main.log
+// on every discovery attempt.
+//
+// The AUDIT policy is used rather than the bare RedactURLQueryParams the issue
+// names: RedactURLQueryParams is name-rule-only, so a credential under an
+// unrecognised parameter name (`?opaque=ghp_…`) still reached the log. There is
+// no write-path echo to protect on a log sink, so running the value-shaped
+// detector as well is pure gain. URLValueDeep also decodes one level of nesting,
+// which is where the authorize URL hides the upstream URL.
+//
+// url.URL.Redacted() is deliberately NOT used anywhere: it masks the userinfo
+// password only and leaves `?token=` intact.
+func logSafeURL(rawURL string) string {
+	return LogSafeURL(rawURL)
+}
+
+// LogSafeURL is logSafeURL for callers OUTSIDE this package (issue #1158,
+// review round 2 finding B6).
+//
+// internal/upstream/core.Client.logSafeURL, managed.Client.logSafeURL,
+// transport.HTTPTransportConfig.logSafeURL, the CLI client and the registry
+// routes each rendered their URL log fields with RedactURLQueryParams — the
+// NAME rule only. This package's own new renderer deliberately does not, and
+// says why in so many words: a credential under an unrecognised or opaque
+// parameter name (`?opaque=ghp_…`, `?resource=<url-encoded url with a token>`)
+// is invisible to the name rule and still reached the log. Two renderers for
+// the same class of field is how the gap re-opens, so there is one.
+func LogSafeURL(rawURL string) string {
+	return AuditRedaction.URLValueDeep(rawURL)
+}
+
+// logSafeURLs is logSafeURL over a slice — the RFC 8414 candidate list is
+// logged whole (`urls_tried`) and every entry is derived from the configured
+// server URL.
+func logSafeURLs(urls []string) []string {
+	if urls == nil {
+		return nil
+	}
+	out := make([]string, len(urls))
+	for i, u := range urls {
+		out[i] = logSafeURL(u)
+	}
+	return out
+}
+
+// logSafeErrorField renders an error as a LOG FIELD with any credential its
+// text carries removed (issue #1158, review round 2 finding B3).
+//
+// Masking the `url` FIELD of a log statement is only half the job on an HTTP
+// failure path: net/http quotes the request URL inside the error it returns, so
+// `client.Post("https://host/mcp?token=SECRET", …)` renders as
+//
+//	Post "https://host/mcp?token=SECRET": dial tcp 10.0.0.1:443: i/o timeout
+//
+// and the credential the sibling `zap.String("metadata_url", logSafeURL(…))`
+// masks reaches the identical log line through `zap.Error(err)`. internal/
+// transport has scrubbed its error fields since #1148 round 3; internal/oauth —
+// which makes most of the outbound discovery requests — did not.
+//
+// ScrubUpstreamText rather than RedactSensitiveData: an error string has no
+// enclosing key to judge it by, so the value-shaped detector has to run as well
+// (`?opaque=ghp_…` is invisible to the name rule). The field NAME stays "error"
+// so existing log queries keep working.
+func logSafeErrorField(err error) zap.Field {
+	if err == nil {
+		return zap.Skip()
+	}
+	return zap.String("error", ScrubUpstreamText(err.Error()))
+}
+
+// logSafeNamedErrorField is logSafeErrorField under a caller-chosen field name,
+// for the sites that log two errors on one statement.
+func logSafeNamedErrorField(name string, err error) zap.Field {
+	if err == nil {
+		return zap.Skip()
+	}
+	return zap.String(name, ScrubUpstreamText(err.Error()))
+}
+
+// LogSafeErrorText renders an error's text for a log field or a structured
+// error leaf, with any credential it quotes removed. Exported for
+// internal/upstream/core, which builds the same OAuth failure payloads.
+func LogSafeErrorText(err error) string {
+	if err == nil {
+		return ""
+	}
+	return ScrubUpstreamText(err.Error())
+}
+
+// StateFingerprint renders an OAuth `state` for a LOG FIELD or an error message
+// (issue #1158, review round 2 finding B1).
+//
+// `state` is the CSRF nonce that binds a callback to the flow that minted it.
+// It is not an access credential on its own, but it is the other half of the
+// pair an attacker who has read the log needs: with the authorization code AND
+// the state, a callback can be replayed against the waiting flow. It was
+// written verbatim on five log statements and inside two error messages.
+//
+// The fingerprint keeps what the log lines actually use it for — correlating
+// "Registered waiter" with "callback received" with "dropped, nobody waiting"
+// across one flow — while carrying no bytes of the nonce itself. A truncated
+// SHA-256 is enough: the values it distinguishes are the handful of flows live
+// in one process.
+func StateFingerprint(state string) string {
+	if state == "" {
+		return "(none)"
+	}
+	sum := sha256.Sum256([]byte(state))
+	return "sha256:" + hex.EncodeToString(sum[:])[:12]
+}
+
+// callbackParamField renders ONE OAuth callback query parameter for a log
+// field, by name.
+//
+// The authorization `code` is a single-use credential exchangeable for an
+// access token at the token endpoint, and it was logged at INFO on every
+// successful login — so `~/.mcpproxy/logs/main.log` held a working credential
+// for the window before mcpproxy redeemed it, and forever after for any flow
+// that failed to complete. It is masked whole: unlike a URL, no part of it is
+// diagnostic.
+func callbackParamField(name, value string) string {
+	switch strings.ToLower(name) {
+	case "state":
+		return StateFingerprint(value)
+	case "code", "access_token", "id_token", "refresh_token", "token", "client_secret":
+		if value == "" {
+			return ""
+		}
+		return AuditMaskValue(value)
+	case "error", "error_description", "error_uri":
+		// Provider-authored free text: it has no enclosing key to judge it by
+		// and providers do echo request parameters back into it.
+		return ScrubUpstreamText(value)
+	default:
+		return AuditRedaction.Leaf(name, value)
+	}
+}
+
+// LogSafeCallbackQuery renders a whole OAuth callback query string for a log
+// field, parameter by parameter.
+//
+// The raw `r.URL.RawQuery` of the callback request was logged at INFO on TWO
+// handlers, which put the authorization code on disk a second and third time
+// even after the dedicated `code` field was masked. Rendering per parameter
+// rather than dropping the field keeps the diagnostic the line exists for:
+// WHICH parameters the provider sent back.
+func LogSafeCallbackQuery(rawQuery string) string {
+	if rawQuery == "" {
+		return rawQuery
+	}
+	if !strings.Contains(rawQuery, "=") {
+		// Not a `k=v` query: a bare token, or something that is not a query
+		// string at all. ParseQuery would turn it into `<whole thing>=`, which
+		// is a rewrite that says nothing; the free-form rule is the honest
+		// answer for a string with no parameter names to judge it by.
+		return ScrubUpstreamText(rawQuery)
+	}
+	values, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		// Unparseable: fall back to the free-form rule rather than publishing
+		// it, and say so.
+		return ScrubUpstreamText(rawQuery)
+	}
+	names := make([]string, 0, len(values))
+	for name := range values {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	parts := make([]string, 0, len(names))
+	for _, name := range names {
+		for _, v := range values[name] {
+			parts = append(parts, name+"="+callbackParamField(name, v))
+		}
+	}
+	return strings.Join(parts, "&")
 }

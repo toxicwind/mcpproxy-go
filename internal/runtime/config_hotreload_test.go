@@ -37,6 +37,30 @@ func TestDetectConfigChanges_Observability(t *testing.T) {
 	assert.False(t, result.RequiresRestart, "cadence change is hot-reloadable")
 }
 
+// TestDetectConfigChanges_AggregateUpstreamPrompts (PR #973): a lone
+// aggregate_upstream_prompts flip must be detected as a hot-reloadable change so
+// ApplyConfig emits config.reloaded and RefreshPrompts (which reads the live
+// snapshot) re-runs. Without this the toggle would be swallowed as "no changes
+// detected" and take effect only on restart.
+func TestDetectConfigChanges_AggregateUpstreamPrompts(t *testing.T) {
+	mk := func(agg bool) *config.Config {
+		return &config.Config{
+			Listen: "127.0.0.1:8080", DataDir: "/d", TLS: &config.TLSConfig{},
+			AggregateUpstreamPrompts: agg,
+		}
+	}
+	t.Run("toggle detected, hot-reloadable", func(t *testing.T) {
+		result := DetectConfigChanges(mk(false), mk(true))
+		require.True(t, result.Success)
+		assert.Contains(t, result.ChangedFields, "aggregate_upstream_prompts")
+		assert.False(t, result.RequiresRestart, "aggregation toggle must not require a restart")
+	})
+	t.Run("no change reports nothing", func(t *testing.T) {
+		result := DetectConfigChanges(mk(true), mk(true))
+		assert.NotContains(t, result.ChangedFields, "aggregate_upstream_prompts")
+	})
+}
+
 // TestDetectConfigChanges_DiscoveryHealthIntervals (MCP-1189 / Codex finding #2):
 // a global health_check_interval / tool_discovery_interval edit must be detected
 // as a hot-reloadable change so ApplyConfig propagates the new cadence to the
@@ -552,5 +576,585 @@ func TestDetectConfigChanges_TrustedHosts(t *testing.T) {
 	t.Run("unchanged list not reported", func(t *testing.T) {
 		result := DetectConfigChanges(mk([]string{"a.example.com"}), mk([]string{"a.example.com"}))
 		assert.NotContains(t, result.ChangedFields, "trusted_hosts")
+	})
+}
+
+// TestDetectConfigChanges_ConcurrencyLimits (spec 093, FR-021): the global
+// aggregate limiter fields and the per-server default set must be reported as
+// hot-reloadable changes, otherwise a lone limit edit falls through as
+// "no changes detected" and the limiter registry is never re-applied.
+// Per-server overrides ride the Servers DeepEqual clause.
+func TestDetectConfigChanges_ConcurrencyLimits(t *testing.T) {
+	mk := func(mutate func(*config.Config)) *config.Config {
+		c := &config.Config{Listen: "127.0.0.1:8080", DataDir: "/d", TLS: &config.TLSConfig{}}
+		if mutate != nil {
+			mutate(c)
+		}
+		return c
+	}
+	intp := func(v int) *int { return &v }
+	durp := func(d time.Duration) *config.Duration { v := config.Duration(d); return &v }
+
+	t.Run("max_concurrent_requests change detected", func(t *testing.T) {
+		result := DetectConfigChanges(
+			mk(nil),
+			mk(func(c *config.Config) { c.MaxConcurrentRequests = intp(10) }))
+		require.True(t, result.Success)
+		assert.Contains(t, result.ChangedFields, "max_concurrent_requests")
+		assert.False(t, result.RequiresRestart, "concurrency limits are hot-reloadable")
+	})
+
+	t.Run("queue_size change detected", func(t *testing.T) {
+		result := DetectConfigChanges(
+			mk(func(c *config.Config) { c.MaxConcurrentRequests = intp(10); c.QueueSize = intp(1) }),
+			mk(func(c *config.Config) { c.MaxConcurrentRequests = intp(10); c.QueueSize = intp(5) }))
+		require.True(t, result.Success)
+		assert.Contains(t, result.ChangedFields, "queue_size")
+	})
+
+	t.Run("queue_timeout change detected", func(t *testing.T) {
+		result := DetectConfigChanges(
+			mk(func(c *config.Config) { c.QueueTimeout = durp(30 * time.Second) }),
+			mk(func(c *config.Config) { c.QueueTimeout = durp(5 * time.Second) }))
+		require.True(t, result.Success)
+		assert.Contains(t, result.ChangedFields, "queue_timeout")
+	})
+
+	t.Run("server_concurrency_defaults change detected", func(t *testing.T) {
+		result := DetectConfigChanges(
+			mk(nil),
+			mk(func(c *config.Config) {
+				c.ServerConcurrencyDefaults = &config.ConcurrencyDefaults{MaxConcurrentRequests: intp(5)}
+			}))
+		require.True(t, result.Success)
+		assert.Contains(t, result.ChangedFields, "server_concurrency_defaults")
+	})
+
+	t.Run("unchanged limits not reported", func(t *testing.T) {
+		build := func() *config.Config {
+			return mk(func(c *config.Config) {
+				c.MaxConcurrentRequests = intp(10)
+				c.QueueSize = intp(5)
+				c.QueueTimeout = durp(30 * time.Second)
+				c.ServerConcurrencyDefaults = &config.ConcurrencyDefaults{MaxConcurrentRequests: intp(5)}
+			})
+		}
+		result := DetectConfigChanges(build(), build())
+		require.True(t, result.Success)
+		assert.NotContains(t, result.ChangedFields, "max_concurrent_requests")
+		assert.NotContains(t, result.ChangedFields, "queue_size")
+		assert.NotContains(t, result.ChangedFields, "queue_timeout")
+		assert.NotContains(t, result.ChangedFields, "server_concurrency_defaults")
+	})
+}
+
+// TestDetectConfigChanges_HTTPTimeouts (GH #965): the three global HTTP server
+// timeouts are baked into http.Server at bind time, so a change is
+// restart-required — and the comparison is on the RESOLVED values, so writing
+// out a key at its built-in default ("120s" read / "120s" write / "180s" idle) is
+// correctly reported as "no change" instead of forcing a pointless restart.
+func TestDetectConfigChanges_HTTPTimeouts(t *testing.T) {
+	mk := func(mutate func(*config.Config)) *config.Config {
+		c := &config.Config{Listen: "127.0.0.1:8080", DataDir: "/d", TLS: &config.TLSConfig{}}
+		if mutate != nil {
+			mutate(c)
+		}
+		return c
+	}
+	durp := func(d time.Duration) *config.Duration { v := config.Duration(d); return &v }
+
+	t.Run("http_write_timeout nil→30s requires restart", func(t *testing.T) {
+		result := DetectConfigChanges(
+			mk(nil),
+			mk(func(c *config.Config) { c.HTTPWriteTimeout = durp(30 * time.Second) }))
+		require.True(t, result.Success)
+		assert.Contains(t, result.ChangedFields, "http_write_timeout")
+		assert.True(t, result.RequiresRestart)
+		assert.False(t, result.AppliedImmediately)
+		assert.Contains(t, result.RestartReason, "HTTP server timeouts")
+	})
+
+	t.Run("http_read_timeout nil→30s requires restart", func(t *testing.T) {
+		result := DetectConfigChanges(
+			mk(nil),
+			mk(func(c *config.Config) { c.HTTPReadTimeout = durp(30 * time.Second) }))
+		require.True(t, result.Success)
+		assert.Contains(t, result.ChangedFields, "http_read_timeout")
+		assert.True(t, result.RequiresRestart)
+	})
+
+	t.Run("http_idle_timeout nil→30s requires restart", func(t *testing.T) {
+		result := DetectConfigChanges(
+			mk(nil),
+			mk(func(c *config.Config) { c.HTTPIdleTimeout = durp(30 * time.Second) }))
+		require.True(t, result.Success)
+		assert.Contains(t, result.ChangedFields, "http_idle_timeout")
+		assert.True(t, result.RequiresRestart)
+	})
+
+	t.Run("nil→explicit built-in defaults is not a change", func(t *testing.T) {
+		result := DetectConfigChanges(
+			mk(nil),
+			mk(func(c *config.Config) {
+				c.HTTPReadTimeout = durp(120 * time.Second)
+				c.HTTPWriteTimeout = durp(120 * time.Second)
+				c.HTTPIdleTimeout = durp(180 * time.Second)
+			}))
+		require.True(t, result.Success)
+		assert.False(t, result.RequiresRestart, "writing out the defaults must not force a restart")
+		assert.NotContains(t, result.ChangedFields, "http_read_timeout")
+		assert.NotContains(t, result.ChangedFields, "http_write_timeout")
+		assert.NotContains(t, result.ChangedFields, "http_idle_timeout")
+	})
+}
+
+// TestDetectConfigChanges_CodeExecution (Spec 096 FR-004): the code-execution
+// knobs are read per execution via the live config snapshot, so an edit that
+// touches only one of them must be reported as a hot-reloadable change instead
+// of being swallowed as "No configuration changes detected".
+func TestDetectConfigChanges_CodeExecution(t *testing.T) {
+	mk := func(mutate func(*config.Config)) *config.Config {
+		cfg := &config.Config{
+			Listen: "127.0.0.1:8080", DataDir: "/d", TLS: &config.TLSConfig{},
+			CodeExecutionTimeoutMs:    120000,
+			CodeExecutionMaxToolCalls: 0,
+			CodeExecutionPoolSize:     10,
+			CodeExecutionMaxParallel:  8,
+		}
+		if mutate != nil {
+			mutate(cfg)
+		}
+		return cfg
+	}
+
+	changes := map[string]func(*config.Config){
+		"code_execution_max_parallel":   func(c *config.Config) { c.CodeExecutionMaxParallel = 16 },
+		"code_execution_timeout_ms":     func(c *config.Config) { c.CodeExecutionTimeoutMs = 60000 },
+		"code_execution_max_tool_calls": func(c *config.Config) { c.CodeExecutionMaxToolCalls = 5 },
+	}
+
+	for name, mutate := range changes {
+		t.Run(name, func(t *testing.T) {
+			result := DetectConfigChanges(mk(nil), mk(mutate))
+			require.True(t, result.Success)
+			assert.Contains(t, result.ChangedFields, "code_execution")
+			assert.False(t, result.RequiresRestart, "code execution settings are hot-reloadable")
+		})
+	}
+
+	t.Run("code_execution_pool_size requires a restart", func(t *testing.T) {
+		// The JS runtime pool is sized once at server construction and never
+		// resized in-process; claiming hot application would leave the old
+		// concurrency cap silently in force.
+		result := DetectConfigChanges(mk(nil), mk(func(c *config.Config) { c.CodeExecutionPoolSize = 20 }))
+		require.True(t, result.Success)
+		assert.Contains(t, result.ChangedFields, "code_execution_pool_size")
+		assert.NotContains(t, result.ChangedFields, "code_execution")
+		assert.True(t, result.RequiresRestart)
+		assert.Contains(t, result.RestartReason, "code_execution_pool_size")
+	})
+
+	t.Run("unchanged settings are not reported", func(t *testing.T) {
+		result := DetectConfigChanges(mk(nil), mk(nil))
+		require.True(t, result.Success)
+		assert.NotContains(t, result.ChangedFields, "code_execution")
+		assert.NotContains(t, result.ChangedFields, "code_execution_pool_size")
+	})
+}
+
+// TestDetectConfigChanges_EnableCodeExecution (UX audit F16): the Settings page
+// states that changes save instantly, and the enable_code_execution field
+// carries no "restart" badge. Before this clause the toggle contributed nothing
+// to ChangedFields, so the field the user actually flipped was never named back
+// to them — the toast reported whatever else the round-trip had (falsely)
+// flagged. The tool surface now rebuilds off the live snapshot on
+// config.reloaded, so the change genuinely applies hot.
+func TestDetectConfigChanges_EnableCodeExecution(t *testing.T) {
+	mk := func(on bool) *config.Config {
+		return &config.Config{
+			Listen: "127.0.0.1:8080", DataDir: "/d", TLS: &config.TLSConfig{},
+			EnableCodeExecution: on,
+		}
+	}
+
+	t.Run("off to on is a hot-reloadable change", func(t *testing.T) {
+		result := DetectConfigChanges(mk(false), mk(true))
+		require.True(t, result.Success)
+		assert.Contains(t, result.ChangedFields, "enable_code_execution")
+		assert.False(t, result.RequiresRestart, "the tool surface is rebuilt on config.reloaded")
+		assert.True(t, result.AppliedImmediately)
+	})
+
+	t.Run("on to off is a hot-reloadable change", func(t *testing.T) {
+		result := DetectConfigChanges(mk(true), mk(false))
+		require.True(t, result.Success)
+		assert.Contains(t, result.ChangedFields, "enable_code_execution")
+		assert.False(t, result.RequiresRestart)
+	})
+
+	t.Run("unchanged is not reported", func(t *testing.T) {
+		result := DetectConfigChanges(mk(true), mk(true))
+		require.True(t, result.Success)
+		assert.NotContains(t, result.ChangedFields, "enable_code_execution")
+	})
+}
+
+// TestDetectConfigChanges_ServersRoundTripNoFalsePositive (UX audit F16): the
+// PATCH /api/v1/config handler round-trips the LIVE config through JSON before
+// merging the patch, so newCfg.Servers is a decoded copy while oldCfg.Servers is
+// the in-memory slice. reflect.DeepEqual saw those as different — `Created`
+// carries a monotonic reading and a *time.Location in memory but not after an
+// RFC3339 decode, and `omitempty` collapses empty Args/Env/Headers to nil — so
+// EVERY patch reported "mcpServers" as changed. That both mislabelled
+// changed_fields in the UI (the audit's own symptom) and triggered a spurious
+// full upstream reload/reconnect on every settings save.
+func TestDetectConfigChanges_ServersRoundTripNoFalsePositive(t *testing.T) {
+	now := time.Now()
+	old := &config.Config{
+		Listen: "127.0.0.1:8080", DataDir: "/d", TLS: &config.TLSConfig{},
+		Servers: []*config.ServerConfig{
+			{
+				Name:     "github",
+				URL:      "https://api.github.com/mcp",
+				Protocol: "http",
+				Enabled:  true,
+				Args:     []string{},
+				Env:      map[string]string{},
+				Headers:  map[string]string{},
+				Created:  now,
+				Updated:  now,
+			},
+		},
+	}
+
+	b, err := json.Marshal(old) // simulate handlePatchConfig's round-trip
+	require.NoError(t, err)
+	var next config.Config
+	require.NoError(t, json.Unmarshal(b, &next))
+	// The user patched exactly one unrelated scalar.
+	next.EnableCodeExecution = !old.EnableCodeExecution
+
+	result := DetectConfigChanges(old, &next)
+	require.True(t, result.Success)
+	assert.NotContains(t, result.ChangedFields, "mcpServers",
+		"mcpServers was not patched — the JSON round-trip is not a change")
+	assert.Equal(t, []string{"enable_code_execution"}, result.ChangedFields)
+}
+
+// TestDetectConfigChanges_ServersRealChangeStillDetected: real server edits must
+// still be detected through the round-trip-tolerant comparison.
+func TestDetectConfigChanges_ServersRealChangeStillDetected(t *testing.T) {
+	mk := func(url string) *config.Config {
+		return &config.Config{
+			Listen: "127.0.0.1:8080", DataDir: "/d", TLS: &config.TLSConfig{},
+			Servers: []*config.ServerConfig{
+				{Name: "github", URL: url, Protocol: "http", Enabled: true},
+			},
+		}
+	}
+
+	t.Run("field edit", func(t *testing.T) {
+		result := DetectConfigChanges(mk("https://a/mcp"), mk("https://b/mcp"))
+		require.True(t, result.Success)
+		assert.Contains(t, result.ChangedFields, "mcpServers")
+	})
+
+	t.Run("server added", func(t *testing.T) {
+		next := mk("https://a/mcp")
+		next.Servers = append(next.Servers, &config.ServerConfig{Name: "second", URL: "https://c/mcp"})
+		result := DetectConfigChanges(mk("https://a/mcp"), next)
+		require.True(t, result.Success)
+		assert.Contains(t, result.ChangedFields, "mcpServers")
+	})
+
+	t.Run("server removed", func(t *testing.T) {
+		old := mk("https://a/mcp")
+		next := mk("https://a/mcp")
+		next.Servers = nil
+		result := DetectConfigChanges(old, next)
+		require.True(t, result.Success)
+		assert.Contains(t, result.ChangedFields, "mcpServers")
+	})
+
+	t.Run("no servers on either side is not a change", func(t *testing.T) {
+		old := &config.Config{Listen: "127.0.0.1:8080", DataDir: "/d", TLS: &config.TLSConfig{}}
+		next := &config.Config{
+			Listen: "127.0.0.1:8080", DataDir: "/d", TLS: &config.TLSConfig{},
+			Servers: []*config.ServerConfig{},
+		}
+		result := DetectConfigChanges(old, next)
+		require.True(t, result.Success)
+		assert.NotContains(t, result.ChangedFields, "mcpServers")
+	})
+}
+
+// TestDetectConfigChanges_DirectToolResponseMode (Spec 102 T066/FR-014): an
+// apply that changes ONLY direct_tool_response_mode must be detected.
+//
+// Without a clause the apply computes empty ChangedFields, is swallowed as "no
+// changes detected", and never emits config.reloaded — so the guarded rebuild
+// downstream is never reached and the operator's flip silently does nothing
+// until the next servers.changed. The two axes are independent: moving one must
+// not report the other.
+func TestDetectConfigChanges_DirectToolResponseMode(t *testing.T) {
+	mk := func(direct, retrieve string) *config.Config {
+		return &config.Config{
+			Listen: "127.0.0.1:8080", DataDir: "/d", TLS: &config.TLSConfig{},
+			DirectToolResponseMode: direct,
+			ToolResponseMode:       retrieve,
+		}
+	}
+
+	t.Run("only direct_tool_response_mode differs -> detected, hot-reloadable", func(t *testing.T) {
+		result := DetectConfigChanges(mk("", ""), mk(config.DirectToolResponseModeDeferred, ""))
+		require.True(t, result.Success)
+		assert.Contains(t, result.ChangedFields, "direct_tool_response_mode")
+		assert.False(t, result.RequiresRestart, "serialization mode is hot-reloadable")
+	})
+
+	t.Run("flip back deferred -> full detected", func(t *testing.T) {
+		result := DetectConfigChanges(
+			mk(config.DirectToolResponseModeDeferred, ""),
+			mk(config.DirectToolResponseModeFull, ""))
+		require.True(t, result.Success)
+		assert.Contains(t, result.ChangedFields, "direct_tool_response_mode")
+	})
+
+	t.Run("unchanged mode not reported", func(t *testing.T) {
+		result := DetectConfigChanges(
+			mk(config.DirectToolResponseModeFull, ""),
+			mk(config.DirectToolResponseModeFull, ""))
+		require.True(t, result.Success)
+		assert.NotContains(t, result.ChangedFields, "direct_tool_response_mode")
+	})
+
+	t.Run("the two axes are independent", func(t *testing.T) {
+		// Moving the retrieve axis must not report the direct one…
+		retrieveOnly := DetectConfigChanges(mk("", ""), mk("", config.ToolResponseModeCompact))
+		assert.Contains(t, retrieveOnly.ChangedFields, "tool_response_mode")
+		assert.NotContains(t, retrieveOnly.ChangedFields, "direct_tool_response_mode")
+
+		// …and vice versa. A shared clause would make an operator's edit to one
+		// surface rebuild the other.
+		directOnly := DetectConfigChanges(mk("", ""), mk(config.DirectToolResponseModeDeferred, ""))
+		assert.Contains(t, directOnly.ChangedFields, "direct_tool_response_mode")
+		assert.NotContains(t, directOnly.ChangedFields, "tool_response_mode")
+	})
+
+	t.Run("an unrelated edit reports neither", func(t *testing.T) {
+		before := mk(config.DirectToolResponseModeDeferred, config.ToolResponseModeCompact)
+		after := mk(config.DirectToolResponseModeDeferred, config.ToolResponseModeCompact)
+		after.DebugSearch = !before.DebugSearch
+		result := DetectConfigChanges(before, after)
+		assert.NotContains(t, result.ChangedFields, "direct_tool_response_mode")
+	})
+}
+
+// Cross-model review: "" and "full" are the same mode, so normalizing one to
+// the other is NOT a change. Reporting it makes the apply result claim a field
+// moved when nothing did — the rebuild guard downstream would suppress the
+// churn, but the caller is still told wrong.
+func TestDetectConfigChanges_DirectToolResponseModeEmptyEqualsFull(t *testing.T) {
+	mk := func(mode string) *config.Config {
+		return &config.Config{
+			Listen: "127.0.0.1:8080", DataDir: "/d", TLS: &config.TLSConfig{},
+			DirectToolResponseMode: mode,
+		}
+	}
+
+	for _, tc := range []struct{ from, to string }{
+		{"", config.DirectToolResponseModeFull},
+		{config.DirectToolResponseModeFull, ""},
+	} {
+		result := DetectConfigChanges(mk(tc.from), mk(tc.to))
+		require.True(t, result.Success)
+		assert.NotContainsf(t, result.ChangedFields, "direct_tool_response_mode",
+			"%q -> %q is the same mode spelled two ways", tc.from, tc.to)
+	}
+
+	// Still detected when it really moves.
+	real := DetectConfigChanges(mk(""), mk(config.DirectToolResponseModeDeferred))
+	assert.Contains(t, real.ChangedFields, "direct_tool_response_mode")
+}
+
+// The retrieve axis has the same ""-means-"full" contract as the direct axis
+// above, so it needs the same normalized comparison. It shipped comparing raw
+// strings; exposing "full" as an explicit choice in the Settings form made an
+// explicit-vs-absent round trip reachable from the UI.
+func TestDetectConfigChanges_ToolResponseModeEmptyEqualsFull(t *testing.T) {
+	mk := func(mode string) *config.Config {
+		return &config.Config{
+			Listen: "127.0.0.1:8080", DataDir: "/d", TLS: &config.TLSConfig{},
+			ToolResponseMode: mode,
+		}
+	}
+
+	for _, tc := range []struct{ from, to string }{
+		{"", config.ToolResponseModeFull},
+		{config.ToolResponseModeFull, ""},
+	} {
+		result := DetectConfigChanges(mk(tc.from), mk(tc.to))
+		require.True(t, result.Success)
+		assert.NotContainsf(t, result.ChangedFields, "tool_response_mode",
+			"%q -> %q is the same mode spelled two ways", tc.from, tc.to)
+	}
+
+	// Still detected when it really moves, in both directions.
+	assert.Contains(t,
+		DetectConfigChanges(mk(""), mk(config.ToolResponseModeCompact)).ChangedFields,
+		"tool_response_mode")
+	assert.Contains(t,
+		DetectConfigChanges(mk(config.ToolResponseModeCompact), mk(config.ToolResponseModeFull)).ChangedFields,
+		"tool_response_mode")
+
+	// Normalizing one axis must not leak into the other.
+	assert.NotContains(t,
+		DetectConfigChanges(mk(""), mk(config.ToolResponseModeCompact)).ChangedFields,
+		"direct_tool_response_mode")
+}
+
+// TestDetectConfigChanges_RoutingModeRequiresRestart: /mcp is bound to ONE
+// mcp-go server instance at startup and registered on an http.ServeMux, which
+// cannot re-register a pattern — so a routing_mode change genuinely cannot take
+// effect on a running proxy.
+//
+// Before this clause the field was absent from detection entirely, which was
+// worse than silent: an API apply answered "No configuration changes detected"
+// while writing the new value to disk, so /api/v1/status, /api/v1/routing,
+// `mcpproxy doctor` and the Web UI header all reported the configured intent
+// while /mcp kept serving the old surface — and the Web UI showed a green
+// success toast, because its warning branch keys on RequiresRestart.
+func TestDetectConfigChanges_RoutingModeRequiresRestart(t *testing.T) {
+	mk := func(mode string) *config.Config {
+		return &config.Config{
+			Listen: "127.0.0.1:8080", DataDir: "/d", TLS: &config.TLSConfig{},
+			RoutingMode: mode,
+		}
+	}
+
+	t.Run("a change is detected AND flagged for restart", func(t *testing.T) {
+		result := DetectConfigChanges(mk(config.RoutingModeRetrieveTools), mk(config.RoutingModeDirect))
+		require.True(t, result.Success)
+		assert.Contains(t, result.ChangedFields, "routing_mode",
+			"the field must be reported, or the caller is told nothing changed")
+		assert.True(t, result.RequiresRestart,
+			"/mcp cannot rebind its routing mode on a running proxy")
+		assert.False(t, result.AppliedImmediately)
+		assert.NotEmpty(t, result.RestartReason, "the operator must be told WHY a restart is needed")
+	})
+
+	t.Run("an unchanged mode is not reported", func(t *testing.T) {
+		result := DetectConfigChanges(mk(config.RoutingModeDirect), mk(config.RoutingModeDirect))
+		require.True(t, result.Success)
+		assert.NotContains(t, result.ChangedFields, "routing_mode")
+		assert.False(t, result.RequiresRestart)
+	})
+
+	t.Run("it does not drag the serialization axes with it", func(t *testing.T) {
+		// The serialization axes ARE hot-reloadable. A routing_mode change must
+		// not make them look like they need a restart too, or an operator flips
+		// one and is told to restart for no reason.
+		before := mk(config.RoutingModeDirect)
+		after := mk(config.RoutingModeDirect)
+		after.DirectToolResponseMode = config.DirectToolResponseModeDeferred
+
+		result := DetectConfigChanges(before, after)
+		assert.Contains(t, result.ChangedFields, "direct_tool_response_mode")
+		assert.NotContains(t, result.ChangedFields, "routing_mode")
+		assert.False(t, result.RequiresRestart, "a serialization flip is hot-reloadable")
+		assert.True(t, result.AppliedImmediately)
+	})
+}
+
+// TestDetectConfigChanges_RoutingModeNormalization: routing_mode documents ""
+// as meaning retrieve_tools, exactly like its two serialization neighbours,
+// which both normalize before comparing. The routing_mode clause compared raw
+// strings, so an apply whose body simply OMITS routing_mode (a hand-written
+// config, a CLI apply, any client that does not round-trip every key) was
+// reported as a restart-required routing change to a mode that is the one
+// already being served — and the empty value was then persisted, at which point
+// /api/v1/routing normalizes it back and reports nothing pending. Two surfaces
+// contradicting each other over a change that never happened.
+func TestDetectConfigChanges_RoutingModeNormalization(t *testing.T) {
+	t.Run("empty vs explicit default is not a change", func(t *testing.T) {
+		old := &config.Config{RoutingMode: config.RoutingModeRetrieveTools}
+		next := &config.Config{RoutingMode: ""}
+		result := DetectConfigChanges(old, next)
+		assert.False(t, result.RequiresRestart, "omitting routing_mode must not force a restart")
+		assert.NotContains(t, result.ChangedFields, "routing_mode")
+	})
+
+	t.Run("explicit default vs empty is not a change either", func(t *testing.T) {
+		old := &config.Config{RoutingMode: ""}
+		next := &config.Config{RoutingMode: config.RoutingModeRetrieveTools}
+		result := DetectConfigChanges(old, next)
+		assert.False(t, result.RequiresRestart)
+		assert.NotContains(t, result.ChangedFields, "routing_mode")
+	})
+
+	t.Run("a real mode change still requires a restart", func(t *testing.T) {
+		old := &config.Config{RoutingMode: ""}
+		next := &config.Config{RoutingMode: config.RoutingModeDirect}
+		result := DetectConfigChanges(old, next)
+		assert.True(t, result.RequiresRestart)
+		assert.Contains(t, result.ChangedFields, "routing_mode")
+	})
+}
+
+// Spec 107 FR-027 (T047): trusted_proxies is live — reported as a changed
+// field, never restart-pinned; nil vs empty is not a change (omitempty).
+func TestDetectConfigChanges_TrustedProxies(t *testing.T) {
+	mk := func(list []string) *config.Config {
+		return &config.Config{
+			Listen: "127.0.0.1:8080", DataDir: "/d", TLS: &config.TLSConfig{},
+			TrustedProxies: list,
+		}
+	}
+
+	t.Run("trusted_proxies change detected live", func(t *testing.T) {
+		result := DetectConfigChanges(mk(nil), mk([]string{"10.0.0.0/8"}))
+		require.True(t, result.Success)
+		assert.Contains(t, result.ChangedFields, "trusted_proxies")
+		assert.False(t, result.RequiresRestart, "trusted_proxies is hot-reloadable")
+		assert.True(t, result.AppliedImmediately)
+	})
+
+	t.Run("nil vs empty slice not reported", func(t *testing.T) {
+		assert.NotContains(t, DetectConfigChanges(mk(nil), mk([]string{})).ChangedFields, "trusted_proxies")
+	})
+
+	t.Run("unchanged list not reported", func(t *testing.T) {
+		assert.NotContains(t, DetectConfigChanges(mk([]string{"::1"}), mk([]string{"::1"})).ChangedFields, "trusted_proxies")
+	})
+}
+
+// Spec 107 T108/T109: audit_log is bound at sink construction, so an edit is
+// reported restart-pinned, never applied immediately.
+func TestDetectConfigChanges_AuditLog_RestartPinned(t *testing.T) {
+	mk := func(a *config.AuditLogConfig) *config.Config {
+		return &config.Config{
+			Listen: "127.0.0.1:8080", DataDir: "/d", TLS: &config.TLSConfig{},
+			AuditLog: a,
+		}
+	}
+	trueVal := true
+
+	t.Run("nil to explicit block requires restart", func(t *testing.T) {
+		result := DetectConfigChanges(mk(nil), mk(&config.AuditLogConfig{Enabled: &trueVal, Stdout: &trueVal}))
+		require.True(t, result.Success)
+		assert.Contains(t, result.ChangedFields, "audit_log")
+		assert.True(t, result.RequiresRestart)
+		assert.False(t, result.AppliedImmediately)
+		assert.Equal(t, "audit_log is bound at sink construction", result.RestartReason)
+	})
+
+	t.Run("unchanged block not reported", func(t *testing.T) {
+		a := &config.AuditLogConfig{Enabled: &trueVal, Stdout: &trueVal}
+		b := &config.AuditLogConfig{Enabled: &trueVal, Stdout: &trueVal}
+		assert.NotContains(t, DetectConfigChanges(mk(a), mk(b)).ChangedFields, "audit_log")
+	})
+
+	t.Run("nil to nil not reported", func(t *testing.T) {
+		assert.NotContains(t, DetectConfigChanges(mk(nil), mk(nil)).ChangedFields, "audit_log")
 	})
 }

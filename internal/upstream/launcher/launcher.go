@@ -43,6 +43,24 @@ type Spec struct {
 
 	// StopGrace overrides DefaultStopGrace if non-zero.
 	StopGrace time.Duration
+
+	// RedactArgs masks the child's argv for the startup banner written to
+	// LogSink (issue #1158).
+	//
+	// The banner previously wrote cmd.Args verbatim into
+	// ~/.mcpproxy/logs/server-<name>.log on every spawn - fully transformed,
+	// i.e. AFTER the docker env->argv injection has turned every configured
+	// env var into `-e KEY=VALUE`, and after a login-shell wrap has folded the
+	// whole command line into one `-c "..."` element.
+	//
+	// The redactor is injected rather than imported because this package is
+	// deliberately dependency-free (`go list -deps` returns only itself);
+	// importing internal/oauth would drag config/security/storage in with it.
+	//
+	// nil means the banner OMITS argv entirely. That default is fail-CLOSED on
+	// purpose: a future caller that forgets to set the field loses a
+	// diagnostic, not a secret.
+	RedactArgs func([]string) []string
 }
 
 // Handle represents a running child managed by the launcher. Stop, Wait,
@@ -129,6 +147,13 @@ func Spawn(ctx context.Context, spec *Spec, log *zap.Logger) (Handle, error) {
 	}
 	h.pid.Store(int64(cmd.Process.Pid))
 
+	// On Windows, wrap the just-started process in a Job Object so that
+	// terminateProcess/killProcess below (and the natural-exit path in
+	// reap) can reach grandchildren the process spawns — Process.Kill()
+	// alone only ever reaches this one PID. No-op on Unix, where the
+	// process-group attrs applied via applyProcAttrs already cover this.
+	h.job = createJob(cmd)
+
 	// Pump stdout+stderr to LogSink. Both streams write to the same
 	// sink, prefixed so they remain distinguishable. Discard mode is
 	// supported via io.Discard. We wrap LogSink in a small mutex so
@@ -146,8 +171,14 @@ func Spawn(ctx context.Context, spec *Spec, log *zap.Logger) (Handle, error) {
 		if len(args) > 0 {
 			args = args[1:]
 		}
-		_, _ = fmt.Fprintf(sink, "[launcher] starting: %s %v (pid=%d)\n",
-			cmd.Path, args, cmd.Process.Pid)
+		if spec.RedactArgs == nil {
+			// Fail closed: no redactor, no argv. See Spec.RedactArgs.
+			_, _ = fmt.Fprintf(sink, "[launcher] starting: %s (%d args, redacted) (pid=%d)\n",
+				cmd.Path, len(args), cmd.Process.Pid)
+		} else {
+			_, _ = fmt.Fprintf(sink, "[launcher] starting: %s %v (pid=%d)\n",
+				cmd.Path, spec.RedactArgs(args), cmd.Process.Pid)
+		}
 	}
 
 	h.pumpWG.Add(2)
@@ -171,6 +202,7 @@ type handle struct {
 	log       *zap.Logger
 	done      chan struct{}
 	stopGrace time.Duration
+	job       io.Closer // Windows Job Object wrapper; nil on Unix (see createJob)
 
 	pid    atomic.Int64 // 0 once exited
 	pumpWG sync.WaitGroup
@@ -232,8 +264,9 @@ func (h *handle) stopLocked(ctx context.Context) error {
 		zap.Int("pid", h.Pid()),
 		zap.Duration("grace", h.stopGrace))
 
-	// SIGTERM the process group (Unix) / process (Windows fallback).
-	if err := terminateProcess(h.cmd, h.log); err != nil {
+	// SIGTERM the process group (Unix) / terminate the Job Object tree
+	// (Windows) — see the platform files for h.terminate.
+	if err := h.terminate(); err != nil {
 		h.log.Warn("terminate failed (will fall through to wait/kill)",
 			zap.Error(err))
 	}
@@ -252,7 +285,7 @@ func (h *handle) stopLocked(ctx context.Context) error {
 	h.log.Warn("child did not exit within grace period; sending SIGKILL",
 		zap.Int("pid", h.Pid()),
 		zap.Duration("grace", h.stopGrace))
-	if err := killProcess(h.cmd, h.log); err != nil {
+	if err := h.kill(); err != nil {
 		h.log.Error("kill failed", zap.Error(err))
 		// Fall through — we still wait for done.
 	}
@@ -275,6 +308,15 @@ func (h *handle) reap() {
 	// kernel propagates EOF — we don't need Wait() to reach that state.
 	h.pumpWG.Wait()
 	err := h.cmd.Wait()
+
+	// Release the Job Object (Windows only — see createJob/winjob). By the
+	// time we get here every pipe holder has exited, so on the Stop path
+	// this is a no-op (h.terminate/h.kill already closed the job — that is
+	// what made the pumps reach EOF); it only does real work when the
+	// whole tree exited on its own. Close is idempotent and goroutine-safe.
+	if h.job != nil {
+		_ = h.job.Close()
+	}
 
 	h.waitErrMu.Lock()
 	h.waitErr = err

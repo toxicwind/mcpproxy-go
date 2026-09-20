@@ -6,9 +6,17 @@ import SwiftUI
 enum SidebarItem: String, CaseIterable, Identifiable {
     case dashboard = "Dashboard"
     case servers = "Servers"
+    // F16: BM25 tool discovery is the product's headline feature and had no
+    // native home — a tray-first user could not answer "which of my 942 tools
+    // does X?" without opening a browser.
+    case tools = "Tools"
     case registries = "Registries"
     case activity = "Activity Log"
     case secrets = "Secrets"
+    // F5: TokensView was a complete, API-complete create/list/revoke UI that
+    // nothing instantiated — a headline security feature reachable from the
+    // Web UI and the CLI but not from the app the user has open.
+    case tokens = "Agent Tokens"
 
     var id: String { rawValue }
 
@@ -16,9 +24,11 @@ enum SidebarItem: String, CaseIterable, Identifiable {
         switch self {
         case .dashboard: return "rectangle.3.group"
         case .servers: return "server.rack"
+        case .tools: return "wrench.and.screwdriver"
         case .registries: return "books.vertical"
         case .activity: return "clock.arrow.circlepath"
         case .secrets: return "key.fill"
+        case .tokens: return "key.horizontal"
         }
     }
 
@@ -26,7 +36,16 @@ enum SidebarItem: String, CaseIterable, Identifiable {
 
 struct MainWindow: View {
     @ObservedObject var appState: AppState
-    @State private var selectedItem: SidebarItem? = .dashboard
+    @State private var selectedItem: SidebarItem?
+
+    /// `initialTab` seeds the sidebar selection for a window created to land
+    /// on a specific section (tray "Open Activity…" → Activity). Once the
+    /// window exists, later switches arrive as `.switchToSidebarTab`
+    /// notifications instead — state is only readable at creation time.
+    init(appState: AppState, initialTab: SidebarItem = .dashboard) {
+        self.appState = appState
+        _selectedItem = State(initialValue: initialTab)
+    }
 
     var body: some View {
         NavigationSplitView {
@@ -61,12 +80,16 @@ struct MainWindow: View {
                         DashboardView(appState: appState)
                     case .servers:
                         ServersView(appState: appState)
+                    case .tools:
+                        ToolsView(appState: appState)
                     case .registries:
                         RegistriesView(appState: appState)
                     case .activity:
                         ActivityView(appState: appState)
                     case .secrets:
                         SecretsView(appState: appState)
+                    case .tokens:
+                        TokensView(appState: appState)
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -82,6 +105,20 @@ struct MainWindow: View {
         .onReceive(NotificationCenter.default.publisher(for: .switchToServers)) { _ in
             selectedItem = .servers
         }
+        .onReceive(NotificationCenter.default.publisher(for: .switchToSidebarTab)) { note in
+            guard let item = MainWindow.sidebarItem(from: note) else { return }
+            selectedItem = item
+        }
+    }
+
+    /// Decode a `.switchToSidebarTab` notification's payload. The wire form is
+    /// the SidebarItem raw value as a String (posted by
+    /// `AppController.showMainWindow(tab:)`); anything else — including a
+    /// SidebarItem posted as the object itself — is deliberately dropped
+    /// rather than crashing a notification handler.
+    static func sidebarItem(from note: Notification) -> SidebarItem? {
+        guard let raw = note.object as? String else { return nil }
+        return SidebarItem(rawValue: raw)
     }
 
     /// Hidden ⌘1…⌘5 shortcuts to jump straight to each sidebar section. Keeps

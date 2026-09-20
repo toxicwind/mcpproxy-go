@@ -11,6 +11,12 @@ keywords: [updates, version, upgrade, notifications]
 
 MCPProxy includes built-in update checking to help you stay current with the latest features and security fixes.
 
+:::tip Installing the update
+This page covers how MCPProxy *notices* a new version. For actually applying
+one — the macOS one-click updater, `mcpproxy update`, the per-channel behaviour
+matrix and the kill switches — see [Auto-Update](/features/auto-update).
+:::
+
 ## How It Works
 
 MCPProxy automatically checks for new versions by querying GitHub Releases:
@@ -52,7 +58,7 @@ $ mcpproxy doctor
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 🔍 MCPProxy Health Check
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Version: v1.2.3 (update available: v1.3.0)
+Version: v1.2.3 (update available: v1.3.0, 8 releases / ~14 weeks behind)
 Download: https://github.com/smart-mcp-proxy/mcpproxy-go/releases/tag/v1.3.0
 
 ✅ All systems operational! No issues detected.
@@ -110,12 +116,31 @@ are the operator override:
 
 - `MCPPROXY_DISABLE_AUTO_UPDATE=true` disables checking even when
   `update_check.enabled` is `true`.
-- `MCPPROXY_ALLOW_PRERELEASE_UPDATES=true` selects the prerelease channel even
-  when `update_check.channel` is `"stable"`.
+- `MCPPROXY_ALLOW_PRERELEASE_UPDATES=true` selects the prerelease channel — but
+  see the build-identity rule below: it only takes effect on dev/unstamped
+  builds.
 
 The env vars only widen in one direction (disable checks / include
 prereleases). They cannot re-enable checking that the config disabled: with
 `update_check.enabled: false`, no check runs regardless of environment.
+
+### The running build's version decides the channel
+
+For a **released** build the running binary's own version is authoritative and
+overrides both `update_check.channel` and `MCPPROXY_ALLOW_PRERELEASE_UPDATES`:
+
+- a **stable** build (e.g. `v0.56.0`) is **never** offered an RC — a stale `rc`
+  opt-in left over from a previously-installed RC cannot resurrect RC offers;
+- an **RC** build (`-rc.N` / `-next.*`) tracks the **rc** channel automatically
+  (offered the next RC, and its graduating stable) with no opt-in;
+- a **dev / unstamped** build (local `go build`, a `go install @commit`
+  pseudo-version) has no release identity, so the `channel` config key and
+  `MCPPROXY_ALLOW_PRERELEASE_UPDATES` still apply — the only way to exercise the
+  rc channel without a released RC binary.
+
+The macOS tray applies the same rule to itself: a stable tray app never offers
+itself an RC even when attached to a newer RC core. See
+[Prerelease Builds](https://github.com/smart-mcp-proxy/mcpproxy-go/blob/main/docs/prerelease-builds.md).
 
 ### Examples
 
@@ -151,6 +176,9 @@ Response includes an `update` field when version information is available:
     "update": {
       "available": true,
       "latest_version": "v1.3.0",
+      "behind_summary": "8 releases / ~14 weeks behind",
+      "releases_behind": 8,
+      "weeks_behind": 14,
       "release_url": "https://github.com/smart-mcp-proxy/mcpproxy-go/releases/tag/v1.3.0",
       "checked_at": "2025-01-15T10:30:00Z",
       "is_prerelease": false,
@@ -171,10 +199,10 @@ guided command in `mcpproxy status`, `mcpproxy doctor`, and the Web UI
 banner).
 
 Detection prefers a **build-time channel marker** stamped into
-single-channel artifacts at packaging time (the Docker image and the Windows
-installer). When no marker is present — the release archives feed the
-tarball, Homebrew, and DMG channels from one binary — runtime heuristics run
-in decreasing confidence order:
+single-channel artifacts at packaging time (the Docker image, the Windows
+installer, and — since Spec 092 — the release `.tar.gz`/`.zip` archives).
+When no marker is present, runtime heuristics run in decreasing confidence
+order:
 
 1. **Homebrew**: the (symlink-resolved) executable path lives under a
    Homebrew prefix (`/opt/homebrew/`, a `Cellar/` path, or
@@ -208,6 +236,22 @@ in decreasing confidence order:
 Ambiguity always resolves to `unknown`: MCPProxy never guesses a channel,
 because a wrong update command is worse than a generic instruction.
 
+### Why the `tarball` marker is weak
+
+The `tarball` marker is the one exception to "the marker wins". Homebrew
+installs the *same* release `.tar.gz` into its Cellar, so a stamped binary can
+legitimately end up in a Homebrew (or, after a future packaging change, some
+other) install. The detector therefore runs heuristics 1–5 first and only
+applies a `tarball` marker when none of them matched — that is, when the
+binary is an official release archive extracted somewhere no package manager
+owns. Every other marker (docker, windows-installer, …) still short-circuits
+detection.
+
+This is what makes `tarball` a *positive* identification: `mcpproxy update`
+self-replaces the binary only on this channel (Spec 092 FR-020). A plain
+`unknown` install is never self-updated, no matter how writable it is —
+writability is not ownership.
+
 ### Update Commands per Channel
 
 | Channel | `update_command` | Guidance shown instead |
@@ -219,7 +263,8 @@ because a wrong update command is worse than a generic instruction.
 | `dmg` | — | Download the latest DMG (release page is deep-linked) |
 | `windows-installer` | — | Download the latest Windows installer |
 | `docker` | — | Pull or rebuild the newer image for your deployment |
-| `tarball` / `unknown` | — | Download the latest release from the releases page |
+| `tarball` | `mcpproxy update` | — |
+| `unknown` | — | Download the latest release from the releases page |
 
 Every surface always deep-links the release notes for the latest version,
 whether or not a command is available.
@@ -229,11 +274,54 @@ whether or not a command is available.
 published only to the GitHub pre-release channel, so the package-manager
 commands above would not deliver them (`brew`/`apt`/`dnf` serve stable
 artifacts, and Go's `@latest` resolves to the newest stable). When the offered
-version is a prerelease, only `go-install` gets a command — pinned to the
-exact version (`…/cmd/mcpproxy@v0.48.0-rc.1`) — and every other channel falls
-back to the release-page guidance.
+version is a prerelease, only `go-install` (pinned to the exact version,
+`…/cmd/mcpproxy@v0.48.0-rc.1`) and `tarball` (`mcpproxy update`, which resolves
+releases through the same prerelease selection) keep a command — every other
+channel falls back to the release-page guidance.
 
 ## Updating MCPProxy
+
+### `mcpproxy update` (all channels)
+
+`mcpproxy update` branches on the detected install channel (Spec 092 US3) so
+you never have to remember which one you are on:
+
+| Channel | What the command does |
+|---------|----------------------|
+| `homebrew` / `deb` / `rpm` / `go-install` | Prints the exact upgrade command and exits. Nothing is modified — the package manager owns the install. |
+| `docker` / `windows-installer` | Prints channel-appropriate guidance. |
+| `dmg` (macOS app bundle) | Points at the menu bar app (MCPProxy menu → Check for Updates). The app bundle and its staged core copy are never modified. |
+| `tarball` | Performs a verified self-update (see below). |
+| `unknown` | Guidance only. Pass `--self` to assert that you manage the binary yourself; writability alone is not ownership. |
+
+```bash
+mcpproxy update --check                     # current / latest / channel, no side effects
+mcpproxy update                             # do the right thing for this install
+mcpproxy update -o json                     # machine-readable report
+mcpproxy update --self                      # assert a self-managed install on `unknown`
+mcpproxy update --version v0.54.0 --force   # deliberate downgrade (both flags required)
+```
+
+**Self-update safety rules** (FR-021/FR-022):
+
+- The release archive's SHA-256 is always checked against the release's
+  `checksums.txt`, and `checksums.txt` itself is verified against its cosign
+  signature bundle with the signing identity pinned to this repository's
+  release workflow. Verification currently shells out to a locally installed
+  [cosign](https://docs.sigstore.dev/cosign/installation/); if cosign is not on
+  `PATH` the update **aborts** — `--allow-unverified-signature` is the explicit
+  (and loudly warned) opt-out that falls back to checksum-only verification.
+- The swap is a rename inside the target directory, the file mode is
+  preserved, and a symlinked launcher has its destination replaced rather than
+  the symlink.
+- The previous binary is kept as `<binary>.old` until the new one runs and
+  reports the expected version; on any failure it is restored.
+- A non-writable target fails with a message naming the path and its owner.
+  MCPProxy never escalates privileges.
+- A version equal to or older than the running one requires **both**
+  `--version <tag>` and `--force`.
+- An already-running core keeps executing the old binary; the swap takes
+  effect the next time it starts.
 
 ### Homebrew (macOS/Linux)
 

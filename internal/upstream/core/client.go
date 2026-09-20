@@ -10,7 +10,9 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/hash"
@@ -27,18 +29,30 @@ import (
 	"github.com/mark3labs/mcp-go/client/transport"
 	"github.com/mark3labs/mcp-go/mcp"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
 // Client implements basic MCP client functionality without state management
 type Client struct {
-	id           string
-	config       *config.ServerConfig
-	globalConfig *config.Config
-	storage      *storage.BoltDB
-	logger       *zap.Logger
+	id     string
+	config *config.ServerConfig
+	// exposePrompts mirrors config.ExposePrompts but can be updated without a
+	// reconnect (PR #973 review, P2): config itself is set once in NewClient
+	// and never reassigned, so ListPrompts/GetPrompt would otherwise keep
+	// enforcing whatever ExposePrompts value was in effect when the
+	// connection was created even after a config hot-reload. Updated via
+	// SetExposePrompts, mirroring managed.Client's cfg pointer swap.
+	exposePrompts atomic.Pointer[bool]
+	globalConfig  *config.Config
+	storage       *storage.BoltDB
+	logger        *zap.Logger
 
 	// Upstream server specific logger for debugging
 	upstreamLogger *zap.Logger
+	// upstreamLogCloser releases upstreamLogger's file sink. Disconnect
+	// closes it (issue #1266); the sink reopens on the next write, so a
+	// reconnecting server logs on as before. nil for console (CLI) loggers.
+	upstreamLogCloser io.Closer
 
 	// MCP client and server info
 	client     *client.Client
@@ -58,6 +72,13 @@ type Client struct {
 	connected  bool
 	connecting bool // Prevent concurrent connection attempts
 
+	// authStrategy holds the name of the HTTP/SSE auth strategy the current
+	// connection was established with (see AuthStrategy). Atomic rather than
+	// under c.mu because Connect holds c.mu for the whole attempt — an OAuth
+	// flow can take minutes — and the server-list projection must be able to
+	// read it without waiting on that.
+	authStrategy atomic.Value
+
 	// OAuth progress tracking (separate mutex to prevent reentrant deadlock)
 	oauthMu            sync.RWMutex
 	oauthInProgress    bool
@@ -69,13 +90,19 @@ type Client struct {
 	// when multiple requests are in-flight simultaneously
 	sseRequestMu sync.Mutex
 
-	// brokeredAuth, when set, is the per-user upstream credential the gateway
-	// resolved for this (user, server) connection. The headers-auth strategy
-	// injects it into the configured outbound header, replacing any inbound or
-	// statically-configured auth — the gateway/IdP token is never forwarded
-	// (spec 074 FR-016/FR-017). nil for non-brokered upstreams (unchanged
-	// behaviour).
-	brokeredAuth *proxytransport.BrokeredAuth
+	// retryAfter collects the `Retry-After` hints this upstream's HTTP/SSE
+	// responses carry. mcp-go flattens a 429 into an error string long before
+	// the connection state machine sees it, so the hint is captured by a
+	// RoundTripper installed under the MCP client and read back here via
+	// RetryAfterDeadline (#1040).
+	//
+	// It is a generation pointer, not a fixed recorder: each connect attempt
+	// swaps in a fresh one (beginRetryAfterGeneration). Transports built for an
+	// earlier attempt keep the recorder they captured at construction, so a
+	// request still in flight on a superseded client cannot write into the
+	// current attempt's slate — and the current attempt starts empty by
+	// construction rather than by racing a Clear.
+	retryAfter atomic.Pointer[proxytransport.RetryAfterRecorder]
 
 	// Transport type and stderr access (for stdio)
 	transportType string
@@ -116,6 +143,7 @@ type Client struct {
 
 	// Docker container tracking
 	containerID     string
+	containerOwner  string // com.mcpproxy.server label read back when containerID was verified (Spec 105 D9)
 	containerName   string // Store container name for cleanup via docker container commands
 	isDockerCommand bool
 
@@ -129,6 +157,9 @@ type Client struct {
 
 	// Notification callback for tools/list_changed
 	onToolsChanged func(serverName string)
+
+	// Notification callback for prompts/list_changed (F13)
+	onPromptsChanged func(serverName string)
 }
 
 // NewClient creates a new core MCP client
@@ -167,6 +198,8 @@ func NewClientWithOptions(id string, serverConfig *config.ServerConfig, logger *
 			zap.String("upstream_name", serverConfig.Name),
 		),
 	}
+	c.exposePrompts.Store(resolvedServerConfig.ExposePrompts)
+	c.retryAfter.Store(proxytransport.NewRetryAfterRecorder())
 
 	// Create secure environment manager
 	var envConfig *secureenv.EnvConfig
@@ -219,13 +252,14 @@ func NewClientWithOptions(id string, serverConfig *config.ServerConfig, logger *
 	// Create upstream server logger if provided
 	if logConfig != nil {
 		var upstreamLogger *zap.Logger
+		var upstreamLogCloser io.Closer
 		var err error
 
 		// Use CLI logger for debugging or regular logger for daemon mode
 		if cliDebugMode {
 			upstreamLogger, err = logs.CreateCLIUpstreamServerLogger(logConfig, serverConfig.Name)
 		} else {
-			upstreamLogger, err = logs.CreateUpstreamServerLogger(logConfig, serverConfig.Name)
+			upstreamLogger, upstreamLogCloser, err = logs.NewUpstreamServerLogger(logConfig, serverConfig.Name)
 		}
 
 		if err != nil {
@@ -235,6 +269,7 @@ func NewClientWithOptions(id string, serverConfig *config.ServerConfig, logger *
 				zap.Error(err))
 		} else {
 			c.upstreamLogger = upstreamLogger
+			c.upstreamLogCloser = upstreamLogCloser
 			if logConfig.Level == "trace" && cliDebugMode {
 				c.upstreamLogger.Debug("TRACE LEVEL ENABLED - All JSON-RPC frames will be logged to console",
 					zap.String("server", serverConfig.Name))
@@ -266,6 +301,17 @@ func (c *Client) Ping(ctx context.Context) error {
 		return fmt.Errorf("client not connected")
 	}
 
+	// Spec 058: mcp-go deprecated Ping because the RPC was removed in protocol
+	// 2026-07-28, where it returns success WITHOUT sending anything — a health
+	// probe that always passes is worse than none, since it reports a dead
+	// upstream as healthy.
+	//
+	// This remains a real probe today only because the upstream handshake is
+	// pinned to the legacy era (FR-027, connection_lifecycle.go). Lifting that
+	// pin MUST come with an era-aware replacement, or spec 074's health loop
+	// goes blind; that is tracked as a required task of the pin lift, not as
+	// cleanup.
+	//nolint:staticcheck // SA1019: valid on the legacy era this client is pinned to; see above.
 	return client.Ping(ctx)
 }
 
@@ -311,7 +357,12 @@ func (c *Client) ListTools(ctx context.Context) ([]*config.ToolMetadata, error) 
 	listReq := mcp.ListToolsRequest{}
 	toolsResult, err := client.ListTools(ctx, listReq)
 	if err != nil {
-		c.logger.Error("Failed to list tools via direct call to upstream server",
+		// Debug, not Error: both callers above (managed.Client.ListTools and
+		// upstream.Manager.discoverTools) log this same failure, so logging it
+		// here made one transient sweep miss cost three ERROR lines. The
+		// outermost caller is the only layer that knows whether the failure
+		// matters — a periodic sweep just retries on the next cycle.
+		c.logger.Debug("Failed to list tools via direct call to upstream server",
 			zap.String("server", c.config.Name),
 			zap.Error(err))
 		return nil, fmt.Errorf("failed to list tools: %w", err)
@@ -333,9 +384,16 @@ func (c *Client) ListTools(ctx context.Context) ([]*config.ToolMetadata, error) 
 		// no-op (FR-A7).
 		outputSchemaJSON := captureOutputSchemaJSON(tool)
 
+		// Spec 105 FR-009: stamp the exact upstream-reported name as RawName.
+		// Name carries the same raw string for the index/search seams (#871),
+		// but only RawName is an unambiguous identity — a raw name may itself
+		// contain colons ("ns:erase") or even begin with this server's own
+		// prefix, and every producer downstream (approval records, index
+		// docIDs) keys on it via config.RawToolName.
 		toolMeta := &config.ToolMetadata{
 			ServerName:       c.config.Name,
 			Name:             tool.Name,
+			RawName:          tool.Name,
 			Description:      tool.Description,
 			ParamsJSON:       paramsJSON,
 			OutputSchemaJSON: outputSchemaJSON,
@@ -508,6 +566,44 @@ func (c *Client) GetConnectionInfo() types.ConnectionInfo {
 		State:      state,
 		ServerName: c.getServerName(),
 	}
+}
+
+// httpTransportConfig builds the transport config for this client's HTTP/SSE
+// connections, threading the per-server Retry-After recorder (#1040) into every
+// mcp-go client we construct. Every HTTP/SSE connect path must go through it —
+// a branch that calls proxytransport.CreateHTTPTransportConfig directly would
+// silently lose the rate-limit hint for that auth strategy.
+func (c *Client) httpTransportConfig(serverConfig *config.ServerConfig, oauthConfig *client.OAuthConfig) *proxytransport.HTTPTransportConfig {
+	cfg := proxytransport.CreateHTTPTransportConfig(serverConfig, oauthConfig)
+	// The transport captures THIS generation's recorder. A later attempt swaps
+	// the pointer, and this client keeps writing to the recorder it was built
+	// with — which is exactly what keeps generations from bleeding into each
+	// other (#1040).
+	cfg.RetryAfter = c.retryAfter.Load()
+	return cfg
+}
+
+// beginRetryAfterGeneration retires the current recorder and installs a fresh
+// one for a new connect attempt. Swapping rather than clearing means a request
+// still in flight on a superseded transport writes into the retired recorder,
+// where it can no longer be mistaken for something this attempt observed.
+func (c *Client) beginRetryAfterGeneration() {
+	c.retryAfter.Store(proxytransport.NewRetryAfterRecorder())
+}
+
+// RetryAfterDeadline reports the instant before which this upstream asked us not
+// to come back (from a `Retry-After` on a 429/503), or the zero time when it gave
+// no such hint. The managed client stamps it onto the state machine so both
+// reconnect gates honour it (#1040).
+func (c *Client) RetryAfterDeadline() time.Time {
+	return c.retryAfter.Load().Deadline()
+}
+
+// ClearRetryAfter drops any recorded rate-limit hint. Called once a connection
+// succeeds so a hint observed by an auth strategy that was superseded by a
+// working one cannot hold back a later, unrelated reconnect.
+func (c *Client) ClearRetryAfter() {
+	c.retryAfter.Load().Clear()
 }
 
 // GetServerInfo returns server information from initialization
@@ -719,7 +815,16 @@ func (c *Client) refreshTokenWithStoredCredentials(ctx context.Context, tokenEnd
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("token refresh failed with status %d: %s", resp.StatusCode, string(body))
+		// Issue #1158 (review round 2, investigation 2). The token endpoint's
+		// error BODY was embedded verbatim, and this error is logged with the
+		// server name and returned to the REST caller. Two problems, both real:
+		// an OAuth error_description is provider-authored free text that does
+		// echo request parameters back (and this request's form carries
+		// client_secret and refresh_token), and the body is unbounded, so a
+		// 502 HTML page from a proxy in front of the endpoint went into
+		// main.log whole. Scrub with the free-text rule, then cap.
+		return nil, fmt.Errorf("token refresh failed with status %d: %s",
+			resp.StatusCode, cappedScrub(string(body), 512))
 	}
 
 	var tokenResp oauthTokenResponse
@@ -748,12 +853,30 @@ func (c *Client) GetConfig() *config.ServerConfig {
 	return c.config
 }
 
+// SetExposePrompts updates the ExposePrompts override without requiring a
+// reconnect (PR #973 review, P2). Call this whenever the owning
+// managed.Client's config is refreshed so a hot-reloaded expose_prompts
+// value takes effect immediately instead of only after the connection is
+// torn down and recreated.
+func (c *Client) SetExposePrompts(exposePrompts *bool) {
+	c.exposePrompts.Store(exposePrompts)
+}
+
 // SetOnToolsChangedCallback sets the callback invoked when a notifications/tools/list_changed
 // notification is received from the upstream MCP server. This enables reactive tool re-indexing.
 func (c *Client) SetOnToolsChangedCallback(callback func(serverName string)) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.onToolsChanged = callback
+}
+
+// SetOnPromptsChangedCallback sets the callback invoked when a
+// notifications/prompts/list_changed notification is received from the upstream
+// MCP server (F13). Enables reactive re-aggregation of upstream prompts.
+func (c *Client) SetOnPromptsChangedCallback(callback func(serverName string)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.onPromptsChanged = callback
 }
 
 // Helper methods
@@ -793,4 +916,50 @@ func containsString(str, substr string) bool {
 		}
 	}
 	return false
+}
+
+// oauthLogger returns the logger the OAuth layer should write through.
+//
+// It tees the main logger and this upstream's own per-server log. Both halves
+// matter:
+//
+//   - c.logger reaches main.log, where operators and the docs look first.
+//   - c.upstreamLogger writes server-<name>.log, which is what
+//     `mcpproxy upstream logs <name>` serves. docs/configuration.md points the
+//     operator at that command for a redirect_uri failure, so the records have
+//     to actually be there — otherwise they find nothing and conclude the
+//     diagnostic does not exist.
+//
+// Before this, internal/oauth logged through zap.L(), which is the no-op logger
+// in this binary (zap.ReplaceGlobals is never called), so neither destination
+// got anything at all.
+func (c *Client) oauthLogger() *zap.Logger {
+	switch {
+	case c.upstreamLogger == nil:
+		return c.logger
+	case c.logger == nil:
+		return c.upstreamLogger
+	default:
+		return zap.New(zapcore.NewTee(c.logger.Core(), c.upstreamLogger.Core()))
+	}
+}
+
+// cappedScrub renders an upstream-authored response body for an error message:
+// the free-form rule first, then the cap, and the cut moved back to a rune
+// boundary because the mask rendering is multi-byte.
+//
+// Scrub-then-cap, not cap-then-scrub: cutting first hands the detectors a
+// FRAGMENT of any credential straddling the boundary, and every vendor-shaped
+// matcher is anchored on a complete token, so the fragment matches nothing and
+// its leading bytes are published.
+func cappedScrub(s string, limit int) string {
+	scrubbed := oauth.ScrubUpstreamText(s)
+	if len(scrubbed) <= limit {
+		return scrubbed
+	}
+	cut := limit
+	for cut > 0 && !utf8.RuneStart(scrubbed[cut]) {
+		cut--
+	}
+	return scrubbed[:cut] + "… (truncated)"
 }

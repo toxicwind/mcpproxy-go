@@ -39,7 +39,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
         with:
-          go-version: "1.25"
+          go-version: "1.26"
           cache: true
 
       - name: Download dependencies
@@ -79,6 +79,30 @@ jobs:
             ./internal/sandbox/... \
             ./internal/upstream/core/... \
             ./internal/security/scanner/...
+
+      # 4b. The escape this suite exists to catch is scheduler-dependent: the
+      #     Landlock domain is per-thread, so the bug only shows when the Go
+      #     runtime moves the goroutine off the confined thread between Apply and
+      #     execve. On an idle runner that never happens and every step above
+      #     passes even with the bug present. Saturate the CPUs first so the
+      #     enforcement tests are actually discriminating.
+      - name: Sandbox enforcement under scheduler load
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          set +m                      # no job-control messages for the load pack
+          pids=""
+          # shellcheck disable=SC2034
+          for _ in $(seq 1 "$(nproc)"); do
+            ( while :; do :; done ) &
+            pids="$pids $!"
+          done
+          # Kill the load pack however this step exits (pass, fail, or timeout)
+          # so a stuck busy loop can never outlive the step and hang the job.
+          # shellcheck disable=SC2064
+          trap "kill $pids 2>/dev/null || true" EXIT INT TERM
+          go test -race -count=30 -run 'TestSandboxWrapper_EndToEnd' ./internal/upstream/core/
+          go test -race -count=10 -run 'TestApplyPinsThreadAcrossReschedule|TestLandlockEnforcesFilesystemAllowlist' ./internal/sandbox/
 
       # 5. Build the binary (proves sandbox code compiles on linux/amd64).
       - name: Build mcpproxy binary
@@ -162,7 +186,7 @@ jobs:
 
       - name: Upload server log
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: sandbox-server-log
           path: /tmp/mcp3236-ci/server.log

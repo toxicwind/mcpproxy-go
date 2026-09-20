@@ -8,8 +8,13 @@ import (
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
 )
 
-// ConvertServerConfig converts a config.ServerConfig to a contracts.Server
-func ConvertServerConfig(cfg *config.ServerConfig, status string, connected bool, toolCount int, authenticated bool) *Server {
+// ConvertServerConfig converts a config.ServerConfig to a contracts.Server.
+//
+// globalIsolation is the global docker_isolation block; it is required to
+// resolve the EFFECTIVE isolation state, which is what `isolation.enabled`
+// reports on the wire (GH #1142). Pass nil only when no global config exists —
+// that resolves to "no isolation", the same answer the spawn path gives.
+func ConvertServerConfig(cfg *config.ServerConfig, globalIsolation *config.DockerIsolationConfig, status string, connected bool, toolCount int, authenticated bool) *Server {
 	server := &Server{
 		ID:             cfg.Name,
 		Name:           cfg.Name,
@@ -42,6 +47,14 @@ func ConvertServerConfig(cfg *config.ServerConfig, status string, connected bool
 		// MCP-3322: surface the per-server init_timeout override so callers can
 		// read back a configured handshake deadline.
 		InitTimeout: cfg.InitTimeout,
+		// F9: surface the per-server prompt-aggregation override so a caller that
+		// PATCHed it can read it back.
+		ExposePrompts: cfg.ExposePrompts,
+		// Spec 093: surface the per-server concurrency overrides (tri-state) so a
+		// caller that PATCHed a limit can read it back.
+		MaxConcurrentRequests: cfg.MaxConcurrentRequests,
+		QueueSize:             cfg.QueueSize,
+		QueueTimeout:          cfg.QueueTimeout,
 	}
 
 	// Convert OAuth config if present
@@ -55,22 +68,65 @@ func ConvertServerConfig(cfg *config.ServerConfig, status string, connected bool
 		}
 	}
 
-	// Convert isolation config if present. The per-server overrides that
-	// actually live on config.IsolationConfig are Image/NetworkMode/
-	// ExtraArgs/WorkingDir; MemoryLimit/CPULimit/Timeout are still only
-	// available at the global DockerIsolationConfig level, so they stay
-	// empty here until that refactor lands.
-	if cfg.Isolation != nil {
-		server.Isolation = &IsolationConfig{
-			Enabled:     cfg.Isolation.IsEnabled(),
-			Image:       cfg.Isolation.Image,
-			NetworkMode: cfg.Isolation.NetworkMode,
-			ExtraArgs:   append([]string(nil), cfg.Isolation.ExtraArgs...),
-			WorkingDir:  cfg.Isolation.WorkingDir,
-		}
-	}
+	// Convert isolation config. The per-server overrides that actually live on
+	// config.IsolationConfig are Enabled/Mode/Image/NetworkMode/ExtraArgs/
+	// WorkingDir; MemoryLimit/CPULimit/Timeout are still only available at the
+	// global DockerIsolationConfig level, so they stay empty here until that
+	// refactor lands.
+	//
+	// `Enabled` on the wire is the EFFECTIVE state, so it needs the global
+	// config to resolve; the raw tri-state override travels alongside it.
+	server.Isolation, server.IsolationEffective = BuildIsolationView(globalIsolation, cfg)
 
 	return server
+}
+
+// BuildIsolationView projects a server's isolation configuration onto the wire
+// types: the override block (raw tri-state preserved) and the resolved
+// effective state.
+//
+// Both are emitted for every stdio server, even one with no `isolation` block
+// at all — a client that reads `isolation?.enabled` must get a real answer for
+// an inheriting server rather than the absence that used to read as "off"
+// (GH #1142). Servers with no local command carry neither.
+func BuildIsolationView(globalIsolation *config.DockerIsolationConfig, cfg *config.ServerConfig) (*IsolationConfig, *IsolationEffective) {
+	if cfg == nil {
+		return nil, nil
+	}
+	// A server with no local command has no child process to isolate, so the
+	// block is meaningless — unless it carries a stale override the operator
+	// should still be able to see and clear.
+	if cfg.Command == "" && cfg.Isolation == nil {
+		return nil, nil
+	}
+
+	resolved := config.ResolveIsolation(globalIsolation, cfg)
+
+	iso := &IsolationConfig{Enabled: resolved.Isolated}
+	if src := cfg.Isolation; src != nil {
+		if src.Enabled != nil {
+			// Copy the value: the wire type must not alias the config pointer.
+			iso.EnabledOverride = config.BoolPtr(*src.Enabled)
+		}
+		if src.Mode != nil {
+			iso.ModeOverride = string(*src.Mode)
+		}
+		iso.Image = src.Image
+		iso.NetworkMode = src.NetworkMode
+		if len(src.ExtraArgs) > 0 {
+			iso.ExtraArgs = append([]string(nil), src.ExtraArgs...)
+		}
+		iso.WorkingDir = src.WorkingDir
+	}
+
+	eff := &IsolationEffective{
+		Mode:       string(resolved.Mode),
+		Isolated:   resolved.Isolated,
+		GlobalMode: string(resolved.GlobalMode),
+		Inherited:  resolved.Inherited,
+		Source:     resolved.Source,
+	}
+	return iso, eff
 }
 
 // ConvertToolMetadata converts a config.ToolMetadata to a contracts.Tool
@@ -157,6 +213,25 @@ func ConvertUpstreamStatsToServerStats(stats map[string]interface{}) ServerStats
 	return serverStats
 }
 
+// genericInt coerces a value from a generic map into an int. Generic server
+// maps reach this converter both straight from Go structs (int) and from JSON
+// round-trips (float64), so both encodings must be accepted. The bool result
+// distinguishes "key absent or not numeric" from a legitimate 0 — which matters
+// for the tri-state concurrency overrides, where 0 means "disabled" and absent
+// means "inherit" (spec 093 FR-020).
+func genericInt(v interface{}) (int, bool) {
+	switch n := v.(type) {
+	case int:
+		return n, true
+	case int64:
+		return int(n), true
+	case float64:
+		return int(n), true
+	default:
+		return 0, false
+	}
+}
+
 // ConvertGenericServersToTyped converts []map[string]interface{} to []Server
 func ConvertGenericServersToTyped(genericServers []map[string]interface{}) []Server {
 	servers := make([]Server, 0, len(genericServers))
@@ -193,6 +268,12 @@ func ConvertGenericServersToTyped(genericServers []map[string]interface{}) []Ser
 			v := autoApprove
 			server.AutoApproveToolChanges = &v
 		}
+		// F9: prompt-aggregation override is tri-state — only set the pointer when
+		// the key is present so an unset override stays nil.
+		if exposePrompts, ok := generic["expose_prompts"].(bool); ok {
+			v := exposePrompts
+			server.ExposePrompts = &v
+		}
 		// Spec 086: per-server trust tier round-trips as a plain string.
 		if trustMode, ok := generic["trust_mode"].(string); ok {
 			server.TrustMode = trustMode
@@ -203,6 +284,21 @@ func ConvertGenericServersToTyped(genericServers []map[string]interface{}) []Ser
 			if d, err := time.ParseDuration(initTimeout); err == nil {
 				v := config.Duration(d)
 				server.InitTimeout = &v
+			}
+		}
+		// Spec 093: per-server concurrency overrides are tri-state, so only set
+		// the pointer when the key is actually present. Generic maps come from
+		// JSON, where every number decodes as float64.
+		if v, ok := genericInt(generic["max_concurrent_requests"]); ok {
+			server.MaxConcurrentRequests = &v
+		}
+		if v, ok := genericInt(generic["queue_size"]); ok {
+			server.QueueSize = &v
+		}
+		if queueTimeout, ok := generic["queue_timeout"].(string); ok && queueTimeout != "" {
+			if d, err := time.ParseDuration(queueTimeout); err == nil {
+				v := config.Duration(d)
+				server.QueueTimeout = &v
 			}
 		}
 		if connected, ok := generic["connected"].(bool); ok {
@@ -240,6 +336,15 @@ func ConvertGenericServersToTyped(genericServers []map[string]interface{}) []Ser
 			server.RetryCount = rc
 		case float64:
 			server.RetryCount = int(rc)
+		}
+		if retryStopped, ok := generic["retry_stopped"].(bool); ok {
+			server.RetryStopped = retryStopped
+		}
+		if code, ok := generic["retry_stopped_code"].(string); ok {
+			server.RetryStoppedCode = code
+		}
+		if reason, ok := generic["retry_stopped_reason"].(string); ok {
+			server.RetryStoppedReason = reason
 		}
 		switch v := generic["last_retry_time"].(type) {
 		case time.Time:

@@ -15,41 +15,101 @@
         </button>
       </div>
 
-      <select v-model="status" class="select select-sm select-bordered" data-test="usage-status-filter" @change="reload">
+      <!--
+        F30 (#1046): both selects carry their purpose only in their option
+        text, so a screen reader announces "combo box" with no idea what it
+        filters. They went unnoticed by the original audit because Usage had
+        no route of its own then; #1044 made it the landing page and brought
+        them onto "/", where the committed a11y sweep now reaches them.
+      -->
+      <select v-model="status" aria-label="Filter calls by status" class="select select-sm select-bordered" data-test="usage-status-filter" @change="reload">
         <option value="">All statuses</option>
         <option value="success">Success</option>
         <option value="error">Errors</option>
         <option value="blocked">Blocked</option>
+        <option value="rejected">Rejected</option>
       </select>
 
-      <select v-model="sort" class="select select-sm select-bordered" data-test="usage-sort" @change="reload">
+      <select v-model="sort" aria-label="Sort tools by" class="select select-sm select-bordered" data-test="usage-sort" @change="reload">
         <option value="resp_bytes">Sort: response size</option>
         <option value="calls">Sort: calls</option>
         <option value="error_rate">Sort: error rate</option>
         <option value="p95">Sort: p95 latency</option>
       </select>
 
-      <span v-if="data" class="text-xs opacity-50 ml-auto" data-test="usage-freshness">
+      <!--
+        F9: `opacity-*` multiplies alpha on base-content and lands under AA
+        (this one measured 3.16:1 on corporate). #1054 replaced the
+        `text-base-content/NN` ramp and `.stat-*` with the AA-checked
+        `--tone-muted`, but the raw opacity utility was never covered — and
+        nothing caught it until #1044 moved this view onto "/", where the
+        committed contrast sweep walks. Same visual intent, measured colour.
+      -->
+      <span v-if="data" class="text-xs text-base-content/60 ml-auto" data-test="usage-freshness">
         Updated {{ freshnessLabel }}
       </span>
     </div>
 
     <!-- Tokens-saved headline (FR-007) -->
     <div v-if="data" class="stats stats-vertical sm:stats-horizontal shadow w-full" data-test="usage-tokens-saved">
-      <div class="stat">
-        <div class="stat-title">Tokens saved</div>
-        <div class="stat-value text-success">{{ formatNumber(data.tokens_saved) }}</div>
-        <div class="stat-desc">{{ data.tokens_saved_percentage.toFixed(1) }}% reduction via BM25 discovery</div>
+      <!--
+        Audit finding F23 (#1046): this tile "did not move" after 16 further
+        tool calls. It is not supposed to. It is a STRUCTURAL estimate computed
+        from the current tool catalog — the cost of putting every upstream tool
+        in the agent's context versus what retrieve_tools returns for one query —
+        so it moves when servers or tools change, never per call. The number was
+        right; the label ("Tokens saved", beside per-window call counts) said
+        cumulative-savings-so-far. It now says what it measures, and the tooltip
+        says how it is derived.
+      -->
+      <div class="stat" data-test="usage-tokens-saved-tile">
+        <div class="stat-title flex items-center gap-1">
+          Tokens saved per request
+          <span
+            class="cursor-help opacity-50"
+            aria-hidden="true"
+            :title="tokensSavedExplainer"
+          >ⓘ</span>
+        </div>
+        <div class="stat-value text-success" :title="tokensSavedExplainer">
+          {{ formatNumber(data.tokens_saved) }}
+        </div>
+        <div class="stat-desc">
+          {{ data.tokens_saved_percentage.toFixed(1) }}% smaller tool context via BM25 discovery ·
+          <span class="text-base-content/60">tracks your catalog, not your call volume</span>
+        </div>
       </div>
-      <div class="stat">
-        <div class="stat-title">Tool calls</div>
-        <div class="stat-value">{{ formatNumber(totalCalls) }}</div>
-        <div class="stat-desc">{{ data.tools.length }} active tool{{ data.tools.length === 1 ? '' : 's' }} ({{ windowLabel }})</div>
+      <!--
+        Calls and errors come from the response, which counts the same
+        population as the Activity Log's own header — see usageHeadline for why
+        summing `tools` here was wrong (F1, #1046).
+      -->
+      <div class="stat" data-test="usage-calls-tile">
+        <div class="stat-title">Calls</div>
+        <div class="stat-value">{{ formatNumber(headline.calls) }}</div>
+        <!--
+          "Active tools" counts the same population the charts below chart:
+          names that have completed at least one call (F22, #1046). Counting the
+          whole rollup here would print "6 active tools" over a histogram
+          labelled "3 tools" on the same screen.
+        -->
+        <div class="stat-desc">
+          {{ activeToolCount }} active tool{{ activeToolCount === 1 ? '' : 's' }}
+          <!--
+            The per-tool list is truncated to top-N server-side, so this count
+            is of what is CHARTED, not of everything that ran. Say so rather
+            than print a total that quietly excludes the tail.
+          -->
+          <span v-if="data.other" :title="`${data.other.tools_folded} further tools are folded into “other”`">
+            (+{{ data.other.tools_folded }} folded)
+          </span>
+          ({{ windowLabel }})
+        </div>
       </div>
-      <div class="stat">
+      <div class="stat" data-test="usage-errors-tile">
         <div class="stat-title">Errors</div>
-        <div class="stat-value" :class="totalErrors > 0 ? 'text-error' : ''">{{ formatNumber(totalErrors) }}</div>
-        <div class="stat-desc">{{ overallErrorRate }}% overall error rate</div>
+        <div class="stat-value" :class="headline.errors > 0 ? 'text-error' : ''">{{ formatNumber(headline.errors) }}</div>
+        <div class="stat-desc">{{ headline.errorRate }}% overall error rate</div>
       </div>
     </div>
 
@@ -75,7 +135,7 @@
           <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
         </svg>
         <h3 class="font-semibold text-lg mt-2">No usage data yet</h3>
-        <p class="text-sm opacity-60 max-w-md">
+        <p class="text-sm text-base-content/60 max-w-md">
           Once your agents start calling tools through the proxy, you'll see call volume,
           token sinks, error rates and a timeline here. Try widening the window or clearing filters.
         </p>
@@ -109,7 +169,7 @@
       </div>
 
       <!-- "other" fold note when the per-tool list was truncated -->
-      <div v-if="data.other" class="lg:col-span-2 text-xs opacity-50 text-center" data-test="usage-other-note">
+      <div v-if="data.other" class="lg:col-span-2 text-xs text-base-content/60 text-center" data-test="usage-other-note">
         + {{ data.other.tools_folded }} more tool{{ data.other.tools_folded === 1 ? '' : 's' }}
         ({{ formatNumber(data.other.calls) }} calls) folded into “other”.
       </div>
@@ -120,8 +180,9 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import api from '@/services/api'
+import { useAuthStore } from '@/stores/auth'
 import type { UsageAggregateResponse, UsageWindow, UsageSort, UsageStatus } from '@/types'
-import { formatNumber } from '@/utils/usageFormat'
+import { formatNumber, partitionUsageTools, usageHeadline } from '@/utils/usageFormat'
 import CallHistogram from '@/components/usage/CallHistogram.vue'
 import ResponseSizeRanking from '@/components/usage/ResponseSizeRanking.vue'
 import ErrorRateChart from '@/components/usage/ErrorRateChart.vue'
@@ -142,6 +203,8 @@ const loading = ref(false)
 const error = ref<string | null>(null)
 let refreshTimer: ReturnType<typeof setInterval> | null = null
 
+const authStore = useAuthStore()
+
 const windowLabel = computed(() => {
   switch (window.value) {
     case '24h': return 'last 24h'
@@ -150,12 +213,23 @@ const windowLabel = computed(() => {
   }
 })
 
-const totalCalls = computed(() => data.value?.tools.reduce((s, t) => s + t.calls, 0) ?? 0)
-const totalErrors = computed(() => data.value?.tools.reduce((s, t) => s + t.errors, 0) ?? 0)
-const overallErrorRate = computed(() => {
-  const c = totalCalls.value
-  return c > 0 ? ((totalErrors.value / c) * 100).toFixed(1) : '0.0'
-})
+const headline = computed(() => usageHeadline(data.value))
+
+/** Tools that have completed at least one call — what the charts below chart. */
+const activeToolCount = computed(
+  () => partitionUsageTools(data.value?.tools ?? []).completed.length
+)
+
+/**
+ * How the tokens-saved figure is derived, in one sentence an operator can act
+ * on. F23 (#1046): the chip and this tile carried the product's headline claim
+ * with no explanation of what window it covered or why it never moved.
+ */
+const tokensSavedExplainer =
+  'Estimated per-request saving: the tokens it would take to put every ' +
+  'upstream tool definition in your agent\'s context, minus what retrieve_tools ' +
+  'returns for one query. It is a property of your current tool catalog, so it ' +
+  'changes when you add, remove or reconnect servers — not with each call.'
 
 const isEmpty = computed(() => {
   if (!data.value) return false
@@ -169,7 +243,21 @@ const freshnessLabel = computed(() => {
   return `${Math.round(ms / 60_000)}m ago`
 })
 
+// Requests can overlap — the 30s auto-refresh, a window switch and a filter
+// reset all call reload() and there is no cancellation. Without sequencing, a
+// slower earlier response can land last and repaint the panel with data for a
+// window the user already moved off. Only the newest request may write state.
+let reloadSeq = 0
+
 async function reload() {
+  // Spec 107 FR-041 / cross-review round 2, chunk 4 P1: GET /activity/usage
+  // is an admin-only core door (named must-refuse, rest-endpoints.md §8).
+  // Usage is the tenant dashboard's DEFAULT landing panel, so an unguarded
+  // reload() here drew a 403 on every tenant page load and every 30s
+  // refresh, regardless of entry point (mount, interval, window/filter
+  // change) — guard the fetch itself rather than each caller.
+  if (authStore.principalKind === 'tenant') return
+  const seq = ++reloadSeq
   loading.value = true
   error.value = null
   try {
@@ -178,15 +266,20 @@ async function reload() {
       status: status.value || undefined,
       sort: sort.value,
     })
+    if (seq !== reloadSeq) return
     if (resp.success && resp.data) {
       data.value = resp.data
     } else {
       error.value = resp.error || 'Failed to load usage data'
     }
   } catch (e) {
+    if (seq !== reloadSeq) return
     error.value = e instanceof Error ? e.message : 'Failed to load usage data'
   } finally {
-    loading.value = false
+    // A superseded request must not clear the spinner the newest one owns.
+    if (seq === reloadSeq) {
+      loading.value = false
+    }
   }
 }
 

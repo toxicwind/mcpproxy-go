@@ -12,6 +12,7 @@ import (
 
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/contracts"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/oauth"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/registries"
 )
 
@@ -90,6 +91,16 @@ func (s *Server) AddRegistrySource(req *AddRegistrySourceRequest) (*config.Regis
 	if req == nil {
 		return nil, errors.New("nil request")
 	}
+	// Issue #1148, round 8: the read doors mask a registry source URL with the
+	// shared LIVE rule, so a client can echo that mask back here. Nothing binds
+	// a revert to a registry URL — the caller replaces it wholesale — so the
+	// answer is the same bind-or-refuse one the server write path gives:
+	// refuse, and let the caller resend the real value.
+	if err := oauth.CheckServerWriteMasks("registry_source.", map[string]interface{}{
+		"url": req.URL, "servers_url": "",
+	}); err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrInvalidRegistryURL, err)
+	}
 
 	entry, err := buildRegistrySourceEntry(req.URL, req.Protocol, req.ID, req.Name)
 	if err != nil {
@@ -134,7 +145,7 @@ func (s *Server) AddRegistrySource(req *AddRegistrySourceRequest) (*config.Regis
 
 	s.logger.Info("Added custom registry source",
 		zap.String("registry_id", entry.ID),
-		zap.String("url", entry.URL),
+		zap.String("url", oauth.LogSafeURL(entry.URL)),
 		zap.String("provenance", entry.Provenance))
 
 	return &entry, nil
@@ -158,7 +169,7 @@ func (s *Server) resolveRegistrySourceShape(entry *config.RegistryEntry) error {
 	if err != nil {
 		if errors.Is(err, registries.ErrRegistrySourceUnreachable) {
 			s.logger.Warn("Could not probe registry source; adding it with the derived defaults",
-				zap.String("url", entry.URL), zap.Error(err))
+				zap.String("url", oauth.LogSafeURL(entry.URL)), zap.Error(err))
 			return nil
 		}
 		return fmt.Errorf("%w: %v", ErrRegistrySourceUnusable, err)

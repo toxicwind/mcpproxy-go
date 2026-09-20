@@ -16,6 +16,7 @@ import (
 
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/contracts"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/preflight"
 	internalRuntime "github.com/smart-mcp-proxy/mcpproxy-go/internal/runtime"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/secret"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/storage"
@@ -169,13 +170,13 @@ func (m *MockServerController) GetDockerRecoveryStatus() *storage.DockerRecovery
 	}
 }
 func (m *MockServerController) IsDockerAvailable() bool { return true }
-func (m *MockServerController) GetRecentSessions(_ int) ([]*contracts.MCPSession, int, error) {
+func (m *MockServerController) GetRecentSessions(_ int, _ string) ([]*contracts.MCPSession, int, error) {
 	return []*contracts.MCPSession{}, 0, nil
 }
 func (m *MockServerController) GetSessionByID(_ string) (*contracts.MCPSession, error) {
 	return nil, nil
 }
-func (m *MockServerController) GetToolCallsBySession(_ string, _ int, _ int) ([]*contracts.ToolCallRecord, int, error) {
+func (m *MockServerController) GetToolCallsBySession(_ string, _ int, _ int, _ storage.ToolCallScope) ([]*contracts.ToolCallRecord, int, error) {
 	return []*contracts.ToolCallRecord{}, 0, nil
 }
 
@@ -188,6 +189,10 @@ func (m *MockServerController) GetServerTools(serverName string) ([]map[string]i
 			"usage":       10,
 		},
 	}, nil
+}
+
+func (m *MockServerController) SearchToolsScoped(_ string, _ int, _ func(string) bool) ([]map[string]interface{}, error) {
+	return []map[string]interface{}{}, nil
 }
 
 func (m *MockServerController) SearchTools(_ string, _ int) ([]map[string]interface{}, error) {
@@ -234,7 +239,7 @@ func (m *MockServerController) NotifySecretsChanged(_ context.Context, _, _ stri
 func (m *MockServerController) GetCurrentConfig() interface{} { return map[string]interface{}{} }
 
 // Tool call history methods
-func (m *MockServerController) GetToolCalls(_ int, _ int) ([]*contracts.ToolCallRecord, int, error) {
+func (m *MockServerController) GetToolCalls(_ int, _ int, _ storage.ToolCallScope) ([]*contracts.ToolCallRecord, int, error) {
 	return []*contracts.ToolCallRecord{}, 0, nil
 }
 func (m *MockServerController) GetToolCallByID(_ string) (*contracts.ToolCallRecord, error) {
@@ -243,7 +248,7 @@ func (m *MockServerController) GetToolCallByID(_ string) (*contracts.ToolCallRec
 func (m *MockServerController) GetServerToolCalls(_ string, _ int) ([]*contracts.ToolCallRecord, error) {
 	return []*contracts.ToolCallRecord{}, nil
 }
-func (m *MockServerController) ReplayToolCall(_ string, _ map[string]interface{}) (*contracts.ToolCallRecord, error) {
+func (m *MockServerController) ReplayToolCall(_ context.Context, _ string, _ map[string]interface{}) (*contracts.ToolCallRecord, error) {
 	return &contracts.ToolCallRecord{
 		ID:         "replayed-call-123",
 		ServerName: "test-server",
@@ -339,6 +344,10 @@ func (m *MockServerController) RefreshVersionInfo() *updatecheck.VersionInfo {
 	return nil
 }
 
+func (m *MockServerController) UpdatePolicy() updatecheck.Policy {
+	return updatecheck.Policy{Enabled: true, Channel: updatecheck.PolicyChannelStable}
+}
+
 // Tool discovery
 func (m *MockServerController) DiscoverServerTools(_ context.Context, _ string) error {
 	return nil
@@ -369,11 +378,16 @@ func (m *MockServerController) GetToolApproval(_, _ string) (*storage.ToolApprov
 	return nil, nil
 }
 func (m *MockServerController) GetToolApprovalStatus(_, _ string) (string, error) { return "", nil }
+func (m *MockServerController) RunPreflight(_ context.Context, _ preflight.Params) (preflight.Outcome, error) {
+	return preflight.Outcome{}, nil
+}
+func (m *MockServerController) RecordPreflight(_ internalRuntime.PreflightActivity) error { return nil }
 func (m *MockServerController) GetOnboardingState() (*storage.OnboardingState, error) {
 	return &storage.OnboardingState{}, nil
 }
 func (m *MockServerController) SaveOnboardingState(_ *storage.OnboardingState) error { return nil }
 func (m *MockServerController) GetActivationFirstMCPClient() (bool, []string)        { return false, nil }
+func (m *MockServerController) RecordUpdateFailure(_ string) (bool, error)           { return false, nil }
 
 // Test contract compliance for API responses
 func TestAPIContractCompliance(t *testing.T) {

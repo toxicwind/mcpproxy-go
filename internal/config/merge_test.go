@@ -1087,6 +1087,35 @@ func TestCopyServerConfig_PreservesAllowlistAndOverrides(t *testing.T) {
 	}
 }
 
+// TestCopyServerConfig_ExposePrompts covers the per-server prompts-aggregation
+// override added alongside the ExposePrompts field: CopyServerConfig must
+// carry both a set and an unset value, and the copy must be by value (not a
+// shared pointer) like every other tri-state *bool/*Duration field above.
+func TestCopyServerConfig_ExposePrompts(t *testing.T) {
+	t.Run("nil stays nil", func(t *testing.T) {
+		src := &ServerConfig{Name: "srv"}
+		dst := CopyServerConfig(src)
+		if dst.ExposePrompts != nil {
+			t.Errorf("ExposePrompts: got %v, want nil", dst.ExposePrompts)
+		}
+	})
+
+	t.Run("set value is copied by value, not aliased", func(t *testing.T) {
+		exposePrompts := false
+		src := &ServerConfig{Name: "srv", ExposePrompts: &exposePrompts}
+
+		dst := CopyServerConfig(src)
+		if dst.ExposePrompts == nil || *dst.ExposePrompts != false {
+			t.Errorf("ExposePrompts: got %v, want false", dst.ExposePrompts)
+		}
+
+		*src.ExposePrompts = true
+		if *dst.ExposePrompts {
+			t.Error("ExposePrompts pointer is shared, not copied by value")
+		}
+	})
+}
+
 // TestMergeServerConfig_InitTimeout covers MCP-3322: a patch carrying
 // init_timeout sets/replaces the per-server override (and records a diff), while
 // a patch that omits it preserves the existing value.
@@ -1138,6 +1167,58 @@ func TestMergeServerConfig_InitTimeout(t *testing.T) {
 	})
 }
 
+// TestMergeServerConfig_ExposePrompts covers the runtime-toggle gap found in
+// PR #973 review: a patch carrying expose_prompts (including an explicit
+// false) sets/replaces the per-server override (and records a diff), while a
+// patch that omits it preserves the existing value.
+func TestMergeServerConfig_ExposePrompts(t *testing.T) {
+	t.Run("patch sets expose_prompts from unset", func(t *testing.T) {
+		base := &ServerConfig{Name: "srv", Enabled: true}
+		exposePrompts := false
+		patch := &ServerConfig{ExposePrompts: &exposePrompts}
+
+		merged, diff, err := MergeServerConfig(base, patch, DefaultMergeOptions())
+		if err != nil {
+			t.Fatalf("merge: %v", err)
+		}
+		if merged.ExposePrompts == nil || *merged.ExposePrompts != exposePrompts {
+			t.Errorf("ExposePrompts: got %v, want %v", merged.ExposePrompts, exposePrompts)
+		}
+		if diff == nil || diff.Modified["expose_prompts"].Path != "expose_prompts" {
+			t.Errorf("expected expose_prompts in diff, got %+v", diff)
+		}
+	})
+
+	t.Run("unrelated patch preserves expose_prompts", func(t *testing.T) {
+		exposePrompts := false
+		base := &ServerConfig{Name: "srv", Enabled: true, ExposePrompts: &exposePrompts}
+		patch := &ServerConfig{Enabled: true, URL: "http://example.com/mcp"}
+
+		merged, _, err := MergeServerConfig(base, patch, DefaultMergeOptions())
+		if err != nil {
+			t.Fatalf("merge: %v", err)
+		}
+		if merged.ExposePrompts == nil || *merged.ExposePrompts != exposePrompts {
+			t.Errorf("ExposePrompts was wiped on unrelated patch: got %v, want %v", merged.ExposePrompts, exposePrompts)
+		}
+	})
+
+	t.Run("patch replaces existing expose_prompts", func(t *testing.T) {
+		old := false
+		base := &ServerConfig{Name: "srv", Enabled: true, ExposePrompts: &old}
+		newVal := true
+		patch := &ServerConfig{ExposePrompts: &newVal}
+
+		merged, _, err := MergeServerConfig(base, patch, DefaultMergeOptions())
+		if err != nil {
+			t.Fatalf("merge: %v", err)
+		}
+		if merged.ExposePrompts == nil || *merged.ExposePrompts != newVal {
+			t.Errorf("ExposePrompts: got %v, want %v", merged.ExposePrompts, newVal)
+		}
+	})
+}
+
 // TestMergeServerConfig_PreservesDisabledToolsOnUnrelatedPatch is the
 // end-to-end regression: patching an unrelated field on a server that has a
 // disabled_tools denylist must not wipe the denylist (it previously did,
@@ -1152,5 +1233,78 @@ func TestMergeServerConfig_PreservesDisabledToolsOnUnrelatedPatch(t *testing.T) 
 	}
 	if len(merged.DisabledTools) != 1 || merged.DisabledTools[0] != "danger" {
 		t.Errorf("DisabledTools dropped on unrelated patch: got %v, want [danger]", merged.DisabledTools)
+	}
+}
+
+// TestMergeIsolationConfig_PreservesMode is a regression test for GH #1142:
+// copyIsolationConfig and MergeIsolationConfig both ignored IsolationConfig.Mode,
+// so patching any unrelated isolation field silently dropped the per-server
+// isolation mode — the primary MCP-34.2 override.
+func TestMergeIsolationConfig_PreservesMode(t *testing.T) {
+	sandbox := IsolationModeSandbox
+	base := &IsolationConfig{Mode: &sandbox, Image: "old"}
+	patch := &IsolationConfig{Image: "new"}
+
+	merged := MergeIsolationConfig(base, patch, false)
+	if merged == nil {
+		t.Fatal("MergeIsolationConfig returned nil")
+	}
+	if merged.Mode == nil {
+		t.Fatalf("Mode was dropped by the merge (got nil, want %q)", sandbox)
+	}
+	if *merged.Mode != sandbox {
+		t.Errorf("Mode = %q, want %q", *merged.Mode, sandbox)
+	}
+	if merged.Image != "new" {
+		t.Errorf("Image = %q, want %q", merged.Image, "new")
+	}
+	// The copy must not alias the base pointer.
+	if merged.Mode == base.Mode {
+		t.Error("Mode pointer is aliased with base; copyIsolationConfig must deep-copy it")
+	}
+}
+
+// TestMergeIsolationConfig_PatchModeWins pins the override direction: an
+// explicit Mode on the patch replaces the base, and a nil Mode leaves it alone.
+func TestMergeIsolationConfig_PatchModeWins(t *testing.T) {
+	sandbox := IsolationModeSandbox
+	docker := IsolationModeDocker
+
+	base := &IsolationConfig{Mode: &sandbox}
+	merged := MergeIsolationConfig(base, &IsolationConfig{Mode: &docker}, false)
+	if merged.Mode == nil || *merged.Mode != docker {
+		t.Errorf("patch Mode should win: got %v, want %q", merged.Mode, docker)
+	}
+
+	// base-only copy path (patch == nil, removeIfNil false)
+	copied := MergeIsolationConfig(base, nil, false)
+	if copied.Mode == nil || *copied.Mode != sandbox {
+		t.Errorf("copy path dropped Mode: got %v, want %q", copied.Mode, sandbox)
+	}
+
+	// patch-only copy path (base == nil)
+	fromPatch := MergeIsolationConfig(nil, &IsolationConfig{Mode: &docker}, false)
+	if fromPatch.Mode == nil || *fromPatch.Mode != docker {
+		t.Errorf("patch-only path dropped Mode: got %v, want %q", fromPatch.Mode, docker)
+	}
+}
+
+// TestMergeServerConfig_PreservesIsolationMode is the end-to-end version of the
+// above through the ServerConfig merge that the MCP `upstream_servers patch`
+// path uses.
+func TestMergeServerConfig_PreservesIsolationMode(t *testing.T) {
+	sandbox := IsolationModeSandbox
+	base := &ServerConfig{Name: "srv", Isolation: &IsolationConfig{Mode: &sandbox}}
+	patch := &ServerConfig{Isolation: &IsolationConfig{Image: "python:3.12"}}
+
+	merged, _, err := MergeServerConfig(base, patch, DefaultMergeOptions())
+	if err != nil {
+		t.Fatalf("MergeServerConfig: %v", err)
+	}
+	if merged.Isolation == nil || merged.Isolation.Mode == nil {
+		t.Fatalf("isolation.mode dropped by an unrelated patch: %+v", merged.Isolation)
+	}
+	if *merged.Isolation.Mode != sandbox {
+		t.Errorf("isolation.mode = %q, want %q", *merged.Isolation.Mode, sandbox)
 	}
 }

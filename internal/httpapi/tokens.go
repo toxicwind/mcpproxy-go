@@ -2,10 +2,10 @@ package httpapi
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"regexp"
-	"strconv"
 	"strings"
 	"time"
 
@@ -13,6 +13,7 @@ import (
 
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/auth"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/contracts"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/storage"
 )
 
 // TokenStore defines the storage interface for agent token CRUD operations.
@@ -25,7 +26,10 @@ type TokenStore interface {
 	DeleteAgentToken(name string) error
 	RegenerateAgentToken(name string, newRawToken string, hmacKey []byte) (*auth.AgentToken, error)
 	ValidateAgentToken(rawToken string, hmacKey []byte) (*auth.AgentToken, error)
-	UpdateAgentTokenLastUsed(name string) error
+	// UpdateAgentTokenLastUsedByHash is keyed by the token's HMAC hash, not by
+	// its name: names are unique only within an owner in the server edition,
+	// so a by-name stamp could land on another tenant's token.
+	UpdateAgentTokenLastUsedByHash(hash string) error
 }
 
 // ServerNameLister provides the list of known server names for allowed_servers validation.
@@ -75,18 +79,34 @@ type regenerateTokenResponse struct {
 // tokenNameRegex validates token name format: starts with alphanumeric, followed by alphanumeric, underscores, or hyphens.
 var tokenNameRegex = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]*$`)
 
-// maxExpiryDuration is the maximum allowed token expiry (365 days).
-const maxExpiryDuration = 365 * 24 * time.Hour
-
-// defaultExpiryDuration is the default token expiry (30 days).
-const defaultExpiryDuration = 30 * 24 * time.Hour
+// The expiry rule (30-day default, 365-day cap) lives in auth.ParseTokenExpiry
+// (Spec 107 FR-011), shared with the server edition's POST /user/tokens.
 
 // requireAdminAuth checks that the request is authenticated as admin (not an agent token).
 // Returns true if the request should proceed, false if a 403 was written.
 func (s *Server) requireAdminAuth(w http.ResponseWriter, r *http.Request) bool {
+	return s.requireAdminRead(w, r, "Agent tokens cannot manage tokens")
+}
+
+// requireAdminRead is requireAdminAuth with a caller-supplied denial message,
+// so a route outside token management does not 403 with "Agent tokens cannot
+// manage tokens" (#1166 — GET /api/v1/config reuses this gate).
+//
+// It keys on !IsAdmin(), the SAME test auth.IsScopedCaller and
+// (*Server).revealSecrets use. It used to key on Type == AuthTypeAgent, which
+// is identical today — agent is the only non-admin type apiKeyAuthMiddleware
+// installs on this mux — but would fail OPEN the moment a server-edition
+// AuthTypeUser context reached it: a plain OAuth user is not an admin, yet
+// would have passed an AuthTypeAgent-only test and read GET /api/v1/config.
+// One mux must not carry two different definitions of "not admin".
+//
+// A request with NO AuthContext is still allowed through: that is the
+// middleware's testing/bootstrap passthrough, and it must stay exactly as
+// permissive as it is today (same rule as auth.CanEnumerateServer).
+func (s *Server) requireAdminRead(w http.ResponseWriter, r *http.Request, message string) bool {
 	ac := auth.AuthContextFromContext(r.Context())
-	if ac != nil && ac.Type == auth.AuthTypeAgent {
-		s.writeError(w, r, http.StatusForbidden, "Agent tokens cannot manage tokens")
+	if ac != nil && !ac.IsAdmin() {
+		s.writeError(w, r, http.StatusForbidden, message)
 		return false
 	}
 	return true
@@ -189,9 +209,22 @@ func (s *Server) handleCreateToken(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.tokenStore.CreateAgentToken(agentToken, rawToken, hmacKey); err != nil {
-		// Check for duplicate name
-		if strings.Contains(err.Error(), "already exists") {
-			s.writeError(w, r, http.StatusConflict, err.Error())
+		// Check for duplicate name. Classified on a typed sentinel rather than
+		// a substring of the storage message, so the response never echoes
+		// storage internals.
+		if errors.Is(err, storage.ErrAgentTokenNameExists) || strings.Contains(err.Error(), "already exists") {
+			s.writeError(w, r, http.StatusConflict, fmt.Sprintf("A token named %q already exists", req.Name))
+			return
+		}
+		if errors.Is(err, storage.ErrAgentTokenLimitReached) {
+			s.writeError(w, r, http.StatusConflict, fmt.Sprintf("Maximum number of agent tokens (%d) reached", auth.MaxTokens))
+			return
+		}
+		// Personal-edition tokens are ownerless and cannot reach this condition
+		// today, but classify it so a future owned-token caller does not get a
+		// misleading 500.
+		if errors.Is(err, storage.ErrAgentTokenOwnerLimitReached) {
+			s.writeError(w, r, http.StatusConflict, fmt.Sprintf("Maximum number of agent tokens for this owner (%d) reached", auth.MaxTokensPerOwner))
 			return
 		}
 		s.logger.Errorf("Failed to create agent token: %v", err)
@@ -360,6 +393,14 @@ func (s *Server) handleRegenerateToken(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, r, http.StatusNotFound, fmt.Sprintf("Token %q not found", name))
 			return
 		}
+		// Rotation refreshes a live secret; it is not an un-revoke. Classified
+		// here so the refusal is a 409 with an actionable body rather than the
+		// generic 500 the fall-through would produce.
+		if errors.Is(err, storage.ErrAgentTokenRevoked) {
+			s.writeError(w, r, http.StatusConflict,
+				fmt.Sprintf("Token %q is revoked and cannot be regenerated. Delete it and create a new token.", name))
+			return
+		}
 		s.logger.Errorf("Failed to regenerate agent token: %v", err)
 		s.writeError(w, r, http.StatusInternalServerError, "Failed to regenerate token")
 		return
@@ -416,41 +457,13 @@ func (s *Server) validateProfilePin(slug string) error {
 	return fmt.Errorf("unknown profile_pin %q (available: %s)", slug, strings.Join(available, ", "))
 }
 
-// parseExpiry parses an expiry duration string and returns the absolute expiry time.
-// Accepted formats: "30d" (days), "720h" (hours), or any Go duration string.
-// Maximum allowed duration is 365 days. Empty string defaults to 30 days.
+// parseExpiry parses an expiry duration string and returns the absolute expiry
+// time. It is a one-line wrapper over auth.ParseTokenExpiry (Spec 107 FR-011):
+// "30d", "720h" or any Go duration, positive, at most 365 days, 30 days when
+// empty — the SAME rule the server edition's POST /user/tokens applies, so the
+// two minting doors cannot drift.
 func parseExpiry(expiresIn string) (time.Time, error) {
-	if expiresIn == "" {
-		return time.Now().UTC().Add(defaultExpiryDuration), nil
-	}
-
-	var d time.Duration
-
-	// Handle "Nd" format (days)
-	if strings.HasSuffix(expiresIn, "d") {
-		daysStr := strings.TrimSuffix(expiresIn, "d")
-		days, err := strconv.Atoi(daysStr)
-		if err != nil || days <= 0 {
-			return time.Time{}, fmt.Errorf("invalid expiry duration: %q", expiresIn)
-		}
-		d = time.Duration(days) * 24 * time.Hour
-	} else {
-		// Try standard Go duration
-		var err error
-		d, err = time.ParseDuration(expiresIn)
-		if err != nil {
-			return time.Time{}, fmt.Errorf("invalid expiry duration: %q", expiresIn)
-		}
-		if d <= 0 {
-			return time.Time{}, fmt.Errorf("expiry duration must be positive")
-		}
-	}
-
-	if d > maxExpiryDuration {
-		return time.Time{}, fmt.Errorf("expiry duration cannot exceed 365 days")
-	}
-
-	return time.Now().UTC().Add(d), nil
+	return auth.ParseTokenExpiry(expiresIn, time.Now().UTC())
 }
 
 // validateAllowedServers checks that each server name in the list either is "*"
