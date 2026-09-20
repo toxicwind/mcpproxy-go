@@ -34,6 +34,12 @@ export interface DangerSpec {
 // which are validated from the control type). Centralised in validateField.
 export type ValueKind = 'hostport' | 'bytesize' | 'cpu' | 'hostname' | 'url' | 'secretkey'
 
+// A `[]string` config key edited through a textarea. The form shows a joined
+// string ('comma' = "a, b", 'lines' = one entry per line) and the PATCH
+// partial carries the split, trimmed array — see listToText / textToList.
+// Without this the textarea would PATCH a plain string into a []string key.
+export type ListKind = 'comma' | 'lines'
+
 export interface SettingField {
   key: string // dot-path, e.g. "docker_isolation.enabled"
   label: string
@@ -50,6 +56,12 @@ export interface SettingField {
   valueKind?: ValueKind // extra format validation for text/secret fields
   optional?: boolean // when true, an empty value is valid (skips kind validation)
   resetDefault?: string // when set, render an inline "Reset to default" button that emits this value
+  // Value an absent/blank key actually resolves to on the Go side. Only needed
+  // for `omitempty` fields whose zero value is meaningful (the serialization
+  // modes: "" means "full"). See normalizeFieldDefaults below for why.
+  defaultValue?: string
+  // Set for a textarea that edits a []string key (see ListKind).
+  listKind?: ListKind
 }
 
 export interface SettingsAccordion {
@@ -171,6 +183,16 @@ export const SECURITY_FIELDS: SettingField[] = [
     },
   },
   {
+    // Spec 088 US4 / FR-018 — the deep-scan layer used to be reachable only by
+    // hand-editing this key. It is hot-reloadable (the `security` block is
+    // deep-compared in DetectConfigChanges), so no restart flag.
+    key: 'security.deep_scan.enabled',
+    docs: '/features/security-scanner-plugins',
+    label: 'Deep scan (Docker scanners)',
+    help: 'The deterministic offline baseline scan is always on and needs no setup. Turning this on adds the opt-in Docker-based deep scanners (source-level analysis of the server’s published package) on top of it. Requires Docker; a deep-scan failure is informational and never changes the baseline verdict.',
+    control: 'toggle',
+  },
+  {
     key: 'docker_isolation.enabled',
     docs: '/features/docker-isolation',
     label: 'Run stdio servers in Docker',
@@ -181,7 +203,7 @@ export const SECURITY_FIELDS: SettingField[] = [
     key: 'enable_code_execution',
     docs: '/features/code-execution',
     label: 'Enable code execution tool',
-    help: 'Adds a sandboxed JavaScript tool agents can use to orchestrate several tool calls in one request. Off by default.',
+    help: 'Adds a sandboxed JavaScript tool agents can use to orchestrate several tool calls in one request. On by default; the sandbox respects quarantine and server restrictions.',
     control: 'toggle',
   },
   {
@@ -200,7 +222,7 @@ export const SECURITY_FIELDS: SettingField[] = [
   {
     key: 'reveal_secret_headers',
     label: 'Show secret headers (debug)',
-    help: 'Normally mcpproxy redacts Authorization / API-Key header values in responses and logs. Turning this on shows them in clear text — debugging only.',
+    help: 'Normally mcpproxy redacts Authorization / API-Key header values in responses and logs. Turning this on shows them in clear text to an authenticated ADMIN only — agent tokens stay masked, and the /events stream and upstream_stats are always masked. Debugging only.',
     control: 'toggle',
     danger: {
       confirmValue: true,
@@ -221,6 +243,18 @@ export const SECURITY_FIELDS: SettingField[] = [
         'Binding to a non-loopback address (e.g. 0.0.0.0) exposes mcpproxy to your network. Make sure “Require API key for MCP clients” is enabled. Continue?',
     },
   },
+  {
+    // Spec 107 FR-027 (edition-neutral, hot-reloaded): X-Forwarded-For /
+    // X-Forwarded-Proto / X-Forwarded-Host / X-Real-IP are honoured only when
+    // the direct peer is in this list. Empty = trust nobody.
+    key: 'trusted_proxies',
+    label: 'Trusted reverse proxies',
+    help: 'One CIDR or IP address per line (e.g. 10.0.0.0/8). Forwarded headers (X-Forwarded-For, X-Forwarded-Proto, X-Forwarded-Host, X-Real-IP) are honoured only from these peers; leave empty when mcpproxy is not behind a proxy. Applies without a restart.',
+    control: 'textarea',
+    listKind: 'lines',
+    optional: true,
+    placeholder: '10.0.0.0/8',
+  },
 ]
 
 // ---- Section 2: General ----
@@ -235,6 +269,41 @@ export const GENERAL_FIELDS: SettingField[] = [
       { value: 'retrieve_tools', label: 'Retrieve — search tools first (recommended)' },
       { value: 'direct', label: 'Direct — list all tools' },
       { value: 'code_execution', label: 'Code execution' },
+    ],
+    // /mcp binds its routing mode once at startup and http.ServeMux cannot
+    // re-register, so this genuinely needs a restart. Without the flag the
+    // operator got a green "Configuration applied" toast while /mcp kept
+    // serving the old surface.
+    restart: true,
+  },
+  // Spec 085 / Spec 102 — the two SERIALIZATION axes. Neither is a routing
+  // mode: `routing_mode` picks the tool SURFACE, these two pick how each entry
+  // on that surface is rendered. Both hot-reload (the Go change detector sets
+  // requires_restart for neither), so no restart badge. Until this landed they
+  // were reachable only via the config file, an env var, a serve flag or the
+  // REST API — a tray-only user could not set them at all.
+  {
+    key: 'tool_response_mode',
+    docs: '/features/search-discovery#tool-response-mode',
+    label: 'Detail in tool-search results',
+    help: 'Applies to Retrieve mode. Full = every result carries its complete input schema. Compact = a one-line signature plus a first-sentence description, and the agent fetches a full schema on demand with describe_tool. Saves tokens; never changes which tools are found.',
+    control: 'select',
+    defaultValue: 'full',
+    options: [
+      { value: 'full', label: 'Full — complete schemas (default)' },
+      { value: 'compact', label: 'Compact — signatures, schema on demand' },
+    ],
+  },
+  {
+    key: 'direct_tool_response_mode',
+    docs: '/features/schema-deferred-direct-mode',
+    label: 'Detail in Direct-mode listings',
+    help: 'Applies to Direct mode, and to /mcp/all in any mode. Full = every tool is listed with its complete input schema. Deferred = name, description and a compact signature only, with schemas fetched on demand via describe_tool; a call whose arguments do not fit is rejected before it reaches the server, with the schema attached so the agent can correct itself.',
+    control: 'select',
+    defaultValue: 'full',
+    options: [
+      { value: 'full', label: 'Full — complete schemas (default)' },
+      { value: 'deferred', label: 'Deferred — signatures, schema on demand' },
     ],
   },
   { key: 'tools_limit', label: 'Search results limit', help: 'How many tools a single tool-search returns to the agent.', control: 'number', min: 1, max: 1000 },
@@ -272,10 +341,102 @@ export const GENERAL_FIELDS: SettingField[] = [
 // so old configs hydrate the form while edits always save under `server_edition`.
 export const SERVER_EDITION_TAB_LABEL = 'Server Edition'
 export const SERVER_EDITION_SECTION_TITLE = '👥 Server Edition'
+//
+// Spec 107 PR-B (T054): this row set is asserted EXACTLY by
+// `tests/unit/settings-server-edition-wording.spec.ts`. The `Settings`
+// disposition paragraph of `specs/107-server-edition-sso-hardening/contracts/
+// config-keys.md` is the authority. Every row is restart-pinned (bound at
+// login-handler construction). Deliberately absent, Raw-JSON-only:
+// `access.*` (no map control), `oauth.allow_insecure_issuer` (a loopback-only
+// development toggle that must not look like a normal setting), and the
+// retained keys with no row today (`admin_emails`, `session_ttl`,
+// `bearer_token_ttl`, `oauth.client_id`, `oauth.tenant_id`,
+// `oauth.allowed_domains` — SC-007, no UI widening). NEVER a row:
+// `oauth.client_secret` and `credential_encryption_key` (secrets; `${env:}` /
+// `MCPPROXY_CRED_KEY`) and `store_idp_tokens` (deprecated no-op).
 export const SERVER_EDITION_FIELDS: SettingField[] = [
   { key: 'server_edition.enabled', label: 'Enable multi-user mode', control: 'toggle', restart: true },
-  { key: 'server_edition.oauth.provider', label: 'OAuth provider', control: 'select', options: ['', 'google', 'github', 'microsoft'].map((v) => ({ value: v, label: v || '(none)' })) },
-  { key: 'server_edition.max_user_servers', label: 'Max servers per user', control: 'number', min: 0 },
+  {
+    key: 'server_edition.oauth.provider',
+    label: 'OAuth provider',
+    help: 'Identity provider family. Choose "oidc" for any OpenID Connect provider (Keycloak, Okta, Entra, Authentik, …) and set the issuer URL below. Client id and secret are set in the config file (use ${env:…} for the secret).',
+    control: 'select',
+    options: ['', 'google', 'github', 'microsoft', 'oidc'].map((v) => ({ value: v, label: v || '(none)' })),
+    restart: true,
+  },
+  {
+    key: 'server_edition.oauth.display_name',
+    label: 'Login button label',
+    help: 'Shown on the sign-in page as "Sign in with …". Defaults to the provider family name. Up to 64 characters.',
+    control: 'text',
+    optional: true,
+    placeholder: 'Acme SSO',
+    restart: true,
+  },
+  {
+    key: 'server_edition.oauth.issuer_url',
+    label: 'OIDC issuer URL',
+    help: 'Required when the provider is "oidc". Must be https (plain http is accepted only for a loopback host with allow_insecure_issuer set in the config file). Discovery runs at <issuer>/.well-known/openid-configuration and the discovered issuer must match byte-for-byte.',
+    control: 'text',
+    valueKind: 'url',
+    optional: true,
+    placeholder: 'https://login.example.com/realms/acme',
+    restart: true,
+  },
+  {
+    key: 'server_edition.oauth.scopes',
+    label: 'OIDC scopes',
+    help: 'Comma-separated scopes requested at login. "openid" is always added. Default: openid, profile, email.',
+    control: 'textarea',
+    listKind: 'comma',
+    optional: true,
+    placeholder: 'openid, profile, email',
+    restart: true,
+  },
+  {
+    key: 'server_edition.oauth.groups_claim',
+    label: 'Groups claim',
+    help: 'Name of the ID-token / userinfo claim that carries the user’s groups (used by the access map). Default: groups.',
+    control: 'text',
+    optional: true,
+    placeholder: 'groups',
+    restart: true,
+  },
+  {
+    key: 'server_edition.oauth.email_verified_policy',
+    label: 'Email verification policy',
+    help: 'refuse_false = reject a login whose ID token says email_verified: false (default); require_true = also reject when the claim is missing; ignore = never check.',
+    control: 'select',
+    options: [
+      { value: 'refuse_false', label: 'refuse_false — reject unverified (default)' },
+      { value: 'require_true', label: 'require_true — require the claim to be true' },
+      { value: 'ignore', label: 'ignore — never check' },
+    ],
+    restart: true,
+  },
+  {
+    key: 'server_edition.public_url',
+    label: 'Public URL',
+    help: 'The absolute origin users reach mcpproxy at behind a reverse proxy (scheme://host[:port], no path). Used to build the OAuth callback and to decide whether the session cookie is Secure. MCPPROXY_PUBLIC_URL overrides it.',
+    control: 'text',
+    valueKind: 'url',
+    optional: true,
+    placeholder: 'https://mcp.example.com',
+    restart: true,
+  },
+  {
+    key: 'server_edition.session_cookie_secure',
+    label: 'Session cookie Secure attribute',
+    help: 'auto = Secure when the public URL is https or TLS is on (default). "false" cannot be combined with an https public URL or TLS.',
+    control: 'select',
+    defaultValue: 'auto',
+    options: [
+      { value: 'auto', label: 'auto — follow the public URL / TLS (default)' },
+      { value: 'true', label: 'true — always Secure' },
+      { value: 'false', label: 'false — never Secure (plain-http development only)' },
+    ],
+    restart: true,
+  },
 ]
 
 // isBlankInstructions returns true when a saved instructions value is empty /
@@ -283,6 +444,21 @@ export const SERVER_EDITION_FIELDS: SettingField[] = [
 export function isBlankInstructions(v: string | null | undefined): boolean {
   return !v || v.trim() === ''
 }
+
+// Spec 107 PR-D (T110): `audit_log.*` rows from `contracts/config-keys.md`.
+// `audit_log` is `RequiresRestart=true` ("audit_log is bound at sink
+// construction" — DetectConfigChanges), so every row carries the restart
+// badge. There is no secret key under `audit_log`, so no row uses the
+// `secret` control.
+export const AUDIT_LOG_FIELDS: SettingField[] = [
+  { key: 'audit_log.enabled', label: 'Enable audit logging', help: 'Writes one JSONL line per authorization decision and tool call. On by default under the server edition; the personal edition defaults to off.', control: 'toggle', restart: true },
+  { key: 'audit_log.stdout', label: 'Write to stdout', help: 'Server edition default when no path is set — not used under the native stdio transport (stdout carries JSON-RPC there); set a path instead.', control: 'toggle', restart: true },
+  { key: 'audit_log.path', label: 'File path', help: 'Where to write the rotating audit log file. Leave blank to use stdout instead.', control: 'text', optional: true, placeholder: '/var/log/mcpproxy/audit.jsonl', restart: true },
+  { key: 'audit_log.max_size_mb', label: 'Rotate after (MB)', control: 'number', min: 1, restart: true },
+  { key: 'audit_log.max_backups', label: 'Rotated files to keep', control: 'number', min: 1, restart: true },
+  { key: 'audit_log.max_age_days', label: 'Delete rotated logs after (days)', control: 'number', min: 1, restart: true },
+  { key: 'audit_log.compress', label: 'Compress rotated files', control: 'toggle', restart: true },
+]
 
 // ---- Section 3: Advanced (subsystem accordions) ----
 export const ADVANCED_ACCORDIONS: SettingsAccordion[] = [
@@ -314,7 +490,11 @@ export const ADVANCED_ACCORDIONS: SettingsAccordion[] = [
     fields: [
       { key: 'code_execution_timeout_ms', label: 'Max run time per execution (ms)', control: 'number', min: 1, max: 600000 },
       { key: 'code_execution_max_tool_calls', label: 'Max tool calls per execution', help: '0 = unlimited.', control: 'number', min: 0 },
-      { key: 'code_execution_pool_size', label: 'JavaScript runtime pool size', help: 'How many sandboxes run concurrently.', control: 'number', min: 1, max: 100 },
+      // UX audit F16: the Go detector forces a restart for this one (the JS
+      // runtime pool is sized at server construction and never resized), so it
+      // must carry the badge — its siblings above genuinely apply hot.
+      { key: 'code_execution_pool_size', label: 'JavaScript runtime pool size', help: 'How many sandboxes run concurrently.', control: 'number', min: 1, max: 100, restart: true },
+      { key: 'code_execution_max_parallel', label: 'Parallel calls per call_tools() batch', help: 'Default concurrency for batched tool calls; a script can override it per call (1-32).', control: 'number', min: 1, max: 32 },
     ],
   },
   {
@@ -377,6 +557,13 @@ export const ADVANCED_ACCORDIONS: SettingsAccordion[] = [
     ],
   },
   {
+    id: 'audit-log',
+    docs: '/features/audit-log',
+    title: 'Audit log',
+    description: 'Edition-neutral JSONL record of authorization decisions and tool calls. Changes take effect after a restart (the sink is bound at startup).',
+    fields: AUDIT_LOG_FIELDS,
+  },
+  {
     id: 'discovery',
     title: 'Tool discovery & health checks',
     description: 'How often mcpproxy probes upstream servers for liveness and re-discovers their tools. Lower these to reduce background traffic to chatty servers.',
@@ -427,6 +614,128 @@ export const ADVANCED_ACCORDIONS: SettingsAccordion[] = [
 // Settings keys come from the static catalogue above, but the generic helper is
 // guarded regardless.
 
+/**
+ * Labels of every field that carries the "restart" badge, derived from the
+ * catalogue itself.
+ *
+ * UX audit F16: the Settings hints panel used to hardcode this list in prose,
+ * which drifted from the badges (it named "Data directory", which has no field
+ * at all, and missed the code-execution pool size). Deriving it means the two
+ * surfaces cannot disagree — a field gains or loses the badge and the hint
+ * follows.
+ */
+export function restartRequiredLabels(): string[] {
+  const labels: string[] = []
+  for (const f of allCatalogFields()) {
+    if (f.restart && !labels.includes(f.label)) labels.push(f.label)
+  }
+  return labels
+}
+
+/** Every field in the catalogue, across all sections and accordions. */
+export function allCatalogFields(): SettingField[] {
+  return [
+    ...GENERAL_FIELDS,
+    ...SECURITY_FIELDS,
+    ...SERVER_EDITION_FIELDS,
+    ...ADVANCED_ACCORDIONS.flatMap((a) => a.fields),
+  ]
+}
+
+/**
+ * Fill in the resolved default for every catalogue field that declares a
+ * `defaultValue` and is currently blank in `cfg`. Mutates and returns cfg.
+ *
+ * The serialization-mode keys are `omitempty` on the Go side, where an absent
+ * value means "full" — so the config the API returns simply omits them until
+ * someone sets one. A native <select> whose value matches no <option> renders
+ * an empty box, which would make the default read as "unset" rather than as
+ * "full". Applied to BOTH the working copy and the last-saved snapshot so a
+ * field nobody touched never counts as an unsaved change.
+ */
+/**
+ * Back-compat for the teams -> server_edition rename (MCP-1086): if a config
+ * only carries the legacy `teams` key, mirror it onto `server_edition` so the
+ * form (which binds to `server_edition.*`) hydrates. Mutates and returns cfg.
+ */
+export function aliasServerEdition(cfg: any): any {
+  if (cfg && cfg.server_edition == null && cfg.teams != null) {
+    cfg.server_edition = cfg.teams
+  }
+  return cfg
+}
+
+/**
+ * Build the Settings form state from a raw `GET /api/v1/config` response.
+ *
+ * Extracted from Settings.vue so the hydration invariant is testable directly
+ * rather than by matching source text. That invariant:
+ *
+ *  - `working` and `original` BOTH get the resolved defaults, so a field nobody
+ *    touched never counts as an unsaved change.
+ *  - `raw` is the untouched response. The Raw JSON tab must show server truth,
+ *    and both helpers above MUTATE their argument, so the clones matter.
+ */
+export function hydrateConfigState(cfg: any): { working: any; original: any; raw: any } {
+  const clone = (v: any) => (v == null ? v : JSON.parse(JSON.stringify(v)))
+  return {
+    working: normalizeListFields(normalizeFieldDefaults(aliasServerEdition(clone(cfg)))),
+    original: normalizeListFields(normalizeFieldDefaults(aliasServerEdition(clone(cfg)))),
+    raw: clone(cfg),
+  }
+}
+
+export function normalizeFieldDefaults(cfg: any): any {
+  if (cfg == null || typeof cfg !== 'object') return cfg
+  for (const f of allCatalogFields()) {
+    if (f.defaultValue == null) continue
+    const cur = getPath(cfg, f.key)
+    if (cur == null || cur === '') setPath(cfg, f.key, f.defaultValue)
+  }
+  return cfg
+}
+
+/**
+ * Render a []string value as the textarea text of a list-kind field. Anything
+ * that is not an array (already text, null) is returned unchanged.
+ */
+export function listToText(kind: ListKind, value: unknown): unknown {
+  if (!Array.isArray(value)) return value
+  const items = value.map((v) => String(v))
+  return kind === 'lines' ? items.join('\n') : items.join(', ')
+}
+
+/**
+ * Parse the textarea text of a list-kind field back into a trimmed []string.
+ * Commas and newlines both separate entries for either kind (an operator who
+ * pastes "a,b" into a one-per-line box still gets two entries); blank entries
+ * are dropped, so a cleared textarea is an empty list, never a string. An
+ * array is returned as-is.
+ */
+export function textToList(_kind: ListKind, value: unknown): string[] {
+  if (Array.isArray(value)) return value.map((v) => String(v))
+  if (value == null) return []
+  return String(value)
+    .split(/[\n,]/)
+    .map((v) => v.trim())
+    .filter((v) => v !== '')
+}
+
+/**
+ * Turn every list-kind field's array into its textarea text. Applied to BOTH
+ * the working copy and the last-saved snapshot (see hydrateConfigState) so the
+ * dirty comparison stays string-vs-string. Mutates and returns cfg.
+ */
+export function normalizeListFields(cfg: any): any {
+  if (cfg == null || typeof cfg !== 'object') return cfg
+  for (const f of allCatalogFields()) {
+    if (!f.listKind) continue
+    const cur = getPath(cfg, f.key)
+    if (Array.isArray(cur)) setPath(cfg, f.key, listToText(f.listKind, cur))
+  }
+  return cfg
+}
+
 export function getPath(obj: any, path: string): any {
   return path.split('.').reduce((o, k) => (o == null ? undefined : o[k]), obj)
 }
@@ -450,10 +759,15 @@ export function setPath(obj: any, path: string, value: any): void {
 
 // buildPartial assembles a nested object containing ONLY the given dot-path
 // keys, read from `source`. This is the partial payload sent to PATCH /config.
+// A list-kind field (see ListKind) is converted from its textarea text back
+// into the []string the Go side expects.
 export function buildPartial(source: any, dirtyKeys: string[]): Record<string, any> {
   const out: Record<string, any> = {}
+  const fields = allCatalogFields()
   for (const key of dirtyKeys) {
-    setPath(out, key, getPath(source, key))
+    const f = fields.find((x) => x.key === key)
+    const val = getPath(source, key)
+    setPath(out, key, f?.listKind ? textToList(f.listKind, val) : val)
   }
   return out
 }

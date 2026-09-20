@@ -1,10 +1,36 @@
 <template>
   <dialog :open="show" class="modal" data-test="add-server-modal">
-    <div class="modal-box max-w-3xl" data-test="add-server-modal-box">
-      <h3 class="font-bold text-lg mb-4">Add New Server</h3>
+    <!--
+      UX audit F6: the box is a flex column with its own scroll region so the
+      submit row stays pinned to the bottom instead of falling below the fold,
+      and it carries the ARIA dialog contract (role/aria-modal/labelledby) that
+      `<dialog open>` does not provide on its own.
+    -->
+    <div
+      ref="dialogRef"
+      class="modal-box max-w-3xl flex flex-col max-h-[85vh] p-0 overflow-hidden"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="add-server-modal-title"
+      data-test="add-server-modal-box"
+    >
+      <!-- Header -->
+      <div class="flex items-start justify-between gap-4 px-6 pt-6 pb-4">
+        <h3 id="add-server-modal-title" class="font-bold text-lg">Add New Server</h3>
+        <button
+          type="button"
+          class="btn btn-sm btn-circle btn-ghost"
+          data-modal-close-button
+          data-test="add-server-modal-close"
+          aria-label="Close"
+          @click="handleClose"
+        >
+          ✕
+        </button>
+      </div>
 
       <!-- Tab Selection -->
-      <div class="tabs tabs-box mb-4">
+      <div class="tabs tabs-box mx-6 mb-4">
         <a
           :class="['tab', activeTab === 'manual' ? 'tab-active' : '']"
           @click="activeTab = 'manual'"
@@ -20,8 +46,9 @@
       </div>
 
       <!-- Manual Tab -->
-      <div v-if="activeTab === 'manual'">
-        <form @submit.prevent="handleSubmit">
+      <div v-if="activeTab === 'manual'" class="flex flex-col flex-1 min-h-0">
+        <form @submit.prevent="handleSubmit" class="flex flex-col flex-1 min-h-0">
+          <div class="flex-1 min-h-0 overflow-y-auto px-6 pb-4" data-test="add-server-modal-body">
           <!-- Server Type Selection -->
           <div class="form-control mb-4">
             <label class="label">
@@ -87,7 +114,7 @@
               <label class="label">
                 <span class="label-text font-semibold">Command</span>
               </label>
-              <select v-model="formData.command" class="select select-bordered" required>
+              <select v-model="formData.command" class="select select-bordered" aria-label="Command" required>
                 <option value="">Select command</option>
                 <option value="npx">npx (Node.js)</option>
                 <option value="uvx">uvx (Python)</option>
@@ -163,6 +190,41 @@
             </div>
           </div>
 
+          <!-- UX audit F09: adding a second entry for an endpoint that is
+               already configured is legitimate (different headers, a different
+               OAuth identity) but is usually a mistake — and until now nothing
+               said so. The first the user heard of it was the scanner calling
+               the NEW server dangerous, because two entries on one endpoint
+               expose byte-identical tool names and descriptions and
+               detect.shadowing.cross_server reads that as impersonation.
+               This is the observation that should have come first: neutral,
+               non-blocking, and naming the server it collides with.
+
+               The consequences are stated CONDITIONALLY, and that is not
+               hedging for its own sake — neither is guaranteed by endpoint
+               equality. A second entry may carry different credentials or a
+               different OAuth identity (the legitimate reason to make one) and
+               so expose a different toolset entirely; and even on identical
+               tools the clone check needs three tokens in BOTH descriptions
+               plus 85%/70% token overlap to fire
+               (internal/security/detect/checks/shadowing.go cloneDescriptions),
+               so short or empty descriptions never match. Promising a scanner
+               verdict this form cannot compute would be the same unfounded
+               claim this whole change exists to remove. -->
+          <p
+            v-if="duplicateEndpointServer"
+            data-test="addserver-duplicate-endpoint"
+            class="text-sm text-base-content/70 flex items-start gap-2 mt-2"
+          >
+            <span aria-hidden="true">ℹ</span>
+            <span>
+              <code class="font-mono">{{ duplicateEndpointServer.name }}</code> is already
+              configured at this endpoint. Adding a second entry is allowed — both will be
+              listed. If they turn out to expose the same tools, those tools will appear
+              twice and the security scan may flag each as a possible clone of the other.
+            </span>
+          </p>
+
           <!-- Toggles Section -->
           <div class="divider mt-6">Options</div>
 
@@ -184,31 +246,21 @@
               </label>
             </div>
 
-            <!-- Quarantined -->
-            <div class="form-control">
-              <label class="flex items-center gap-3 cursor-pointer py-1">
-                <input
-                  type="checkbox"
-                  v-model="formData.quarantined"
-                  class="toggle toggle-warning"
-                />
-                <span class="label-text font-semibold">Quarantined</span>
-                <div class="tooltip tooltip-right before:whitespace-normal before:w-56 before:max-w-[14rem]" data-tip="Prevent tool execution until security review is complete. Recommended for new servers.">
-                  <svg class="w-4 h-4 opacity-60" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-                  </svg>
-                </div>
-              </label>
-            </div>
-
-            <!-- Isolated (Docker) -->
-            <div class="form-control">
+            <!--
+              Isolated (Docker) — stdio only. Isolation is structurally
+              impossible for a URL upstream (internal/config/isolation_resolve.go
+              resolves IsolationSourceNotStdio when Command is empty), so the
+              control is noise rather than a choice there. This v-if is
+              PRESENTATION ONLY: the watcher on formData.type still clears
+              `isolated`, and handleSubmit still only writes isolation_json in
+              the stdio branch. Both guards stay.
+            -->
+            <div v-if="formData.type === 'stdio'" class="form-control">
               <label class="flex items-center gap-3 cursor-pointer py-1">
                 <input
                   type="checkbox"
                   v-model="formData.isolated"
                   class="toggle toggle-info"
-                  :disabled="formData.type !== 'stdio'"
                 />
                 <span class="label-text font-semibold">Docker Isolation</span>
                 <div class="tooltip tooltip-right before:whitespace-normal before:w-56 before:max-w-[14rem]" data-tip="Run stdio server in isolated Docker container for enhanced security (stdio only)">
@@ -219,23 +271,20 @@
               </label>
             </div>
 
-            <!-- Idle on Inactivity -->
-            <div class="form-control">
-              <label class="flex items-center gap-3 cursor-pointer py-1">
-                <input
-                  type="checkbox"
-                  v-model="formData.idleOnInactivity"
-                  class="toggle toggle-success"
-                  disabled
-                />
-                <span class="label-text font-semibold opacity-50">Idle on Inactivity</span>
-                <div class="tooltip tooltip-right before:whitespace-normal before:w-56 before:max-w-[14rem]" data-tip="Future feature: Automatically stop server after period of inactivity to save resources">
-                  <svg class="w-4 h-4 opacity-60" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-                  </svg>
-                </div>
+            <!--
+              Trust mode (spec 088 FR-006): replaces the old independent
+              "Quarantined" checkbox. The chosen mode decides admission —
+              auto is admitted straight away, scan|manual are quarantined on
+              add — so the request omits `quarantined` entirely and lets the
+              backend derive it. Shipping both controls would let the operator
+              contradict the mode.
+            -->
+            <div class="form-control pt-2" data-test="addserver-trust-mode">
+              <label class="label">
+                <span class="label-text font-semibold">Trust Mode</span>
+                <span class="label-text-alt">Decides quarantine on add and tool-change approval</span>
               </label>
-              <span class="text-xs opacity-50 ml-12">Coming soon</span>
+              <TrustModeSelector v-model="formData.trustMode" name="addserver-trust-mode" />
             </div>
           </div>
 
@@ -246,9 +295,13 @@
             </svg>
             <span>{{ error }}</span>
           </div>
+          </div>
 
-          <!-- Actions -->
-          <div class="modal-action">
+          <!-- Actions (sticky footer — F6) -->
+          <div
+            class="modal-action mt-0 px-6 py-4 border-t border-base-300 bg-base-100"
+            data-test="add-server-modal-footer"
+          >
             <button type="button" @click="handleClose" class="btn btn-ghost">Cancel</button>
             <button type="submit" class="btn btn-primary" :disabled="loading">
               <span v-if="loading" class="loading loading-spinner loading-sm"></span>
@@ -259,7 +312,8 @@
       </div>
 
       <!-- Import Tab -->
-      <div v-if="activeTab === 'import'">
+      <div v-if="activeTab === 'import'" class="flex flex-col flex-1 min-h-0">
+        <div class="flex-1 min-h-0 overflow-y-auto px-6 pb-4">
         <!-- Input Method Tabs -->
         <div class="flex gap-2 mb-4">
           <button
@@ -532,9 +586,10 @@ Example (Claude Desktop):
             <div class="text-sm mt-2">Deselect these servers or fix the configuration before importing.</div>
           </div>
         </div>
+        </div>
 
-        <!-- Actions -->
-        <div class="modal-action">
+        <!-- Actions (sticky footer — F6) -->
+        <div class="modal-action mt-0 px-6 py-4 border-t border-base-300 bg-base-100">
           <button type="button" @click="handleClose" class="btn btn-ghost">Cancel</button>
           <button
             @click="handleImport"
@@ -558,6 +613,9 @@ import { ref, reactive, watch, computed, onMounted } from 'vue'
 import { useServersStore } from '@/stores/servers'
 import { useSystemStore } from '@/stores/system'
 import api, { type CanonicalConfigPath } from '@/services/api'
+import TrustModeSelector from '@/components/TrustModeSelector.vue'
+import { useModalA11y } from '@/composables/useModalA11y'
+import type { TrustMode } from '@/utils/trustMode'
 import type { ImportResponse, ImportedServer } from '@/types'
 
 interface Props {
@@ -566,11 +624,19 @@ interface Props {
 
 interface Emits {
   (e: 'close'): void
-  (e: 'added'): void
+  // The single-server add names what it created so the consumer can hand off to
+  // that server's detail view — where connect/scan/review/approve actually
+  // happens. The bulk/import path emits no name (there is no single
+  // destination), which is what keeps consumers on the list they were reading.
+  (e: 'added', serverName?: string): void
 }
 
 const props = defineProps<Props>()
 const emit = defineEmits<Emits>()
+
+// UX audit F6: Escape closes, focus enters the dialog on open and is trapped
+// inside it, and returns to the trigger on close.
+const { dialogRef } = useModalA11y(() => props.show, () => handleClose())
 
 const serversStore = useServersStore()
 const systemStore = useSystemStore()
@@ -589,9 +655,9 @@ const formData = reactive({
   envText: '',
   workingDir: '',
   enabled: true,
-  quarantined: true,
-  isolated: false,
-  idleOnInactivity: false
+  // Manual = the secure default (quarantined on add, every tool change held).
+  trustMode: 'manual' as TrustMode,
+  isolated: false
 })
 
 const loading = ref(false)
@@ -623,6 +689,79 @@ const lineNumbersRef = ref<HTMLDivElement | null>(null)
 let previewTimer: ReturnType<typeof setTimeout> | null = null
 
 // Computed
+
+// Protocol values the backend accepts are `stdio | http | sse |
+// streamable-http | auto` (config.go validProtocols) and the REST payload
+// echoes the configured string verbatim, so it may also be absent. Only the
+// http FAMILY is enumerated; everything else stays eligible for a stdio match.
+const HTTP_FAMILY_PROTOCOLS = new Set<string>(['http', 'sse', 'streamable-http'])
+
+// UX audit F09. The endpoint the manual form currently describes, already
+// belongs to a configured server — or null. Advisory only: nothing here gates
+// submit, merges, or reuses an existing entry.
+//
+// Every "duplicate" guard in the backend keys on the server NAME
+// (internal/server/server.go, internal/config/config.go, internal/configimport),
+// so a second entry on one endpoint is accepted in silence and only surfaces
+// later as a hard-tier detect.shadowing.cross_server "possible impersonation"
+// finding on the new server. This covers the Web-UI door only; the MCP
+// `upstream_servers add`, CLI and import doors still say nothing.
+//
+// Matching is exact string equality after trim, deliberately. Case folding,
+// trailing-slash normalisation and query stripping are each a judgement call
+// about what "the same endpoint" means, and none has been made; exact match
+// catches the real case (a copy-pasted URL) and cannot accuse the wrong server.
+// It can MISS: the server list masks credential-shaped url/command/args values
+// (internal/oauth/serverfields.go), so a secret-bearing endpoint never matches.
+// A hint, not a guarantee — which is why the copy claims nothing more.
+//
+// The endpoint is the WHOLE launch identity, not just the head of it: url for
+// http, and command + the full args list + working_dir for stdio. Review
+// round 1 caught both halves of that being too loose — a stdio entry with a
+// stale `url` matched an http form and named the wrong server, and two
+// same-command entries in different directories read as duplicates.
+const duplicateEndpointServer = computed(() => {
+  // `servers` starts empty, so without `loaded` an unfetched list is
+  // indistinguishable from "no duplicates" and the note would be silently
+  // wrong on a cold open.
+  if (!serversStore.loaded) return null
+
+  if (formData.type === 'http') {
+    const url = formData.url.trim()
+    if (!url) return null
+    // The transport guard is NEGATIVE on purpose: it excludes the opposite
+    // family only, so `sse`, `streamable-http`, `auto` and an absent protocol
+    // all stay eligible. A positive `protocol === formData.type` filter would
+    // MISS the case this whole note exists for — the existing entry is
+    // commonly recorded as `streamable-http` while this modal always sends
+    // `http` (handleSubmit: `protocol: formData.type`).
+    return (
+      serversStore.servers.find(
+        s => s.protocol !== 'stdio' && (s.url ?? '').trim() === url,
+      ) ?? null
+    )
+  }
+
+  const command = (formData.command === 'custom' ? formData.customCommand : formData.command).trim()
+  if (!command) return null
+  const args = parseArgs()
+  // working_dir is part of the endpoint this form describes — handleSubmit
+  // sends it on every stdio add — so `node server.js` in two different
+  // directories is two different programs with two different toolsets, not a
+  // duplicate. Comparing trimmed strings makes an absent value equal to a
+  // blank field, which is the same endpoint.
+  const workingDir = formData.workingDir.trim()
+  return (
+    serversStore.servers.find(s => {
+      if (HTTP_FAMILY_PROTOCOLS.has(s.protocol)) return false
+      if ((s.command ?? '').trim() !== command) return false
+      if ((s.working_dir ?? '').trim() !== workingDir) return false
+      const existing = s.args ?? []
+      return existing.length === args.length && existing.every((a, i) => a === args[i])
+    }) ?? null
+  )
+})
+
 const lineCount = computed(() => {
   if (!importContent.value) return 10 // Show at least 10 lines for placeholder
   return Math.max(importContent.value.split('\n').length, 10)
@@ -799,12 +938,15 @@ async function handleSubmit() {
     const args = parseArgs()
     const env = parseEnv()
 
+    // FR-006: send the trust mode and OMIT `quarantined` — the backend derives
+    // admission from the mode (QuarantineDefaultForServer) and treats an
+    // explicit `quarantined` as an override applied after that derivation.
     const serverData: any = {
       operation: 'add',
       name: formData.name,
       protocol: formData.type,
       enabled: formData.enabled,
-      quarantined: formData.quarantined
+      trust_mode: formData.trustMode
     }
 
     if (formData.type === 'http') {
@@ -833,7 +975,14 @@ async function handleSubmit() {
       message: `${formData.name} has been added successfully`
     })
 
-    emit('added')
+    // Emit the name that was SENT (the serverData snapshot), never the live
+    // formData.name. Two reasons, both real:
+    //  - The name input carries no disabled binding and Cancel stays live while
+    //    `loading` is true, so the field is editable across the await above.
+    //    Re-reading it here can name a server that was never created and strand
+    //    the consumer on ServerDetail's "Server not found".
+    //  - handleClose() below blanks formData.name outright.
+    emit('added', serverData.name)
     handleClose()
   } catch (err) {
     error.value = err instanceof Error ? err.message : 'Failed to add server'
@@ -1079,9 +1228,8 @@ function handleClose() {
   formData.envText = ''
   formData.workingDir = ''
   formData.enabled = true
-  formData.quarantined = true
+  formData.trustMode = 'manual'
   formData.isolated = false
-  formData.idleOnInactivity = false
   error.value = ''
 
   // Reset import state

@@ -2,6 +2,9 @@ package upstream
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"maps"
 	"os/exec"
@@ -11,6 +14,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	uptransport "github.com/mark3labs/mcp-go/client/transport"
+	"github.com/mark3labs/mcp-go/mcp"
 	"go.uber.org/zap"
 
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
@@ -20,6 +25,7 @@ import (
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/storage"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/transport"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/upstream/core"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/upstream/limiter"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/upstream/managed"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/upstream/types"
 )
@@ -111,6 +117,12 @@ type Manager struct {
 	// cannot write due to DB lock). Prevents rapid retrigger loops.
 	tokenReconnect map[string]time.Time
 
+	// tokenFingerprints records which persisted token each server was last
+	// retried with, so the scan fires on a NEW token rather than on the mere
+	// presence of the stale one it already failed with (#1013). Same goroutine
+	// as tokenReconnect (the OAuth event monitor), so it needs no extra lock.
+	tokenFingerprints map[string]string
+
 	// Context for shutdown coordination
 	shutdownCtx    context.Context
 	shutdownCancel context.CancelFunc
@@ -126,6 +138,19 @@ type Manager struct {
 
 	// Tool discovery callback for notifications/tools/list_changed handling
 	toolDiscoveryCallback func(ctx context.Context, serverName string) error
+
+	// Prompts-changed callback for notifications/prompts/list_changed handling (F13)
+	promptsChangedCallback func(serverName string)
+
+	// limiters owns the spec-093 concurrency limiter instances (one per upstream
+	// plus the proxy-wide aggregate). Created once and never replaced — hot
+	// reload republishes limits INTO it so occupancy is shared across
+	// generations (FR-021).
+	limiters *limiter.Registry
+	// rejectObserver is the origin-independent shed seam (FR-012/FR-013),
+	// installed by the runtime. Stored as an atomic pointer because it is set
+	// after construction while clients may already exist.
+	rejectObserver atomic.Pointer[limiter.Observer]
 }
 
 func cloneServerConfig(cfg *config.ServerConfig) *config.ServerConfig {
@@ -168,20 +193,34 @@ func cloneServerConfig(cfg *config.ServerConfig) *config.ServerConfig {
 
 // NewManager creates a new upstream manager
 func NewManager(logger *zap.Logger, globalConfig *config.Config, boltStorage *storage.BoltDB, secretResolver *secret.Resolver, storageMgr *storage.Manager) *Manager {
+	// Scope this process's Docker container-ownership instance ID to its data
+	// dir instead of a host-wide shared file, so concurrent mcpproxy
+	// processes on one host (which already require distinct data dirs, since
+	// BBolt locks config.db) get distinct IDs. Must happen before any code
+	// path calls core.GetInstanceID(), so it's done here, at the earliest
+	// point every entry point (serve, tray, CLI subcommands) has the loaded
+	// config available.
+	core.SetInstanceDataDir(globalConfig.DataDir)
+
 	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
 	manager := &Manager{
-		clients:         make(map[string]*managed.Client),
-		logger:          logger,
-		storage:         boltStorage,
-		notificationMgr: NewNotificationManager(),
-		secretResolver:  secretResolver,
-		tokenReconnect:  make(map[string]time.Time),
-		lastSweptAt:     make(map[string]time.Time),
-		shutdownCtx:     shutdownCtx,
-		shutdownCancel:  shutdownCancel,
-		storageMgr:      storageMgr,
+		clients:           make(map[string]*managed.Client),
+		logger:            logger,
+		storage:           boltStorage,
+		notificationMgr:   NewNotificationManager(),
+		secretResolver:    secretResolver,
+		tokenReconnect:    make(map[string]time.Time),
+		tokenFingerprints: make(map[string]string),
+		lastSweptAt:       make(map[string]time.Time),
+		shutdownCtx:       shutdownCtx,
+		shutdownCancel:    shutdownCancel,
+		storageMgr:        storageMgr,
+		limiters:          limiter.NewRegistry(),
 	}
 	manager.globalConfig.Store(globalConfig)
+	// Spec 093: publish the initial limit generation. With no limits configured
+	// this allocates nothing and every admission is a passthrough (FR-006).
+	manager.applyConcurrencyLimits(globalConfig)
 
 	// Set up OAuth completion callback to trigger connection retries (in-process)
 	tokenManager := oauth.GetTokenStoreManager()
@@ -194,6 +233,12 @@ func NewManager(logger *zap.Logger, globalConfig *config.Config, boltStorage *st
 				zap.Error(err))
 		}
 	})
+
+	// Surface OAuth failures that have no caller to return an error to — an
+	// undeliverable callback, a state mismatch, a background token exchange
+	// that failed. Without this the CLI kept reporting "OAuth authentication
+	// flow initiated successfully" while the flow had already died (issue #975).
+	tokenManager.SetOAuthFailureCallback(manager.recordOAuthFailure)
 
 	// Start database event monitor for cross-process OAuth completion notifications
 	if boltStorage != nil {
@@ -212,9 +257,31 @@ func NewManager(logger *zap.Logger, globalConfig *config.Config, boltStorage *st
 	return manager
 }
 
-// shouldEnableDockerRecovery returns true when Docker recovery should run based on config.
-// It respects docker_recovery.enabled=false and only enables monitoring when Docker
-// isolation is turned on or any server is explicitly using Docker commands.
+// shouldEnableDockerRecovery returns true when Docker recovery should run based
+// on config: does this proxy depend on a working Docker daemon at all?
+//
+// It respects docker_recovery.enabled=false, and otherwise composes the
+// per-server config.ServerDependsOnDocker predicate into the per-manager
+// question the monitor actually asks. The two halves are deliberately
+// different shapes:
+//
+//   - The GLOBAL half is forward-looking. The monitor is started once, at
+//     manager construction, but servers are added at runtime — so a global
+//     resolved mode of "docker" means "anything stdio we launch from now on is
+//     containerised", regardless of which servers happen to be configured now
+//     (this is also why an empty Servers list under global docker still
+//     enables recovery).
+//   - The PER-SERVER half then covers the configs the global mode does not:
+//     a per-server `isolation.mode: "docker"` override wins outright even when
+//     the global mode is none, and a server whose own command invokes docker
+//     needs the daemon whatever isolation says.
+//
+// It replaced a hand-rolled mirror of the two LEGACY booleans that never
+// consulted isolation MODES, so `{mode:"docker", enabled:false}` (and a
+// per-server mode override under a legacy-off global) left recovery monitoring
+// off and let shutdown skip container cleanup, leaking containers — while a
+// legacy per-server `enabled:true` under a none global mode, which the resolver
+// IGNORES, switched the monitor on for containers that never exist (GH #1142).
 func (m *Manager) shouldEnableDockerRecovery() bool {
 	if m == nil {
 		return false
@@ -229,22 +296,15 @@ func (m *Manager) shouldEnableDockerRecovery() bool {
 		return false
 	}
 
-	// Global Docker isolation enabled
-	if gc.DockerIsolation != nil && gc.DockerIsolation.Enabled {
+	// Global half: every stdio server, present or future, is containerised.
+	if gc.DockerIsolation.ResolvedMode() == config.IsolationModeDocker {
 		return true
 	}
 
-	// Detect servers that explicitly use Docker (e.g., docker run/exec commands)
+	// Per-server half: an override that resolves to docker, or a server whose
+	// own command is docker.
 	for _, srv := range gc.Servers {
-		if srv == nil {
-			continue
-		}
-
-		if srv.Isolation != nil && srv.Isolation.IsEnabled() {
-			return true
-		}
-
-		if strings.Contains(srv.Command, "docker") {
+		if config.ServerDependsOnDocker(gc.DockerIsolation, srv) {
 			return true
 		}
 	}
@@ -253,29 +313,35 @@ func (m *Manager) shouldEnableDockerRecovery() bool {
 }
 
 // UsesDockerIsolation reports whether this manager could have launched
-// Docker-isolated containers (global isolation on, a per-server isolation, or
-// a docker command). When false, no container cleanup verification is needed
-// on shutdown — shelling out to `docker ps` would be pure waste (and, in test
-// processes, adds ~17s/Close via the verification loop). Same predicate the
-// Docker recovery monitor uses, so behavior stays consistent.
+// Docker containers (a global or per-server isolation mode that resolves to
+// docker, or a server whose own command is docker). When false, no container
+// cleanup verification is needed on shutdown — shelling out to `docker ps`
+// would be pure waste (and, in test processes, adds ~17s/Close via the
+// verification loop). Same predicate the Docker recovery monitor uses, so
+// behavior stays consistent.
 func (m *Manager) UsesDockerIsolation() bool {
 	return m.shouldEnableDockerRecovery()
 }
 
 // resolveConnectTimeout computes the deadline for an upstream's MCP `initialize`
 // handshake (MCP-3322 / GH #760). It resolves the per-server → global → 30s
-// default init_timeout via Config.ResolveInitTimeout. For Docker-isolated
-// servers — which may need to pull/install a package before answering
-// `initialize` — it keeps a 3-minute floor so a small init_timeout never
-// regresses the historical Docker grace period; a larger init_timeout still
-// wins. Un-isolated stdio servers (the bite in #760) now get the resolved
+// default init_timeout via Config.ResolveInitTimeout. For servers that depend on
+// Docker — which may need to pull an image or install a package before
+// answering `initialize` — it keeps a 3-minute floor so a small init_timeout
+// never regresses the historical Docker grace period; a larger init_timeout
+// still wins. Un-isolated stdio servers (the bite in #760) now get the resolved
 // deadline instead of silently inheriting the caller's ~30s context.
-func (m *Manager) resolveConnectTimeout(serverConfig *config.ServerConfig, dockerIsolated bool) time.Duration {
+//
+// dependsOnDocker is managed.Client.DependsOnDocker: it covers BOTH "we
+// containerise it" and "its own command is docker". It is deliberately not the
+// launch-shape question — a server that already runs docker is never wrapped by
+// us, yet pays exactly the same image-pull latency (GH #1142).
+func (m *Manager) resolveConnectTimeout(serverConfig *config.ServerConfig, dependsOnDocker bool) time.Duration {
 	timeout := 30 * time.Second
 	if gc := m.globalConfig.Load(); gc != nil {
 		timeout = gc.ResolveInitTimeout(serverConfig)
 	}
-	if dockerIsolated && timeout < 3*time.Minute {
+	if dependsOnDocker && timeout < 3*time.Minute {
 		timeout = 3 * time.Minute
 	}
 	return timeout
@@ -297,6 +363,12 @@ func (m *Manager) SetLogConfig(logConfig *config.LogConfig) {
 // touching each client.
 func (m *Manager) SetGlobalConfig(globalConfig *config.Config) {
 	m.globalConfig.Store(globalConfig)
+
+	// Spec 093 FR-021: republish one atomic generation of concurrency limits
+	// (global + per-server) into the SAME limiter instances, so running calls
+	// keep counting against the new caps and queued calls keep their original
+	// deadlines.
+	m.applyConcurrencyLimits(globalConfig)
 
 	m.mu.RLock()
 	clients := make([]*managed.Client, 0, len(m.clients))
@@ -332,6 +404,16 @@ func (m *Manager) SetToolDiscoveryCallback(callback func(ctx context.Context, se
 	defer m.mu.Unlock()
 	m.toolDiscoveryCallback = callback
 	m.logger.Debug("Tool discovery callback set on manager")
+}
+
+// SetPromptsChangedCallback sets the callback for triggering aggregated-prompt
+// refresh when an upstream sends notifications/prompts/list_changed (F13). It is
+// passed to all new clients created by the manager.
+func (m *Manager) SetPromptsChangedCallback(callback func(serverName string)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.promptsChangedCallback = callback
+	m.logger.Debug("Prompts-changed callback set on manager")
 }
 
 // AddServerConfig adds a server configuration without connecting
@@ -374,6 +456,9 @@ func (m *Manager) AddServerConfig(id string, serverConfig *config.ServerConfig) 
 			// Use thread-safe setter to avoid race with GetServerState()
 			m.mu.Unlock()
 			existingClient.SetConfig(serverConfig)
+			// Spec 093: the per-server limits may have changed even though the
+			// transport config did not.
+			m.applyServerConcurrency(serverConfig)
 			return nil
 		}
 	}
@@ -409,6 +494,15 @@ func (m *Manager) AddServerConfig(id string, serverConfig *config.ServerConfig) 
 		client.SetToolDiscoveryCallback(m.toolDiscoveryCallback)
 	}
 
+	// Set up prompts-changed callback for notifications/prompts/list_changed (F13)
+	if m.promptsChangedCallback != nil {
+		client.SetPromptsChangedCallback(m.promptsChangedCallback)
+	}
+
+	// Spec 093: install admission control before the client becomes reachable,
+	// so no dispatch can ever see a client without its limiter wiring.
+	client.SetAdmissionControl(m.limiters, m.currentRejectObserver())
+
 	m.clients[id] = client
 	m.logger.Info("Added upstream server configuration",
 		zap.String("id", id),
@@ -416,6 +510,11 @@ func (m *Manager) AddServerConfig(id string, serverConfig *config.ServerConfig) 
 
 	// IMPORTANT: Release lock before disconnecting to prevent deadlock
 	m.mu.Unlock()
+
+	// Spec 093: publish this server's limits (or retire them when the server is
+	// disabled/quarantined, FR-009). Done off the lock — Retire wakes queued
+	// callers.
+	m.applyServerConcurrency(serverConfig)
 
 	// Disconnect old client outside lock to avoid blocking other operations
 	if clientToDisconnect != nil {
@@ -474,7 +573,7 @@ func (m *Manager) AddServer(id string, serverConfig *config.ServerConfig) error 
 
 		// Connect to server with the resolved init_timeout (MCP-3322) to prevent
 		// hanging while still honoring a per-server/global handshake deadline.
-		ctx, cancel := context.WithTimeout(context.Background(), m.resolveConnectTimeout(serverConfig, client.IsDockerIsolated()))
+		ctx, cancel := context.WithTimeout(context.Background(), m.resolveConnectTimeout(serverConfig, client.DependsOnDocker()))
 		defer cancel()
 		if err := client.Connect(ctx); err != nil {
 			// Check if this is an OAuth error - don't fail AddServer for OAuth
@@ -514,6 +613,17 @@ func (m *Manager) RemoveServer(id string) {
 		delete(m.clients, id)
 	}
 	m.mu.Unlock()
+
+	// Spec 093 FR-009: tombstone the limiter first so queued calls fail
+	// immediately with the server-unavailable semantics instead of waiting out
+	// their queue deadline against a server that no longer exists.
+	name := id
+	if exists && client != nil {
+		if cfg := client.GetConfig(); cfg != nil && cfg.Name != "" {
+			name = cfg.Name
+		}
+	}
+	m.retireServerConcurrency(name)
 
 	// Disconnect outside the lock to avoid blocking other operations
 	if exists {
@@ -644,98 +754,269 @@ func (m *Manager) ShutdownAll(ctx context.Context) error {
 	return nil
 }
 
-// cleanupAllManagedContainers finds and stops all Docker containers managed by mcpproxy
-// Uses labels to identify containers across all instances
+// managedContainerFormat is the `docker ps --format` both sweeps read: id,
+// name and the owner + instance labels, tab-separated, labels last so an
+// empty label leaves its column empty rather than shifting the others.
+const managedContainerFormat = "{{.ID}}\t{{.Names}}\t{{.Label \"com.mcpproxy.server\"}}\t{{.Label \"com.mcpproxy.instance\"}}"
+
+// managedContainer is one `docker ps` row of a sweep.
+type managedContainer struct {
+	ID       string
+	Name     string
+	Owner    string // the com.mcpproxy.server label value as Docker reported it
+	Instance string // the com.mcpproxy.instance label value as Docker reported it
+}
+
+// configuredServerNames returns the raw name of every configured server
+// (enabled or not) — the set of possible canonical owners for a sweep.
+func (m *Manager) configuredServerNames() []string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	names := make([]string, 0, len(m.clients))
+	for _, client := range m.clients {
+		if client == nil {
+			continue
+		}
+		if cfg := client.GetConfig(); cfg != nil {
+			names = append(names, cfg.Name)
+		}
+	}
+	return names
+}
+
+// sweepDocker is how the sweeps run docker: the bare name on PATH.
+func sweepDocker(ctx context.Context, args ...string) *exec.Cmd {
+	return exec.CommandContext(ctx, "docker", args...)
+}
+
+// readManagedContainers runs `docker ps [-a] --no-trunc` with the given
+// filters and returns every row — full id, name and owner label as Docker
+// reports them — with no ownership applied; a row the format could not be
+// parsed is returned with an empty name and owner so it fails the predicate.
+// includeStopped adds `-a`; without it only rows Docker reports as running
+// come back — the same includeStopped convention core.Client's own
+// listOwnedContainersFiltered uses (codex round 10, docker finding 1): a
+// caller that only cares whether something is CURRENTLY running, such as
+// HasDockerContainers, must not see an already-stopped row and misreport it
+// as still running.
+func (m *Manager) readManagedContainers(ctx context.Context, includeStopped bool, filters ...string) ([]managedContainer, error) {
+	args := []string{"ps"}
+	if includeStopped {
+		args = append(args, "-a")
+	}
+	args = append(args, "--no-trunc")
+	for _, filter := range filters {
+		args = append(args, "--filter", filter)
+	}
+	args = append(args, "--format", managedContainerFormat)
+	output, err := sweepDocker(ctx, args...).Output()
+	if err != nil {
+		return nil, err
+	}
+
+	// NOT strings.TrimSpace(output) before splitting, and no per-line
+	// "keep the rest" on a bad count (codex rounds 3 and 4: FR-007
+	// instance-scoping fix). Label VALUES have no tab- or
+	// newline-escaping, and this listing's own docker-side filter
+	// deliberately does NOT constrain com.mcpproxy.server (it must match
+	// ANY configured server, checked in Go by core.ContainerOwnedByAny) —
+	// so a container an attacker creates themselves, carrying
+	// com.mcpproxy.managed=true, can give that Owner label a value
+	// engineered to smuggle "<real-value>\t<junk>" past an exact-match
+	// comparison, or worse, containing a literal newline that splits what
+	// Docker rendered as ONE row into what looks like a second,
+	// independently well-formed line naming a DIFFERENT id, name, owner
+	// and instance of the attacker's choosing. A single malformed line
+	// proves this listing's line boundaries are untrustworthy, so ANY bad
+	// count discards the WHOLE listing (report nothing found) rather than
+	// keeping whichever rows still look well-formed.
+	var rows []managedContainer
+	for _, line := range strings.Split(string(output), "\n") {
+		if line == "" {
+			continue
+		}
+		parts := strings.Split(line, "\t")
+		if len(parts) != 4 {
+			m.logger.Warn("Discarding managed-container listing: a docker ps row did not parse to the expected field count")
+			return nil, nil
+		}
+		rows = append(rows, managedContainer{ID: parts[0], Name: parts[1], Owner: parts[2], Instance: parts[3]})
+	}
+	return rows, nil
+}
+
+// listOwnedManagedContainers runs `docker ps [-a]` with the given label
+// filters and returns only the rows canonically owned by a configured
+// server: com.mcpproxy.server=<raw> AND name
+// ^mcpproxy-<sanitised(raw)>-[a-z0-9]{4}$ for the SAME configured server
+// (core.ContainerOwnedByAny). The managed and instance labels a sweep
+// selects on are shared and copyable, so on their own they are not
+// ownership (Spec 105 FR-007 / D9, codex round 3): a foreign container
+// carrying them is neither mutated nor named. A row that fails the
+// predicate is also not counted: its label is untrusted (that is exactly
+// why it was rejected), so no owner can be attributed to it, and D8's
+// evidence rule requires every container count to carry the owner it
+// counts (codex round 11) — there is no non-fabricated owner to put on a
+// tally of rejected rows, so listOwnedManagedContainers logs nothing about
+// them at all. includeStopped is passed straight through to
+// readManagedContainers.
+func (m *Manager) listOwnedManagedContainers(ctx context.Context, includeStopped bool, filters ...string) ([]managedContainer, error) {
+	rows, err := m.readManagedContainers(ctx, includeStopped, filters...)
+	if err != nil {
+		return nil, err
+	}
+
+	configured := m.configuredServerNames()
+	var owned []managedContainer
+	for _, row := range rows {
+		if !core.ContainerOwnedByAny(configured, row.Name, row.Owner, row.Instance) {
+			continue
+		}
+		owned = append(owned, row)
+	}
+	return owned, nil
+}
+
+// logOwnerGroupedCounts writes one record per container_owner represented
+// in owned, each carrying that owner and how many rows it accounts for —
+// never a single aggregate. A sweep can select containers belonging to more
+// than one configured server, so one bare count cannot be bound to a
+// subject (Spec 105 D8, codex round 10 finding 2); level is m.logger.Info or
+// m.logger.Warn, matching the call site's own level for the record it
+// replaces.
+func (m *Manager) logOwnerGroupedCounts(msg string, level func(msg string, fields ...zap.Field), owned []managedContainer) {
+	counts := make(map[string]int, len(owned))
+	for _, row := range owned {
+		counts[row.Owner]++
+	}
+	for owner, count := range counts {
+		level(msg, zap.String("container_owner", owner), zap.Int("count", count))
+	}
+}
+
+// mutateOwnedManagedContainer runs op on one selected container through
+// core.ContainerMutator — the one verify-then-mutate implementation the
+// core client's cleanup paths use too (Spec 105 FR-007 / D9, codex rounds 5
+// and 6): the selection `docker ps` is a snapshot, and another Docker client
+// can rename or relabel the container between that listing and the
+// stop/kill/rm, so its full id, name and label are re-read immediately
+// before the command and core.ContainerOwnedByAny re-applied over the
+// configured servers. A refusal — the re-read failed, or the container no
+// longer satisfies the predicate — is recorded naming only the listing-time
+// server, never the id or name; the row handed back is the one read NOW, so
+// its Owner is what the mutation's records carry. intent is called with
+// that row right before the command.
+func (m *Manager) mutateOwnedManagedContainer(ctx context.Context, selected managedContainer, op core.ContainerMutation, intent func(core.ContainerRow)) core.MutationResult {
+	mutator := core.ContainerMutator{
+		Docker: sweepDocker,
+		Owns: func(containerName, ownerLabel, instanceLabel string) bool {
+			return core.ContainerOwnedByAny(m.configuredServerNames(), containerName, ownerLabel, instanceLabel)
+		},
+	}
+	res := mutator.Mutate(ctx, selected.ID, op, intent)
+	switch {
+	case res.Verified:
+	case res.Err != nil:
+		m.logger.Warn("Could not re-verify ownership of a selected container - leaving it alone",
+			zap.String("server", selected.Owner),
+			zap.String("operation", string(op)),
+			zap.Error(res.Err))
+	default:
+		m.logger.Warn("Selected container is no longer canonically owned by a configured server - leaving it alone",
+			zap.String("server", selected.Owner),
+			zap.String("operation", string(op)))
+	}
+	return res
+}
+
+// cleanupAllManagedContainers finds and stops this instance's Docker
+// containers managed by mcpproxy. The initial `docker ps` filter is the
+// shared, copyable com.mcpproxy.managed label only — deliberately broad —
+// but listOwnedManagedContainers' canonical-ownership check
+// (core.ContainerOwnedByAny) then keeps only the rows that ALSO carry this
+// process's own com.mcpproxy.instance label: a row from another live
+// mcpproxy instance (same host, a configured server with the same name) is
+// exactly as foreign as one with no label at all, and this shutdown path
+// must never stop or remove a container it does not own.
 func (m *Manager) cleanupAllManagedContainers(ctx context.Context) {
 	m.logger.Info("Cleaning up all mcpproxy-managed Docker containers")
 
 	// Find all containers with our management label
-	listCmd := exec.CommandContext(ctx, "docker", "ps", "-a",
-		"--filter", "label=com.mcpproxy.managed=true",
-		"--format", "{{.ID}}\t{{.Names}}\t{{.Label \"com.mcpproxy.server\"}}")
-
-	output, err := listCmd.Output()
+	owned, err := m.listOwnedManagedContainers(ctx, true, "label=com.mcpproxy.managed=true")
 	if err != nil {
 		m.logger.Debug("No Docker containers found or Docker unavailable", zap.Error(err))
 		return
 	}
 
-	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
-	if len(lines) == 0 || lines[0] == "" {
+	if len(owned) == 0 {
 		m.logger.Debug("No mcpproxy-managed containers found")
 		return
 	}
 
-	m.logger.Info("Found mcpproxy-managed containers to cleanup",
-		zap.Int("count", len(lines)))
+	m.logOwnerGroupedCounts("Found mcpproxy-managed containers to cleanup", m.logger.Info, owned)
 
 	// Grace period for graceful shutdown
 	gracePeriod := 10 * time.Second
 	graceCtx, graceCancel := context.WithTimeout(ctx, gracePeriod)
 	defer graceCancel()
 
-	containerIDs := []string{}
-	for _, line := range lines {
-		if line == "" {
+	// Ownership is re-established right before each mutation
+	// (mutateOwnedManagedContainer), and every record below that names a
+	// container carries the owner Docker reported for it at that moment
+	// (container_owner), on the outcome records as well as the intent ones
+	// (Spec 105 D8/D9, codex rounds 4 and 5).
+	for _, selected := range owned {
+		// Try graceful stop first
+		res := m.mutateOwnedManagedContainer(graceCtx, selected, core.ContainerStop, func(container core.ContainerRow) {
+			m.logger.Info("Stopping container",
+				zap.String("container_id", container.ID),
+				zap.String("container_name", container.Name),
+				zap.String("server", container.Owner),
+				zap.String("container_owner", container.Owner))
+		})
+		if !res.Verified {
 			continue
 		}
-		parts := strings.SplitN(line, "\t", 3)
-		if len(parts) >= 1 {
-			containerID := parts[0]
-			containerName := ""
-			serverName := ""
-			if len(parts) >= 2 {
-				containerName = parts[1]
-			}
-			if len(parts) >= 3 {
-				serverName = parts[2]
-			}
-
-			m.logger.Info("Stopping container",
-				zap.String("container_id", containerID),
-				zap.String("container_name", containerName),
-				zap.String("server", serverName))
-
-			containerIDs = append(containerIDs, containerID)
-
-			// Try graceful stop first
-			stopCmd := exec.CommandContext(graceCtx, "docker", "stop", containerID)
-			if err := stopCmd.Run(); err != nil {
-				m.logger.Warn("Graceful stop failed, will force kill",
-					zap.String("container_id", containerID),
-					zap.Error(err))
-			} else {
-				m.logger.Info("Container stopped gracefully",
-					zap.String("container_id", containerID))
-			}
+		if res.Err != nil {
+			m.logger.Warn("Graceful stop failed, will force kill",
+				zap.String("container_id", res.Container.ID),
+				zap.String("container_owner", res.Container.Owner),
+				zap.Error(res.Err))
+		} else {
+			m.logger.Info("Container stopped gracefully",
+				zap.String("container_id", res.Container.ID),
+				zap.String("container_owner", res.Container.Owner))
 		}
 	}
 
 	// Force kill any remaining containers after grace period
-	if graceCtx.Err() != nil || len(containerIDs) > 0 {
-		m.logger.Info("Force killing any remaining containers")
+	m.logger.Info("Force killing any remaining containers")
 
-		killCtx, killCancel := context.WithTimeout(ctx, 5*time.Second)
-		defer killCancel()
+	killCtx, killCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer killCancel()
 
-		for _, containerID := range containerIDs {
-			// Check if container is still running
-			psCmd := exec.CommandContext(killCtx, "docker", "ps", "-q",
-				"--filter", "id="+containerID)
-			if output, err := psCmd.Output(); err == nil && len(strings.TrimSpace(string(output))) > 0 {
-				// Still running, force kill
+	for _, selected := range owned {
+		// Check if container is still running
+		psCmd := sweepDocker(killCtx, "ps", "-q", "--filter", "id="+selected.ID)
+		if output, err := psCmd.Output(); err == nil && len(strings.TrimSpace(string(output))) > 0 {
+			// Still running, force kill
+			res := m.mutateOwnedManagedContainer(killCtx, selected, core.ContainerKill, func(container core.ContainerRow) {
 				m.logger.Info("Force killing container",
-					zap.String("container_id", containerID))
-
-				killCmd := exec.CommandContext(killCtx, "docker", "kill", containerID)
-				if err := killCmd.Run(); err != nil {
-					m.logger.Error("Failed to force kill container",
-						zap.String("container_id", containerID),
-						zap.Error(err))
-				} else {
-					m.logger.Info("Container force killed",
-						zap.String("container_id", containerID))
-				}
+					zap.String("container_id", container.ID),
+					zap.String("container_owner", container.Owner))
+			})
+			if !res.Verified {
+				continue
+			}
+			if res.Err != nil {
+				m.logger.Error("Failed to force kill container",
+					zap.String("container_id", res.Container.ID),
+					zap.String("container_owner", res.Container.Owner),
+					zap.Error(res.Err))
+			} else {
+				m.logger.Info("Container force killed",
+					zap.String("container_id", res.Container.ID),
+					zap.String("container_owner", res.Container.Owner))
 			}
 		}
 	}
@@ -745,7 +1026,8 @@ func (m *Manager) cleanupAllManagedContainers(ctx context.Context) {
 
 // ForceCleanupAllContainers is a public wrapper for emergency container cleanup
 // This is called when graceful shutdown fails and containers must be force-removed
-// Only removes containers owned by THIS instance (matching instance ID)
+// Only removes containers owned by THIS instance (matching instance ID) AND
+// canonically owned by a configured server (listOwnedManagedContainers).
 func (m *Manager) ForceCleanupAllContainers() {
 	m.logger.Warn("Force cleanup requested - removing all managed containers for this instance")
 
@@ -755,65 +1037,79 @@ func (m *Manager) ForceCleanupAllContainers() {
 
 	// Find all containers with our management label AND our instance ID
 	instanceID := core.GetInstanceID()
-	listCmd := exec.CommandContext(ctx, "docker", "ps", "-a",
-		"--filter", "label=com.mcpproxy.managed=true",
-		"--filter", fmt.Sprintf("label=com.mcpproxy.instance=%s", instanceID),
-		"--format", "{{.ID}}\t{{.Names}}")
-
-	output, err := listCmd.Output()
+	owned, err := m.listOwnedManagedContainers(ctx, true,
+		"label=com.mcpproxy.managed=true",
+		fmt.Sprintf("label=com.mcpproxy.instance=%s", instanceID))
 	if err != nil {
 		m.logger.Warn("Failed to list managed containers for force cleanup", zap.Error(err))
 		return
 	}
 
-	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
-	if len(lines) == 0 || lines[0] == "" {
+	if len(owned) == 0 {
 		m.logger.Info("No managed containers found during force cleanup")
 		return
 	}
 
-	m.logger.Warn("Force removing managed containers",
-		zap.Int("count", len(lines)))
+	m.logOwnerGroupedCounts("Force removing managed containers", m.logger.Warn, owned)
 
-	// Force remove each container (skip graceful stop)
-	for _, line := range lines {
-		if line == "" {
+	// Force remove each container (skip graceful stop), re-establishing
+	// ownership right before the rm (D9 moment-of-mutation rule). Use docker
+	// rm -f to force remove (kills and removes in one step). The outcome
+	// records carry the owner read at mutation time (D8/D9).
+	for _, selected := range owned {
+		res := m.mutateOwnedManagedContainer(ctx, selected, core.ContainerRemove, func(container core.ContainerRow) {
+			m.logger.Warn("Force removing container",
+				zap.String("id", shortContainerID(container.ID)),
+				zap.String("name", container.Name),
+				zap.String("container_owner", container.Owner))
+		})
+		if !res.Verified {
 			continue
 		}
-		parts := strings.SplitN(line, "\t", 2)
-		if len(parts) < 1 {
-			continue
-		}
-
-		containerID := parts[0]
-		containerName := ""
-		if len(parts) >= 2 {
-			containerName = parts[1]
-		}
-
-		m.logger.Warn("Force removing container",
-			zap.String("id", containerID[:12]),
-			zap.String("name", containerName))
-
-		// Use docker rm -f to force remove (kills and removes in one step)
-		rmCmd := exec.CommandContext(ctx, "docker", "rm", "-f", containerID)
-		if err := rmCmd.Run(); err != nil {
+		if res.Err != nil {
 			m.logger.Error("Failed to force remove container",
-				zap.String("id", containerID[:12]),
-				zap.String("name", containerName),
-				zap.Error(err))
+				zap.String("id", shortContainerID(res.Container.ID)),
+				zap.String("name", res.Container.Name),
+				zap.String("container_owner", res.Container.Owner),
+				zap.Error(res.Err))
 		} else {
 			m.logger.Info("Container force removed successfully",
-				zap.String("id", containerID[:12]),
-				zap.String("name", containerName))
+				zap.String("id", shortContainerID(res.Container.ID)),
+				zap.String("name", res.Container.Name),
+				zap.String("container_owner", res.Container.Owner))
 		}
 	}
 
 	m.logger.Info("Force cleanup completed")
 }
 
+// shortContainerID renders the 12-character short form of a container id.
+func shortContainerID(id string) string {
+	if len(id) <= 12 {
+		return id
+	}
+	return id[:12]
+}
+
+// forceCleanupTarget is what forceCleanupClient needs from a managed client:
+// its configuration, the container id it tracks, and the ownership-checked
+// removal the core client performs.
+type forceCleanupTarget interface {
+	GetConfig() *config.ServerConfig
+	GetContainerID() string
+	ForceRemoveTrackedContainerIfOwned(ctx context.Context, containerID string) (owner string, owned bool, err error)
+}
+
 // forceCleanupClient forces cleanup of a specific client's Docker container
-func (m *Manager) forceCleanupClient(client *managed.Client) {
+// when its Disconnect timed out. The stored id is not removed blindly: the
+// core client re-establishes canonical ownership at the moment of the
+// mutation (Spec 105 FR-007 / D9, codex round 3), so a container renamed or
+// reused under that id since it was tracked is left alone. The manager's own
+// records name the container only once that verdict exists and with the
+// owner the core read back (D8 subject-evidence rule, codex round 5): before
+// it, and when the container was rejected or could not be verified, they
+// name the server alone.
+func (m *Manager) forceCleanupClient(client forceCleanupTarget) {
 	containerID := client.GetContainerID()
 	if containerID == "" {
 		m.logger.Debug("No container ID for force cleanup",
@@ -822,23 +1118,31 @@ func (m *Manager) forceCleanupClient(client *managed.Client) {
 	}
 
 	m.logger.Warn("Force cleaning up container for client",
-		zap.String("server", client.GetConfig().Name),
-		zap.String("container_id", containerID[:12]))
+		zap.String("server", client.GetConfig().Name))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// Force remove container
-	rmCmd := exec.CommandContext(ctx, "docker", "rm", "-f", containerID)
-	if err := rmCmd.Run(); err != nil {
+	owner, owned, err := client.ForceRemoveTrackedContainerIfOwned(ctx, containerID)
+	switch {
+	case err != nil && owned:
 		m.logger.Error("Failed to force remove container",
 			zap.String("server", client.GetConfig().Name),
-			zap.String("container_id", containerID[:12]),
+			zap.String("container_id", shortContainerID(containerID)),
+			zap.String("container_owner", owner),
 			zap.Error(err))
-	} else {
+	case err != nil:
+		m.logger.Error("Could not verify ownership of the tracked container - left alone",
+			zap.String("server", client.GetConfig().Name),
+			zap.Error(err))
+	case !owned:
+		m.logger.Info("Tracked container not canonically owned by the client - left alone",
+			zap.String("server", client.GetConfig().Name))
+	default:
 		m.logger.Info("Container force removed successfully",
 			zap.String("server", client.GetConfig().Name),
-			zap.String("container_id", containerID[:12]))
+			zap.String("container_id", shortContainerID(containerID)),
+			zap.String("container_owner", owner))
 	}
 }
 
@@ -980,7 +1284,18 @@ func (m *Manager) pruneSweptState(known map[string]struct{}) {
 // Security: Tools from quarantined servers are NOT discovered to prevent
 // Tool Poisoning Attacks (TPA) from exposing potentially malicious tool descriptions.
 func (m *Manager) DiscoverTools(ctx context.Context) ([]*config.ToolMetadata, error) {
-	return m.discoverTools(ctx, false)
+	tools, _, err := m.discoverTools(ctx, false)
+	return tools, err
+}
+
+// DiscoverToolsReport is DiscoverTools / DiscoverToolsDue with the names of
+// the servers whose tools/list actually SUCCEEDED in this sweep, so a caller
+// can tell a server that listed zero tools (discovery completed, nothing
+// served) from one the sweep skipped or that failed to list (Spec 105
+// FR-009: the discovery-completed marker must be stamped for the former and
+// left alone for the latter).
+func (m *Manager) DiscoverToolsReport(ctx context.Context, dueOnly bool) ([]*config.ToolMetadata, []string, error) {
+	return m.discoverTools(ctx, dueOnly)
 }
 
 // DiscoverToolsDue is the periodic-sweep variant of DiscoverTools: it lists only
@@ -990,10 +1305,11 @@ func (m *Manager) DiscoverTools(ctx context.Context) ([]*config.ToolMetadata, er
 // event-driven callers (connect, reload, manual refresh) use DiscoverTools for a
 // full sweep (spec 074, US3/SC-006/FR-005).
 func (m *Manager) DiscoverToolsDue(ctx context.Context) ([]*config.ToolMetadata, error) {
-	return m.discoverTools(ctx, true)
+	tools, _, err := m.discoverTools(ctx, true)
+	return tools, err
 }
 
-func (m *Manager) discoverTools(ctx context.Context, dueOnly bool) ([]*config.ToolMetadata, error) {
+func (m *Manager) discoverTools(ctx context.Context, dueOnly bool) ([]*config.ToolMetadata, []string, error) {
 	type clientSnapshot struct {
 		id          string
 		name        string
@@ -1039,6 +1355,7 @@ func (m *Manager) discoverTools(ctx context.Context, dueOnly bool) ([]*config.To
 	now := time.Now()
 
 	var allTools []*config.ToolMetadata
+	var listed []string
 	connectedCount := 0
 	skippedNotDue := 0
 	known := make(map[string]struct{}, len(snapshots))
@@ -1091,7 +1408,12 @@ func (m *Manager) discoverTools(ctx context.Context, dueOnly bool) ([]*config.To
 
 		tools, err := client.ListTools(ctx)
 		if err != nil {
-			m.logger.Error("Failed to list tools from client",
+			// Warn, not Error: markSwept below is deliberately skipped so the
+			// next sweep retries this server. A failure the code already plans
+			// to retry is not an error — and on a healthy install with several
+			// stdio servers this fired ~1x/min each, forever, which is what
+			// made main.log rotate every couple of hours.
+			m.logger.Warn("Failed to list tools from client",
 				zap.String("id", snapshot.id),
 				zap.String("server", snapshot.name),
 				zap.Error(err))
@@ -1101,6 +1423,9 @@ func (m *Manager) discoverTools(ctx context.Context, dueOnly bool) ([]*config.To
 		// Record the sweep only after a successful list so a transient failure
 		// retries on the next cycle rather than waiting a full interval.
 		m.markSwept(snapshot.name, now)
+		if snapshot.name != "" {
+			listed = append(listed, snapshot.name)
+		}
 
 		if tools != nil {
 			allTools = append(allTools, tools...)
@@ -1116,11 +1441,70 @@ func (m *Manager) discoverTools(ctx context.Context, dueOnly bool) ([]*config.To
 		zap.Bool("due_only", dueOnly),
 		zap.Int("skipped_not_due", skippedNotDue))
 
-	return allTools, nil
+	return allTools, listed, nil
+}
+
+// tryReconnectOnUse attempts a single synchronous reconnect for a disconnected
+// client when reconnect_on_use is enabled and the server is eligible (not
+// user-logged-out, not quarantined). It returns true only if the client is
+// connected after the attempt. No manager lock is held here (Spec 093 FR-008):
+// the caller must have snapshotted and released m.mu first so a slow reconnect
+// cannot block server management.
+//
+// Extracted from CallTool's inline reconnect block so GetPrompt can recover a
+// reconnect_on_use server identically for prompts/get (Finding F15). CallTool
+// keeps its own inline copy for now; unifying that hot path is a follow-up.
+func (m *Manager) tryReconnectOnUse(ctx context.Context, client *managed.Client, serverName, target string) bool {
+	cfg := client.GetConfig()
+	if cfg == nil || !cfg.ReconnectOnUse || client.IsUserLoggedOut() || cfg.Quarantined {
+		return false
+	}
+
+	m.logger.Info("reconnect_on_use: attempting reconnect",
+		zap.String("server", serverName),
+		zap.String("target", target),
+		zap.String("state", client.GetState().String()))
+
+	reconnectCtx, reconnectCancel := context.WithTimeout(ctx, 15*time.Second)
+	reconnectErr := client.TryReconnectSync(reconnectCtx)
+	reconnectCancel()
+
+	if reconnectErr != nil {
+		m.logger.Warn("reconnect_on_use: reconnect failed, falling through to error",
+			zap.String("server", serverName),
+			zap.Error(reconnectErr))
+		return false
+	}
+	if client.IsConnected() {
+		m.logger.Info("reconnect_on_use: reconnect succeeded",
+			zap.String("server", serverName),
+			zap.String("target", target))
+		return true
+	}
+	return false
 }
 
 // CallTool calls a tool on the appropriate upstream server
 func (m *Manager) CallTool(ctx context.Context, toolName string, args map[string]interface{}) (interface{}, error) {
+	return m.callTool(ctx, toolName, args, nil)
+}
+
+// CallToolOnEpoch is CallTool pinned to the connection generation the caller
+// certified the tool identity against (Spec 105 FR-009 "stale generation";
+// codex r3 D2): the dispatch reaches the upstream on exactly that generation
+// of the server's live client (managed.Client.CallToolOnEpoch) or is refused
+// with managed.ErrConnectionGenerationChanged and zero upstream calls. The
+// reconnect_on_use branch is deliberately NOT taken for a pinned call — a
+// reconnect is a new generation by construction, whose tool set the caller
+// never certified — so a client found disconnected is refused the same way.
+// The refusal is returned verbatim, never enriched, so errors.Is holds.
+func (m *Manager) CallToolOnEpoch(ctx context.Context, toolName string, args map[string]interface{}, expectedEpoch int64) (interface{}, error) {
+	return m.callTool(ctx, toolName, args, &expectedEpoch)
+}
+
+// callTool is the shared body of CallTool and CallToolOnEpoch; expectedEpoch
+// nil means unpinned (reconnect_on_use applies).
+func (m *Manager) callTool(ctx context.Context, toolName string, args map[string]interface{}, expectedEpoch *int64) (interface{}, error) {
 	m.logger.Debug("CallTool: starting",
 		zap.String("tool_name", toolName),
 		zap.Any("args", args))
@@ -1138,12 +1522,13 @@ func (m *Manager) CallTool(ctx context.Context, toolName string, args map[string
 		zap.String("server_name", serverName),
 		zap.String("actual_tool_name", actualToolName))
 
+	// Spec 093 FR-008: resolve the target client under the manager lock and
+	// RELEASE it before anything that can block — the reconnect-on-use attempt,
+	// limiter admission inside the managed client, and the upstream call
+	// itself. Holding m.mu.RLock across a queued call would make a saturated
+	// upstream stall every server add/remove/disable and every config reload.
 	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	m.logger.Debug("CallTool: acquired read lock, searching for client",
-		zap.String("server_name", serverName),
-		zap.Int("total_clients", len(m.clients)))
+	clientCount := len(m.clients)
 
 	// Find the client for this server
 	var targetClient *managed.Client
@@ -1153,6 +1538,11 @@ func (m *Manager) CallTool(ctx context.Context, toolName string, args map[string
 			break
 		}
 	}
+	m.mu.RUnlock()
+
+	m.logger.Debug("CallTool: resolved client under read lock",
+		zap.String("server_name", serverName),
+		zap.Int("total_clients", clientCount))
 
 	if targetClient == nil {
 		m.logger.Error("CallTool: no client found",
@@ -1177,6 +1567,13 @@ func (m *Manager) CallTool(ctx context.Context, toolName string, args map[string
 			return nil, fmt.Errorf("server '%s' is currently connecting - please wait for connection to complete (state: %s)", serverName, state.String())
 		}
 
+		// A pinned dispatch never reconnects: the generation the caller
+		// certified is closed (Disconnect bumped it), and a reconnect would
+		// open one the caller never certified.
+		if expectedEpoch != nil {
+			return nil, managed.ErrConnectionGenerationChanged
+		}
+
 		// Attempt reconnect-on-use if enabled for this server
 		reconnected := false
 		if targetClient.GetConfig().ReconnectOnUse &&
@@ -1187,17 +1584,12 @@ func (m *Manager) CallTool(ctx context.Context, toolName string, args map[string
 				zap.String("tool", actualToolName),
 				zap.String("state", state.String()))
 
-			// Release the read lock during reconnection — Connect acquires mc.mu
-			// and we must not hold m.mu.RLock while blocking on a potentially
-			// slow network operation.
-			m.mu.RUnlock()
-
+			// No manager lock is held here (FR-008): the client was snapshotted
+			// above and released, so a slow reconnect cannot block server
+			// management.
 			reconnectCtx, reconnectCancel := context.WithTimeout(ctx, 15*time.Second)
 			reconnectErr := targetClient.TryReconnectSync(reconnectCtx)
 			reconnectCancel()
-
-			// Re-acquire the read lock
-			m.mu.RLock()
 
 			if reconnectErr != nil {
 				m.logger.Warn("reconnect_on_use: reconnect failed, falling through to error",
@@ -1238,7 +1630,14 @@ func (m *Manager) CallTool(ctx context.Context, toolName string, args map[string
 		zap.String("actual_tool_name", actualToolName))
 
 	// Call the tool on the upstream server with enhanced error handling
-	result, err := targetClient.CallTool(ctx, actualToolName, args)
+	dispatch := targetClient.CallTool
+	if expectedEpoch != nil {
+		pinned := *expectedEpoch
+		dispatch = func(ctx context.Context, toolName string, args map[string]interface{}) (*mcp.CallToolResult, error) {
+			return targetClient.CallToolOnEpoch(ctx, toolName, args, pinned)
+		}
+	}
+	result, err := dispatch(ctx, actualToolName, args)
 
 	m.logger.Debug("CallTool: client.CallTool returned",
 		zap.String("server_name", serverName),
@@ -1246,6 +1645,22 @@ func (m *Manager) CallTool(ctx context.Context, toolName string, args map[string
 		zap.Error(err),
 		zap.Bool("has_result", result != nil))
 	if err != nil {
+		// Spec 093 FR-011: a limiter rejection is a typed identity that must
+		// survive end-to-end (MCP isError text, REST 429 + Retry-After). Return
+		// it verbatim — its message is already caller-ready and the string
+		// enrichment below would both mangle it and mis-classify it (a
+		// queue-full shed is not an upstream rate limit).
+		var limitErr *limiter.LimitError
+		if errors.As(err, &limitErr) {
+			return nil, err
+		}
+		// Spec 105 FR-009 (codex r3 D2): the generation refusal is a typed
+		// identity the dispatch paths map onto their own unresolved-identity
+		// body; return it verbatim so errors.Is survives.
+		if errors.Is(err, managed.ErrConnectionGenerationChanged) {
+			return nil, err
+		}
+
 		// Enrich errors at source with server context
 		errStr := err.Error()
 
@@ -1355,20 +1770,33 @@ func (m *Manager) ConnectAll(ctx context.Context) error {
 			continue
 		}
 
-		if client.GetState() == types.StateError && !client.ShouldRetry() {
-			info := client.GetConnectionInfo()
+		// Same retry policy the supervisor's reconcile honors: plain backoff,
+		// the coarse OAuth ladder, escalating probes after give-up, no redial at
+		// all for a server parked awaiting login, and none for one whose failure
+		// was proven permanent (GH #1145). ConnectAll runs on
+		// every config reload, so gating only on StateError+ShouldRetry (as it
+		// used to) let a reload re-dial servers their own client had paused
+		// (#1013). A user-driven config change for THIS server still reconnects
+		// it — the supervisor plans ActionReconnect, which bypasses the gate.
+		if info := client.GetConnectionInfo(); !info.ShouldAutoReconnect(time.Now()) {
 			m.logger.Debug("Client backoff active, skipping connect attempt",
 				zap.String("id", id),
 				zap.String("name", client.GetConfig().Name),
+				zap.String("state", info.State.String()),
 				zap.Int("retry_count", info.RetryCount),
 				zap.Time("last_retry_time", info.LastRetryTime))
 			continue
 		}
 
+		// #1148: the configured upstream URL can carry its credential in the
+		// query (`?token=…`) or the userinfo (`user:pass@`), and this line runs
+		// on every connect attempt, so the raw form would be written to
+		// main.log on a loop. Redacted through the same helper the core client
+		// and the HTTP transport use.
 		m.logger.Info("Attempting to connect client",
 			zap.String("id", id),
 			zap.String("name", client.GetConfig().Name),
-			zap.String("url", client.GetConfig().URL),
+			zap.String("url", oauth.LiveRedaction.URLValue(client.GetConfig().URL)),
 			zap.String("command", client.GetConfig().Command),
 			zap.String("protocol", client.GetConfig().Protocol))
 
@@ -1381,7 +1809,7 @@ func (m *Manager) ConnectAll(ctx context.Context) error {
 			// un-isolated stdio servers silently inherited the caller's ~30s
 			// context — the #760 bite. resolveConnectTimeout keeps the 3min floor
 			// for Docker isolation while honoring a per-server/global override.
-			connectCtx, cancel := context.WithTimeout(ctx, m.resolveConnectTimeout(c.GetConfig(), c.IsDockerIsolated()))
+			connectCtx, cancel := context.WithTimeout(ctx, m.resolveConnectTimeout(c.GetConfig(), c.DependsOnDocker()))
 			defer cancel()
 
 			if err := c.Connect(connectCtx); err != nil {
@@ -1495,32 +1923,58 @@ func (m *Manager) DisconnectAll() error {
 	return nil
 }
 
-// HasDockerContainers checks if any Docker containers owned by THIS instance are actually running
+// HasDockerContainers reports whether any RUNNING Docker container this
+// instance manages (com.mcpproxy.managed=true, com.mcpproxy.instance=<this
+// instance>) is also canonically owned by a configured server —
+// core.ContainerOwnedByAny over listOwnedManagedContainers, the same
+// selection the shutdown and emergency sweeps apply. The instance/managed
+// labels alone are shared and copyable (Spec 105 D9): a foreign container
+// that copies them, or one whose owning server was since removed from
+// config, must not be reported as still running — that false positive drove
+// the runtime/server shutdown path into its 15-second cleanup-verification
+// wait, a second force-clean, and a false "still running after force
+// cleanup" report for a container mcpproxy neither started nor can act on
+// (codex round 10, docker finding 1). includeStopped is false: an
+// already-stopped row must not read as still running either.
 func (m *Manager) HasDockerContainers() bool {
-	// Check if any containers with our labels AND our instance ID are running
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
 	instanceID := core.GetInstanceID()
-	listCmd := exec.CommandContext(ctx, "docker", "ps", "-q",
-		"--filter", "label=com.mcpproxy.managed=true",
-		"--filter", fmt.Sprintf("label=com.mcpproxy.instance=%s", instanceID))
-
-	output, err := listCmd.Output()
+	owned, err := m.listOwnedManagedContainers(ctx, false,
+		"label=com.mcpproxy.managed=true",
+		fmt.Sprintf("label=com.mcpproxy.instance=%s", instanceID))
 	if err != nil {
 		// Docker not available or error listing - assume no containers
 		return false
 	}
 
-	// If output is not empty, we have running containers
-	containerIDs := strings.TrimSpace(string(output))
-	return containerIDs != ""
+	return len(owned) > 0
 }
 
 // GetStats returns statistics about upstream connections
 // GetStats returns statistics about all managed clients.
 // Phase 6 Fix: Lock-free implementation to prevent deadlock with async operations.
+//
+// Issue #1148, round 4: this map is not an internal counter — it is served
+// verbatim as `upstream_stats` on GET /api/v1/status, on the /api/v1/servers
+// response, and on every SSE `status` event, and it is what the tray renders.
+// Its per-server entries therefore sit behind the same trust boundary as the
+// server list on those same payloads, which httpapi.redactServerSecrets and
+// Runtime.redactServerSecrets already mask. Leaving `url` and `last_error` raw
+// here meant one half of a single response was masked and the other half was
+// not. Mask them at the point they are written.
+//
+// Issue #1167: unconditionally, with no reveal_secret_headers opt-out. This
+// producer takes no ctx and neither does its consumer chain, so there is no
+// caller identity to AND the operator flag with - and the flag alone handed a
+// scoped agent token every server's raw url and last_error on /api/v1/status
+// and on every SSE status event. Same rule, same reason, as the StateView
+// implementation in internal/server.Server.GetUpstreamStats, which is the one
+// that actually runs.
 func (m *Manager) GetStats() map[string]interface{} {
+	const revealSecrets = false
+
 	// Phase 6: Copy client references while holding lock briefly
 	m.mu.RLock()
 	clientsCopy := make(map[string]*managed.Client, len(m.clients))
@@ -1548,14 +2002,18 @@ func (m *Manager) GetStats() map[string]interface{} {
 		// Read config through the thread-safe accessor to avoid racing with
 		// SetConfig on the reconcile add path (MCP-770).
 		name, url, protocol := "", "", ""
+		quarantined, enabled := false, false
 		if cfg := client.GetConfig(); cfg != nil {
 			name, url, protocol = cfg.Name, cfg.URL, cfg.Protocol
+			quarantined = cfg.Quarantined
+			enabled = cfg.Enabled
 			if cfg.Quarantined {
 				quarantinedCount++
 			}
 		}
 
 		status := map[string]interface{}{
+			"enabled":      enabled,
 			"state":        connectionInfo.State.String(),
 			"connected":    connectionInfo.State == types.StateReady,
 			"connecting":   client.IsConnecting(),
@@ -1564,6 +2022,12 @@ func (m *Manager) GetStats() map[string]interface{} {
 			"name":         name,
 			"url":          url,
 			"protocol":     protocol,
+			// Emitted by BOTH upstream_stats producers (see the twin in
+			// internal/server.Server.GetUpstreamStats): every consumer that
+			// recomputes `quarantined_servers` from the entries — the
+			// scoped-caller filter and contracts.ConvertUpstreamStatsToServerStats
+			// — keys on it, and neither producer used to write it.
+			"quarantined": quarantined,
 		}
 
 		if connectionInfo.State == types.StateReady {
@@ -1579,6 +2043,8 @@ func (m *Manager) GetStats() map[string]interface{} {
 		}
 
 		if connectionInfo.LastError != nil {
+			// Masked below by oauth.RedactUpstreamStats, at the one wire
+			// boundary both upstream_stats implementations pass through.
 			status["last_error"] = connectionInfo.LastError.Error()
 		}
 
@@ -1597,6 +2063,14 @@ func (m *Manager) GetStats() map[string]interface{} {
 			if serverInfo := client.GetServerInfo(); serverInfo != nil && serverInfo.ProtocolVersion != "" {
 				status["protocol_version"] = serverInfo.ProtocolVersion
 			}
+		}
+
+		// Round 8 finding 1: `url` and `last_error` are masked by the ONE
+		// shared rule (oauth.RedactUpstreamStatsEntry), not by name-only
+		// redactors chosen here — the server list in the SAME response applies
+		// exactly that rule to exactly these two strings.
+		if !revealSecrets {
+			oauth.RedactUpstreamStatsEntry(status)
 		}
 
 		serverStatus[id] = status
@@ -1635,7 +2109,10 @@ func (m *Manager) GetTotalToolCount() int {
 		}
 		// Read config through the thread-safe accessor (MCP-770).
 		cfg := client.GetConfig()
-		if cfg == nil || !cfg.Enabled || !client.IsConnected() {
+		// #1064: a quarantined server stays dialed for security inspection, so
+		// IsConnected() is true and its cached count is still the pre-quarantine
+		// number -- exclude it explicitly.
+		if cfg == nil || !cfg.ContributesTools() || !client.IsConnected() {
 			continue
 		}
 
@@ -1656,6 +2133,40 @@ func (m *Manager) ListServers() map[string]*config.ServerConfig {
 		servers[id] = client.GetConfig()
 	}
 	return servers
+}
+
+// recordOAuthFailure stamps an unattended OAuth failure onto the server's
+// connection status so it shows up in `mcpproxy upstream list`, the REST status
+// payload and the tray — the same place other auth failures land (issue #975).
+//
+// A server that is currently Ready is left alone: a late or orphaned callback
+// must never knock a working connection into Error.
+func (m *Manager) recordOAuthFailure(serverName string, cause error) {
+	if cause == nil {
+		return
+	}
+
+	m.mu.RLock()
+	client, exists := m.clients[serverName]
+	m.mu.RUnlock()
+	if !exists {
+		m.logger.Warn("OAuth failure reported for unknown server",
+			zap.String("server", serverName),
+			zap.Error(cause))
+		return
+	}
+
+	if client.StateManager.IsReady() {
+		m.logger.Warn("Ignoring OAuth failure for a server that is already connected",
+			zap.String("server", serverName),
+			zap.Error(cause))
+		return
+	}
+
+	m.logger.Warn("Recording OAuth failure on server status",
+		zap.String("server", serverName),
+		zap.Error(cause))
+	client.StateManager.SetOAuthError(cause)
 }
 
 // RetryConnection triggers a connection retry for a specific server
@@ -1723,12 +2234,26 @@ func (m *Manager) RetryConnection(serverName string) error {
 		// Honor the resolved init_timeout (MCP-3322) on the post-OAuth retry too,
 		// with a 2-minute floor so this path never regresses below its historical
 		// grace period.
-		retryTimeout := m.resolveConnectTimeout(client.GetConfig(), client.IsDockerIsolated())
+		retryTimeout := m.resolveConnectTimeout(client.GetConfig(), client.DependsOnDocker())
 		if retryTimeout < 2*time.Minute {
 			retryTimeout = 2 * time.Minute
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), retryTimeout)
 		defer cancel()
+
+		// #1317 round 6: this Disconnect()+Connect() sequence is a fourth
+		// automatic reconnect path (OAuth completion, config-change and
+		// token-monitor triggers all reach RetryConnection) that bypasses
+		// tryReconnect/Connect/TryReconnectSync's own guard entirely. A
+		// transient/ambiguous error elsewhere on this client must not kill a
+		// genuinely healthy, still in-flight call here either. Skipping is a
+		// delay, not an abandoned retry: the health loop and the periodic
+		// backgroundConnections sweep both retry this same client later.
+		if client.GuardReconnectAgainstInFlightCall() {
+			m.logger.Info("Connection retry deferred: a tool call is still in flight",
+				zap.String("server", serverName))
+			return
+		}
 
 		// Important: Ensure a clean reconnect only if not already connected.
 		// Managed state guards above should make this idempotent.
@@ -1764,33 +2289,70 @@ func (m *Manager) verifyContainerHealthy(client *managed.Client) (bool, error) {
 		return false, fmt.Errorf("no container ID available")
 	}
 
+	serverName := ""
+	if cfg := client.GetConfig(); cfg != nil {
+		serverName = cfg.Name
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// Check 1: Container exists and is running
-	inspectCmd := exec.CommandContext(ctx, "docker", "inspect",
-		"--format", "{{.State.Running}},{{.State.Status}}",
-		containerID)
+	return m.verifyDockerContainerHealthy(ctx, sweepDocker, serverName, containerID)
+}
 
-	output, err := inspectCmd.Output()
+// verifyDockerContainerHealthy is the pure implementation verifyContainerHealthy
+// delegates to. `docker inspect <id>` answers by id alone, regardless of
+// name or label, so trusting it directly on the tracked id let a container
+// another Docker client relabelled or renamed after tracking still read as
+// Running and skip ForceReconnectAll's recovery even though it is no longer
+// this server's (codex round 8). Ownership is re-established first, through
+// the same read+predicate ContainerMutator.Verify uses before every
+// mutation: a container that fails the predicate now is NOT healthy —
+// recovery (the caller's rebuild) proceeds — and the refusal names no id,
+// only the server. Only a container ownership confirms is named, and then
+// with the container_owner read back at that same moment, never the
+// requesting server's name.
+//
+// Running state is decided from that SAME read, never a follow-up `docker
+// inspect` (codex round 16 finding 1): a second, separately timed command by
+// id alone reports whatever container holds that id AT THAT LATER MOMENT —
+// which can by then belong to someone else — while this function kept
+// treating it as healthy for serverName. ContainerRow.Running derives it
+// from the ps row Verify already read; row.Status (its human STATUS text)
+// is what the log/error messages below report.
+func (m *Manager) verifyDockerContainerHealthy(ctx context.Context, docker core.DockerCommand, serverName, containerID string) (bool, error) {
+	mutator := core.ContainerMutator{
+		Docker: docker,
+		Owns: func(containerName, ownerLabel, instanceLabel string) bool {
+			return core.ContainerOwnedByAny([]string{serverName}, containerName, ownerLabel, instanceLabel)
+		},
+	}
+	row, ok, err := mutator.Verify(ctx, containerID)
 	if err != nil {
-		return false, fmt.Errorf("container not found or unreachable: %w", err)
+		m.logger.Warn("Could not verify container ownership before health check - treating as unhealthy",
+			zap.String("server", serverName),
+			zap.Error(err))
+		return false, fmt.Errorf("could not verify container ownership: %w", err)
+	}
+	if !ok {
+		m.logger.Warn("Tracked container is no longer canonically owned by this server - treating as lost",
+			zap.String("server", serverName))
+		return false, fmt.Errorf("tracked container is no longer canonically owned by this server")
 	}
 
-	parts := strings.Split(strings.TrimSpace(string(output)), ",")
-	if len(parts) < 2 {
-		return false, fmt.Errorf("unexpected docker inspect output: %s", string(output))
-	}
-
-	running := parts[0] == "true"
-	status := parts[1]
+	// Container exists and is canonically owned NOW: check it is running,
+	// from the row this same Verify read — not a second command.
+	running := row.Running()
+	status := row.Status
 
 	if !running {
 		return false, fmt.Errorf("container not running (status: %s)", status)
 	}
 
 	m.logger.Debug("Container health check passed",
-		zap.String("container_id", containerID[:12]),
+		zap.String("server", serverName),
+		zap.String("container_id", row.ID),
+		zap.String("container_owner", row.Owner),
 		zap.String("status", status))
 
 	return true, nil
@@ -2042,8 +2604,10 @@ func (m *Manager) scanForNewTokens() {
 		}
 
 		state := c.GetState()
-		// Focus on Error state likely due to OAuth/authorization
-		if state != types.StateError {
+		// Focus on states that a freshly persisted token can unblock: a plain
+		// Error (likely OAuth/authorization) and PendingAuth, where the client is
+		// parked waiting for exactly this token (#1013).
+		if state != types.StateError && state != types.StatePendingAuth {
 			continue
 		}
 
@@ -2059,14 +2623,54 @@ func (m *Manager) scanForNewTokens() {
 			continue
 		}
 
-		m.logger.Info("Detected persisted OAuth token; triggering reconnect",
+		// Only a token we have NOT already retried with is news. The failing
+		// server usually still has its (expired/revoked/rejected) token in the
+		// store, so triggering on mere presence redialed it every scan — a 5s
+		// loop that outpaces the supervisor's and defeats the PendingAuth park
+		// (#1013). The fingerprint changes exactly when a login/refresh writes a
+		// new token, which is the event this scan exists to catch.
+		//
+		// The write timestamp is part of the identity, not just the token
+		// content: a provider re-issuing a byte-identical token would otherwise
+		// leave the fingerprint unchanged and permanently suppress this wake —
+		// and for a CLI login that could not persist its completion event, this
+		// scan is the only one left.
+		var writtenAt time.Time
+		if rec, recErr := m.storage.GetOAuthToken(oauth.GenerateServerKey(cfg.Name, cfg.URL)); recErr == nil && rec != nil {
+			writtenAt = rec.Updated
+		}
+		fingerprint := tokenFingerprint(tok, writtenAt)
+		if seen, ok := m.tokenFingerprints[id]; ok && seen == fingerprint {
+			continue
+		}
+
+		m.logger.Info("Detected new persisted OAuth token; triggering reconnect",
 			zap.String("server", cfg.Name),
 			zap.Time("token_expires_at", tok.ExpiresAt))
 
-		// Remember trigger time and retry connection
+		// Remember trigger time + which token we tried, then retry connection
 		m.tokenReconnect[id] = now
+		m.tokenFingerprints[id] = fingerprint
 		_ = m.RetryConnection(cfg.Name)
 	}
+}
+
+// tokenFingerprint identifies a persisted OAuth token without retaining it: a
+// truncated SHA-256 over the access token, refresh token, expiry and the time
+// the record was last written, so any re-issue compares different while the
+// same untouched token compares equal. Never log or persist the raw token to
+// make this comparison.
+func tokenFingerprint(tok *uptransport.Token, writtenAt time.Time) string {
+	if tok == nil {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(strings.Join([]string{
+		tok.AccessToken,
+		tok.RefreshToken,
+		tok.ExpiresAt.UTC().Format(time.RFC3339Nano),
+		writtenAt.UTC().Format(time.RFC3339Nano),
+	}, "\x00")))
+	return hex.EncodeToString(sum[:8])
 }
 
 // StartManualOAuth performs an in-process OAuth flow for the given server.
@@ -2184,6 +2788,10 @@ func (m *Manager) StartManualOAuthQuick(serverName string) (*core.OAuthStartResu
 	// Clear OAuth state for fresh flow
 	coreClient.ClearOAuthState()
 
+	// Snapshot BEFORE the flow starts so a completion can never precede it
+	// (the watcher below detects completion as a change from this value).
+	before := m.storedAccessToken(cfg)
+
 	// Start the quick OAuth flow - this returns immediately with browser status
 	result, err := coreClient.StartOAuthFlowQuick(ctx)
 	if err != nil {
@@ -2191,19 +2799,30 @@ func (m *Manager) StartManualOAuthQuick(serverName string) (*core.OAuthStartResu
 		return result, err
 	}
 
-	// Set up reconnection after OAuth completes (in background)
+	// Set up reconnection after OAuth completes (in background).
+	//
+	// The watcher owns the login context: its deferred cancel ends the
+	// callback wait. It therefore must only finish when THIS login is over —
+	// a new token landed, or the 30-minute deadline passed. It used to stop
+	// after 2 minutes, or after ~2 s when HasRecentOAuthCompletion was already
+	// true from an earlier sign-in (the re-login a declared-OAuth server now
+	// permits, GH #1271), and the browser callback then found nobody waiting
+	// ("mcpproxy is not waiting for this sign-in"). Completion is detected as
+	// a CHANGE of the stored access token, snapshotted before the flow; the
+	// watcher also ends with the manager so it never outlives a shutdown.
 	go func() {
 		defer cancel()
-
-		// Wait a bit for OAuth to complete (the callback handling runs in background)
-		// Then trigger reconnect
-		time.Sleep(2 * time.Second)
-
-		// Check if OAuth completed by looking for token
-		if m.storage != nil {
-			serverKey := oauth.GenerateServerKey(cfg.Name, cfg.URL)
-			token, _ := m.storage.GetOAuthToken(serverKey)
-			if token != nil && token.AccessToken != "" {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-m.shutdownCtx.Done():
+				return
+			case <-ticker.C:
+			}
+			if tok := m.storedAccessToken(cfg); tok != "" && tok != before {
 				m.logger.Info("OAuth token obtained, triggering reconnect",
 					zap.String("server", cfg.Name))
 				if err := m.RetryConnection(cfg.Name); err != nil {
@@ -2211,27 +2830,25 @@ func (m *Manager) StartManualOAuthQuick(serverName string) (*core.OAuthStartResu
 						zap.String("server", cfg.Name),
 						zap.Error(err))
 				}
-			}
-		}
-
-		// Also set up a watcher for OAuth completion
-		tokenManager := oauth.GetTokenStoreManager()
-		for i := 0; i < 60; i++ { // Check for 2 minutes
-			if tokenManager.HasRecentOAuthCompletion(cfg.Name) {
-				m.logger.Info("OAuth completion detected, triggering reconnect",
-					zap.String("server", cfg.Name))
-				if err := m.RetryConnection(cfg.Name); err != nil {
-					m.logger.Warn("Failed to trigger reconnect after OAuth completion",
-						zap.String("server", cfg.Name),
-						zap.Error(err))
-				}
 				return
 			}
-			time.Sleep(2 * time.Second)
 		}
 	}()
 
 	return result, nil
+}
+
+// storedAccessToken returns the access token persisted for the server, or ""
+// when there is none (or no storage).
+func (m *Manager) storedAccessToken(cfg *config.ServerConfig) string {
+	if m.storage == nil {
+		return ""
+	}
+	record, err := m.storage.GetOAuthToken(oauth.GenerateServerKey(cfg.Name, cfg.URL))
+	if err != nil || record == nil {
+		return ""
+	}
+	return record.AccessToken
 }
 
 // StartManualOAuthWithInfo performs an in-process OAuth flow and returns the auth URL and browser status.

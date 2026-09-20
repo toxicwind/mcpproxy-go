@@ -29,6 +29,7 @@ export const HealthActionApprove = 'approve' as const;
 export const HealthActionViewLogs = 'view_logs' as const;
 export const HealthActionSetSecret = 'set_secret' as const;
 export const HealthActionConfigure = 'configure' as const;
+export const HealthActionEditURL = 'edit_url' as const;
 export type HealthAction =
   | typeof HealthActionNone
   | typeof HealthActionLogin
@@ -37,7 +38,8 @@ export type HealthAction =
   | typeof HealthActionApprove
   | typeof HealthActionViewLogs
   | typeof HealthActionSetSecret
-  | typeof HealthActionConfigure;
+  | typeof HealthActionConfigure
+  | typeof HealthActionEditURL;
 
 export interface HealthStatus {
   level: HealthLevel;
@@ -45,6 +47,102 @@ export interface HealthStatus {
   summary: string;
   detail?: string;
   action?: HealthAction;
+}
+
+// Activity status vocabulary - generated from internal/storage/activity_models.go
+export const ActivityStatusSuccess = 'success' as const;
+export const ActivityStatusError = 'error' as const;
+export const ActivityStatusBlocked = 'blocked' as const;
+/** Spec 093: shed by a concurrency limit before reaching the upstream. */
+export const ActivityStatusRejected = 'rejected' as const;
+export type ActivityStatusValue =
+  | typeof ActivityStatusSuccess
+  | typeof ActivityStatusError
+  | typeof ActivityStatusBlocked
+  | typeof ActivityStatusRejected;
+
+/** Machine-readable cause of a spec-093 rejection (activity metadata rejection_reason). */
+export type RejectionReason = 'queue_full' | 'queue_timeout';
+/** Limiter tier that shed the call (activity metadata rejection_scope). */
+export type RejectionScope = 'server' | 'global';
+
+// Preflight (Spec 098) - generated from internal/contracts/types.go
+export const PreflightStatusReady = 'ready' as const;
+export const PreflightStatusUnavailable = 'unavailable' as const;
+export type PreflightStatus = typeof PreflightStatusReady | typeof PreflightStatusUnavailable;
+
+/**
+ * Closed 15-code failure enum. Additive-only: treat an unknown code as
+ * non-retryable. 'server_saturated' is reserved and not emitted.
+ */
+export type PreflightReason =
+  | 'server_initializing'
+  | 'server_unhealthy'
+  | 'server_disabled'
+  | 'server_quarantined'
+  | 'tool_pending_approval'
+  | 'tool_changed'
+  | 'tool_blocked_by_user'
+  | 'oauth_required'
+  | 'hash_mismatch'
+  | 'server_not_in_scope'
+  | 'tool_denied_by_config'
+  | 'missing_annotation'
+  | 'policy_filtered'
+  | 'not_found'
+  | 'server_not_configured';
+
+/** Set-level aggregate (worst class present); drives the CLI exit code 0/10/11/12. */
+export const PreflightVerdictReady = 'ready' as const;
+export const PreflightVerdictDegradedRetryable = 'degraded_retryable' as const;
+export const PreflightVerdictBlocked = 'blocked' as const;
+export const PreflightVerdictUnknownIds = 'unknown_ids' as const;
+export type PreflightVerdict =
+  | typeof PreflightVerdictReady
+  | typeof PreflightVerdictDegradedRetryable
+  | typeof PreflightVerdictBlocked
+  | typeof PreflightVerdictUnknownIds;
+
+export interface PreflightToolRef {
+  id: string;
+  /** "sha256/v{N}:{hex}" - the schema version distinguishes a proxy hash bump from upstream drift. */
+  pin_hash?: string;
+}
+
+export interface PreflightPolicy {
+  read_only_only?: boolean;
+  exclude_destructive?: boolean;
+  exclude_open_world?: boolean;
+}
+
+export interface PreflightRequest {
+  tools: PreflightToolRef[];
+  profile?: string;
+  policy?: PreflightPolicy;
+  wait_ms?: number;
+}
+
+export interface PreflightToolResult {
+  id: string;
+  status: PreflightStatus;
+  /** Present only when status is 'unavailable'. */
+  reason?: PreflightReason;
+  retryable?: boolean;
+  /** Health-action vocabulary; omitted (not 'none') when the reason has no action. */
+  action?: HealthAction;
+  detail?: string;
+  remediation?: string;
+  /** Operator tier + ready results only; never disclosed to an agent token. */
+  hash?: string;
+  /** Up to 3 nearest caller-visible ids, on not_found only. */
+  did_you_mean?: string[];
+}
+
+export interface PreflightResponse {
+  verdict: PreflightVerdict;
+  checked_at: string; // RFC3339
+  waited_ms?: number;
+  tools: PreflightToolResult[];
 }
 
 export interface Server {
@@ -74,10 +172,47 @@ export interface Server {
   updated: string; // ISO date string
   isolation?: IsolationConfig;
   isolation_defaults?: IsolationDefaults; // Resolved baseline values (read-only, used as placeholders)
+  isolation_effective?: IsolationEffective; // Resolved isolation state + why (read-only)
   oauth_status?: 'authenticated' | 'expired' | 'error' | 'none'; // OAuth authentication status
   token_expires_at?: string; // ISO date string when OAuth token expires
   user_logged_out?: boolean; // True if user explicitly logged out (prevents auto-reconnection)
   health?: HealthStatus; // Unified health status calculated by the backend
+  trust_mode?: string; // Per-server approval trust mode (spec 086): 'auto' | 'scan' | 'manual'; raw configured value, absent when unset (effective default: manual)
+  expose_prompts?: boolean; // F9 per-server prompt-aggregation override; absent = inherit default aggregation, false = exclude this server's prompts
+  security_scan?: SecurityScanSummary; // Latest scan summary (spec 086); ABSENT when no scan has ever run
+  // Spec 093 (#955) per-server concurrency overrides. Tri-state: absent =
+  // inherit server_concurrency_defaults, 0 = disabled for this server,
+  // positive = override. Effective concurrency is additionally bounded by the
+  // proxy-wide (global) limiter.
+  max_concurrent_requests?: number;
+  queue_size?: number;
+  queue_timeout?: string; // Go duration string, e.g. '30s'
+}
+
+export interface SecurityScanSummary {
+  last_scan_at?: string; // ISO date string
+  risk_score: number; // 0-100
+  status: string; // 'clean' | 'warnings' | 'dangerous' | 'failed' | 'scanning' (absence of the whole summary = never scanned)
+  finding_counts?: FindingCounts;
+  scanners_run: number;
+  scanners_failed: number;
+  scanners_total: number;
+  deep_scan?: DeepScanDescriptor; // Opt-in deep-scan layer status; never influences status
+}
+
+export interface FindingCounts {
+  dangerous: number;
+  warning: number;
+  info: number;
+  total: number;
+}
+
+export interface DeepScanDescriptor {
+  enabled: boolean;
+  ran: boolean;
+  available: boolean;
+  scanners_failed?: { id: string; reason: string }[];
+  skipped_scanners?: string[]; // Docker scanners enabled but skipped while deep scan is off
 }
 
 export interface OAuthConfig {
@@ -90,7 +225,15 @@ export interface OAuthConfig {
 }
 
 export interface IsolationConfig {
+  // EFFECTIVE isolation state, after global + per-server + structural
+  // resolution. NOT the raw per-server override — read enabled_override for
+  // that. Always present on stdio servers.
   enabled: boolean;
+  // RAW per-server override. Absent = inherit the global setting, which is a
+  // distinct state from an explicit false.
+  enabled_override?: boolean;
+  // RAW per-server mode override. Absent = inherit.
+  mode_override?: string;
   image?: string;
   network_mode?: string;
   extra_args?: string[];
@@ -98,6 +241,17 @@ export interface IsolationConfig {
   cpu_limit?: string;
   working_dir?: string;
   timeout?: string;
+}
+
+// IsolationEffective reports the resolved isolation state of a server and the
+// rule that produced it, so the UI can explain "inherits global: docker"
+// instead of rendering an ambiguous toggle. Read-only; never sent on PATCH.
+export interface IsolationEffective {
+  mode: string; // 'docker' | 'sandbox' | 'none' — what the spawn path branches on
+  isolated: boolean; // actually CONFINED; not simply mode !== 'none' (see 'sandbox-unavailable')
+  global_mode?: string;
+  inherited: boolean; // no per-server enabled/mode override is set
+  source?: string; // 'global' | 'server-mode' | 'server-opt-out' | 'server-opt-in-ignored' | 'not-stdio' | 'already-docker' | 'sandbox-unavailable' | 'unsupported-mode'; treat unknown as 'global'
 }
 
 // IsolationDefaults reports the resolved baseline Docker isolation
@@ -133,6 +287,10 @@ export interface Tool {
   held_reason?: string;
   held_verdict?: string;
   held_signals?: string[];
+  // The tool's current hash in the preflight pin format "sha256/v{N}:{hex}"
+  // (spec 098 FR-011) — the value to paste into a preflight pin. Operator tier
+  // only: absent for agent-token callers and for tools with no stored hash.
+  hash?: string;
 }
 
 export interface SearchResult {
@@ -341,6 +499,17 @@ export interface UpdateInfo {
   // Spec 079 US3 (FR-019): the core runs in a CI / non-interactive context —
   // UI surfaces must stay quiet while the facts remain machine-readable.
   nudges_suppressed?: boolean;
+  // Spec 079 FR-002 (additive per FR-021): how far behind the running build
+  // is. behind_summary is rendered by the daemon
+  // (updatecheck.FormatBehindSummary) and printed verbatim by every surface,
+  // so the CLI, this banner and the tray cannot word it differently — do not
+  // re-derive it from the numbers below. All four are absent when the delta
+  // could not be resolved, or against a daemon too old to send them; the
+  // banner then renders exactly what it rendered before.
+  behind_summary?: string;
+  releases_behind?: number;
+  releases_behind_saturated?: boolean;
+  weeks_behind?: number;
 }
 
 export interface InfoResponse {
@@ -352,4 +521,25 @@ export interface InfoResponse {
     socket: string;
   };
   update?: UpdateInfo;
+  // Spec 092 FR-001a: durable launch provenance of the running core —
+  // "tray", "installer", or "" (user-launched / unknown).
+  launched_by: string;
+  // Spec 092 FR-002: OS process id of the running core, so a tray that only
+  // attached to it still has a mechanism to stop a stale one.
+  pid: number;
+  // Spec 092 FR-015: effective update policy. Always present — the optional
+  // "update" object above is absent both when checking is disabled and when
+  // no check has run yet, so it cannot be used to infer permission.
+  update_policy: UpdatePolicy;
+}
+
+// Spec 092 FR-015: the effective, hot-reloadable update policy.
+export interface UpdatePolicy {
+  // Automatic checks allowed? (update_check.enabled, overridden by
+  // MCPPROXY_DISABLE_AUTO_UPDATE=true). A user-initiated check stays allowed.
+  enabled: boolean;
+  // Tracked release channel: "stable" or "rc".
+  channel: string;
+  // UI surfaces must stay quiet (CI / non-interactive context).
+  nudges_suppressed: boolean;
 }

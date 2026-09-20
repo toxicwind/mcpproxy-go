@@ -16,6 +16,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/contracts"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/diagnostics"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/oauth"
@@ -34,7 +35,11 @@ func redactHealthDetail(healthRaw interface{}, reveal bool) interface{} {
 		return healthRaw
 	}
 	clone := *hs
-	clone.Detail = oauth.RedactSensitiveData(clone.Detail)
+	// Round 8 finding 2: oauth.ScrubUpstreamText is the ONE rule for
+	// free-form upstream text. RedactSensitiveData alone is its name half, and
+	// oauth.RedactServerSecretFields scrubs this very field with both halves on
+	// the sibling /api/v1/servers door.
+	clone.Detail = oauth.ScrubUpstreamText(clone.Detail)
 	return &clone
 }
 
@@ -45,7 +50,8 @@ func redactDiagnosticCause(diag map[string]interface{}, reveal bool) {
 		return
 	}
 	if cause, ok := diag["cause"].(string); ok && cause != "" {
-		diag["cause"] = oauth.RedactSensitiveData(cause)
+		// Round 8 finding 2: the same one rule the sibling REST door applies.
+		diag["cause"] = oauth.ScrubUpstreamText(cause)
 	}
 }
 
@@ -74,7 +80,17 @@ func (s *Server) handleGetServerDiagnostics(w http.ResponseWriter, r *http.Reque
 			break
 		}
 	}
-	if hit == nil {
+	// #1166: a server the caller may not enumerate takes the SAME exit as one
+	// that does not exist — same status, same message — so the response cannot
+	// be used to probe for hidden servers.
+	//
+	// The scopedServerSubtree middleware now applies exactly this rule to the
+	// whole /servers/{id} subtree, so for a scoped caller the request no longer
+	// reaches this line. Kept anyway: it is the route's own absent-server exit
+	// (hit == nil, which still fires for an admin), and the redundant scope
+	// term costs one predicate call while making this handler correct on its
+	// own if it is ever remounted somewhere without that middleware.
+	if hit == nil || !canSeeServer(r.Context(), serverID) {
 		s.writeError(w, r, http.StatusNotFound, "Server not found: "+serverID)
 		return
 	}
@@ -82,11 +98,10 @@ func (s *Server) handleGetServerDiagnostics(w http.ResponseWriter, r *http.Reque
 	// Issue #872: health.detail and diagnostic.cause echo the raw connect
 	// error, which carries the full upstream URL (query secrets and all).
 	// Scrub them in parity with the /api/v1/servers list route unless the
-	// operator opted out via reveal_secret_headers.
-	reveal := false
-	if cfg, cfgErr := s.controller.GetConfig(); cfgErr == nil && cfg != nil {
-		reveal = cfg.RevealSecretHeaders
-	}
+	// operator opted out via reveal_secret_headers AND the caller is an
+	// authenticated admin (#1167 — this read the flag alone, with `r` in
+	// scope and its AuthContext simply never consulted).
+	reveal := s.revealSecrets(r.Context())
 
 	resp := map[string]interface{}{
 		"server":    serverID,
@@ -126,4 +141,51 @@ func (s *Server) handleGetServerDiagnostics(w http.ResponseWriter, r *http.Reque
 	resp["catalog_size"] = len(diagnostics.All())
 
 	s.writeSuccess(w, resp)
+}
+
+// viewString reads one string leaf out of a redacted server view (see
+// oauth.RedactedConfigView), falling back to the raw value when the key was
+// omitted — every string field of config.ServerConfig is `omitempty`, and an
+// empty value carries no secret. It is the httpapi twin of the helper the MCP
+// door uses, so the two build their echoes from the view the same way.
+func viewString(view map[string]interface{}, key, fallback string) string {
+	if v, ok := view[key].(string); ok {
+		return v
+	}
+	return fallback
+}
+
+// redactedRegistrySummary renders one registry source for a REST echo with its
+// URLs masked by the shared LIVE rule.
+//
+// Issue #1148, round 8: a CUSTOM registry source is operator-configured, so its
+// URL can carry a credential in the query string exactly as an upstream URL
+// can — and it was echoed verbatim by add-source / edit-source / remove-source
+// and republished by `list_registries` on every surface. The write doors
+// (Server.AddRegistrySource / EditRegistrySource) refuse an echoed mask rather
+// than persisting it over the credential, which is the same bind-or-refuse
+// answer the server write path gives.
+func redactedRegistrySummary(entry *config.RegistryEntry) contracts.RegistrySummary {
+	// Nil-tolerant on purpose. This renders the SUCCESS payload for three
+	// registry handlers, each of which reaches it whenever the controller
+	// returned no error — and a controller may legitimately report success
+	// without an entry. Dereferencing there panicked inside the handler, which
+	// chi's recoverer turned into a bare 500 with an EMPTY body: the caller saw
+	// an unexplained server error on a request that had in fact succeeded, and
+	// the real cause only appeared as a stack in the log.
+	//
+	// The guard lives here rather than at the three call sites so a fourth
+	// caller cannot reintroduce it.
+	if entry == nil {
+		return contracts.RegistrySummary{}
+	}
+	return contracts.RegistrySummary{
+		ID:         entry.ID,
+		Name:       entry.Name,
+		URL:        oauth.LiveRedaction.URLValue(entry.URL),
+		ServersURL: oauth.LiveRedaction.URLValue(entry.ServersURL),
+		Protocol:   entry.Protocol,
+		Provenance: entry.Provenance,
+		Trusted:    entry.IsTrusted(),
+	}
 }

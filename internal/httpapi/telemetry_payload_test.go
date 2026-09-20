@@ -36,6 +36,8 @@ func (fakeRuntimeStats) GetServerCount() int               { return 7 }
 func (fakeRuntimeStats) GetConnectedServerCount() int      { return 5 }
 func (fakeRuntimeStats) GetToolCount() int                 { return 42 }
 func (fakeRuntimeStats) GetRoutingMode() string            { return "retrieve_tools" }
+func (fakeRuntimeStats) GetToolResponseMode() string       { return "full" }
+func (fakeRuntimeStats) GetDirectToolResponseMode() string { return "full" }
 func (fakeRuntimeStats) IsQuarantineEnabled() bool         { return true }
 func (fakeRuntimeStats) IsDockerAvailable() bool           { return false }
 func (fakeRuntimeStats) GetDockerIsolatedServerCount() int { return 0 }
@@ -127,7 +129,10 @@ func TestHandleGetTelemetryPayload_RendersV7Fields(t *testing.T) {
 	require.True(t, resp.Success)
 	require.NotNil(t, resp.Data)
 
-	assert.Equal(t, float64(7), resp.Data["schema_version"])
+	// Tracks telemetry.SchemaVersion — v8 added the tpa_scanner block and v9
+	// the TPA funnel counters + trust_mode_distribution; the v7 fields below
+	// must keep rendering regardless (FR-014: additive only).
+	assert.Equal(t, float64(telemetry.SchemaVersion), resp.Data["schema_version"])
 	assert.Equal(t, true, resp.Data["wizard_shown"])
 	assert.Equal(t, "completed_external", resp.Data["wizard_connect_step"])
 	assert.Equal(t, float64(1), resp.Data["web_ui_opened"])

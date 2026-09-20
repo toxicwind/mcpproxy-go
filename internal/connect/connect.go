@@ -6,8 +6,11 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
+	"sync"
 
 	"github.com/BurntSushi/toml"
 )
@@ -53,9 +56,46 @@ type ClientStatus struct {
 	// Empty/"unknown" in the content-read-free overall status; resolved to
 	// "accessible"/"absent"/"malformed" (and "denied" in US2) by on-demand reads.
 	AccessState string `json:"access_state"`
+	// CheckedPaths lists every config location the existence check consults,
+	// highest precedence first. For most clients this is just ConfigPath; for
+	// OpenCode it names both opencode.jsonc and opencode.json (#922), so a
+	// "no config found" UI can say exactly which files were looked for.
+	CheckedPaths []string `json:"checked_paths,omitempty"`
 	// Remediation carries actionable fix text, populated only when access is denied.
 	Remediation string `json:"remediation,omitempty"`
+
+	// ProxyURL is THIS instance's MCP endpoint — the address a client would be
+	// pointed at by a connect. Derived from config only (no file read), so it is
+	// populated by both the stat-only listing and the on-demand read.
+	ProxyURL string `json:"proxy_url,omitempty"`
+	// RegisteredURL is the endpoint the client's existing entry actually points
+	// at, projected through exactly the same sanitizer as a Spec 091 preview's
+	// entry summary: scheme, host and path only — query (the ?apikey= carrier),
+	// userinfo and fragment are dropped, and a value that is not an absolute URL
+	// is not echoed at all. Note this is scheme+host+PATH, matching the preview:
+	// a credential embedded in a path segment by a third-party config would
+	// survive, exactly as it already does on the preview surface. Deliberately
+	// identical so the two surfaces cannot disagree about what an entry says.
+	// Empty when nothing was read or the entry carries no URL-shaped value.
+	// Resolved only by GetStatus.
+	RegisteredURL string `json:"registered_url,omitempty"`
+	// EndpointMatch says how RegisteredURL relates to ProxyURL. It exists
+	// because Connected only ever meant "an mcpproxy-shaped entry is present":
+	// an entry merely *named* mcpproxy counts, even when it points at another
+	// instance on another port (audit F18). One of:
+	//   "this"    — the entry's endpoint is this instance
+	//   "other"   — the entry points somewhere else (a different instance)
+	//   "unknown" — the entry has no comparable endpoint (e.g. a stdio command)
+	// Empty when Connected is false or nothing was read.
+	EndpointMatch string `json:"endpoint_match,omitempty"`
 }
+
+// EndpointMatch values for ClientStatus.EndpointMatch.
+const (
+	EndpointMatchThis    = "this"
+	EndpointMatchOther   = "other"
+	EndpointMatchUnknown = "unknown"
+)
 
 // Service provides connect/disconnect operations for MCP client configurations.
 type Service struct {
@@ -81,6 +121,18 @@ type Service struct {
 	// readFile is the content-read seam (Spec 075 T003). Defaults to os.ReadFile;
 	// tests inject a permission-denied error or a call counter through it.
 	readFile func(string) ([]byte, error)
+	// statFile is the metadata seam alongside readFile. Defaults to os.Stat.
+	// Existence checks route through it so a stat that fails for a reason OTHER
+	// than "not there" can be classified honestly instead of being reported as
+	// an absent config.
+	statFile func(string) (os.FileInfo, error)
+
+	// tokenKey is the per-core-instance HMAC key for connect-preview
+	// precondition tokens (Spec 091 FR-005). Generated lazily by
+	// preconditionKey(), never persisted, never exposed: it keeps a token
+	// unforgeable and non-oracular, and scopes it to this process.
+	tokenKeyOnce sync.Once
+	tokenKey     []byte
 }
 
 // WithRequireMCPAuth sets whether the /mcp endpoint requires authentication,
@@ -146,6 +198,20 @@ func NewServiceWithReader(listenAddr, apiKey, homeDir string, readFile func(stri
 
 // setReadFile overrides the content-read seam (test helper).
 func (s *Service) setReadFile(fn func(string) ([]byte, error)) { s.readFile = fn }
+
+// setStat overrides the metadata seam (test helper), so a permission-blocked
+// stat can be exercised without depending on OS permission bits (which root
+// ignores and Windows does not model the same way).
+func (s *Service) setStat(fn func(string) (os.FileInfo, error)) { s.statFile = fn }
+
+// stat performs a metadata check through the seam, falling back to os.Stat for
+// a zero-value Service. No config content is read (Spec 075 FR-001).
+func (s *Service) stat(path string) (os.FileInfo, error) {
+	if s.statFile != nil {
+		return s.statFile(path)
+	}
+	return os.Stat(path)
+}
 
 // read performs a config content read through the seam, falling back to
 // os.ReadFile for a zero-value Service.
@@ -266,23 +332,35 @@ func (s *Service) GetAllStatus() []ClientStatus {
 	clients := GetAllClients()
 	statuses := make([]ClientStatus, 0, len(clients))
 
+	// Config-derived, so it costs no file read and stays inside the Spec 075
+	// content-read-free contract.
+	proxyURL := s.baseURL()
+
 	for _, c := range clients {
-		cfgPath := ConfigPath(c.ID, s.homeDir)
+		cfgPath := s.configPath(c.ID)
 		status := ClientStatus{
-			ID:          c.ID,
-			Name:        c.Name,
-			ConfigPath:  cfgPath,
-			Supported:   c.Supported,
-			Reason:      c.Reason,
-			Note:        c.Note,
-			Bridge:      c.Bridge,
-			Icon:        c.Icon,
-			AccessState: accessUnknown,
+			ID:           c.ID,
+			Name:         c.Name,
+			ConfigPath:   cfgPath,
+			CheckedPaths: s.checkedPaths(c.ID),
+			Supported:    c.Supported,
+			Reason:       c.Reason,
+			Note:         c.Note,
+			Bridge:       c.Bridge,
+			Icon:         c.Icon,
+			AccessState:  accessUnknown,
+			ProxyURL:     proxyURL,
 		}
 
 		// Metadata-only existence check (no content read).
-		if _, err := os.Stat(cfgPath); err == nil {
+		if _, err := s.stat(cfgPath); err == nil {
 			status.Exists = true
+		} else if !os.IsNotExist(err) {
+			// Still no content read — but a stat we were not allowed to make is
+			// not evidence of absence, and leaving the row to say "No config
+			// found" would name the wrong problem. Classifying the stat error
+			// costs nothing extra here.
+			status.AccessState = classifyAccess(err)
 		}
 
 		statuses = append(statuses, status)
@@ -301,21 +379,32 @@ func (s *Service) GetStatus(clientID string) (ClientStatus, error) {
 		return ClientStatus{}, fmt.Errorf("unknown client: %s", clientID)
 	}
 
-	cfgPath := ConfigPath(c.ID, s.homeDir)
+	cfgPath := s.configPath(c.ID)
 	status := ClientStatus{
-		ID:          c.ID,
-		Name:        c.Name,
-		ConfigPath:  cfgPath,
-		Supported:   c.Supported,
-		Reason:      c.Reason,
-		Note:        c.Note,
-		Bridge:      c.Bridge,
-		Icon:        c.Icon,
-		AccessState: accessUnknown,
+		ID:           c.ID,
+		Name:         c.Name,
+		ConfigPath:   cfgPath,
+		CheckedPaths: s.checkedPaths(c.ID),
+		Supported:    c.Supported,
+		Reason:       c.Reason,
+		Note:         c.Note,
+		Bridge:       c.Bridge,
+		Icon:         c.Icon,
+		AccessState:  accessUnknown,
+		ProxyURL:     s.baseURL(),
 	}
 
-	if _, err := os.Stat(cfgPath); err == nil {
+	if _, err := s.stat(cfgPath); err == nil {
 		status.Exists = true
+	} else if !os.IsNotExist(err) {
+		// We could not even look. Claiming "no config found" here would report a
+		// permission block as "not installed" and hide the remediation the user
+		// needs (Spec 075 FR-004).
+		status.AccessState = classifyAccess(err)
+		if status.AccessState == accessDenied {
+			status.Remediation = remediationText(c.Name)
+		}
+		return status, nil
 	}
 	if !status.Exists {
 		status.AccessState = accessAbsent
@@ -325,12 +414,14 @@ func (s *Service) GetStatus(clientID string) (ClientStatus, error) {
 		return status, nil
 	}
 
-	name, found, outcome := s.entryAccess(*c, cfgPath)
+	loc, found, outcome := s.entryAccess(*c, cfgPath)
 	status.AccessState = outcome
 	switch {
 	case outcome == accessAccessible && found:
 		status.Connected = true
-		status.ServerName = name
+		status.ServerName = loc.Name
+		status.RegisteredURL = loc.Endpoint
+		status.EndpointMatch = classifyEndpointMatch(loc)
 	case outcome == accessDenied:
 		// A macOS App-Data block must surface as actionable remediation, not as
 		// a plain "not connected" (Spec 075 FR-004).
@@ -344,22 +435,41 @@ func (s *Service) GetStatus(clientID string) (ClientStatus, error) {
 // access outcome classified strictly from the error class (Spec 075 FR-011):
 // a read error maps to absent/denied/malformed via classifyAccess, and a parse
 // failure on otherwise-readable bytes maps to malformed.
-func (s *Service) entryAccess(client ClientDef, cfgPath string) (name string, found bool, outcome string) {
+func (s *Service) entryAccess(client ClientDef, cfgPath string) (loc entryLocation, found bool, outcome string) {
 	raw, err := s.read(cfgPath)
 	if err != nil {
-		return "", false, classifyAccess(err)
+		return entryLocation{}, false, classifyAccess(err)
 	}
-	name, found, parsedOK := s.findEntryFromBytes(client, raw)
+	loc, found, parsedOK := s.findEntryFromBytes(client, raw)
 	if !parsedOK {
-		return "", false, accessMalformed
+		return entryLocation{}, false, accessMalformed
 	}
-	return name, found, accessAccessible
+	return loc, found, accessAccessible
 }
 
 // Connect registers MCPProxy in the specified client's configuration file.
 // serverName defaults to "mcpproxy" if empty. If force is false and an entry
 // already exists, an error is returned.
+//
+// This is the tokenless entry point kept for the Web UI, the CLI and every
+// existing caller; ConnectWithPrecondition adds the Spec 091 drift guard.
 func (s *Service) Connect(clientID, serverName string, force bool) (*ConnectResult, error) {
+	return s.ConnectWithPrecondition(clientID, serverName, force, "")
+}
+
+// ConnectWithPrecondition is Connect guarded by the opaque token a preview
+// returned (Spec 091 FR-005). When preconditionToken is non-empty, the core
+// re-resolves the raw pre-write state and the entry it would write, recomputes
+// the token, and refuses with the discriminated "precondition_failed" action —
+// writing nothing and taking no backup — if anything drifted since the preview:
+// the file appearing or vanishing, the resolved (possibly adopted) entry
+// changing in any way, or the proxy's own configuration changing what would be
+// written. force=true rides WITH the token for a replace-classified flow and
+// never rescues a stale one.
+//
+// An empty token means exactly today's behavior, so existing consumers are
+// unaffected (contracts §2).
+func (s *Service) ConnectWithPrecondition(clientID, serverName string, force bool, preconditionToken string) (*ConnectResult, error) {
 	client := FindClient(clientID)
 	if client == nil {
 		return nil, fmt.Errorf("unknown client: %s", clientID)
@@ -372,27 +482,70 @@ func (s *Service) Connect(clientID, serverName string, force bool) (*ConnectResu
 		serverName = defaultServerName
 	}
 
-	cfgPath := ConfigPath(clientID, s.homeDir)
+	cfgPath := s.configPath(clientID)
 	if cfgPath == "" {
 		return nil, fmt.Errorf("cannot determine config path for %s", clientID)
 	}
-	if client.ID == "opencode" {
-		if _, err := os.Stat(cfgPath); os.IsNotExist(err) {
-			return nil, fmt.Errorf("OpenCode config file %s does not exist", cfgPath)
+	// Resolve the pre-write state ONCE for the whole operation. The token check
+	// and the write must cover the SAME entry — re-resolving per step is what
+	// let a token hash one entry while the write replaced or deleted another
+	// (Spec 091 FR-005).
+	fileExists, existing, _, err := s.preWriteState(client, cfgPath, serverName)
+	if err != nil {
+		return nil, s.asAccessError(client, cfgPath, err)
+	}
+
+	// Precondition check BEFORE any backup or write, so a refusal is completely
+	// inert (Spec 091 FR-005).
+	if preconditionToken != "" {
+		if stale := s.checkPrecondition(client, cfgPath, serverName, preconditionToken, fileExists, existing); stale != nil {
+			return stale, nil
 		}
 	}
 
+	// The refusal guard runs AFTER the drift check. Both orders refuse the
+	// write, but a caller that echoed a token describing a file which has since
+	// vanished is looking at drift, and FR-005 promises drift is reported as the
+	// discriminated conflict for every change kind — a flat refusal instead
+	// reads as a permanent "not connectable" and strands the form.
+	if err := connectRefusal(client, cfgPath); err != nil {
+		return nil, err
+	}
+
 	var res *ConnectResult
-	var err error
 	if client.Format == "toml" {
 		res, err = s.connectTOML(client, cfgPath, serverName, force)
 	} else {
-		res, err = s.connectJSON(client, cfgPath, serverName, force)
+		res, err = s.connectJSON(client, cfgPath, serverName, force, existing)
 	}
 	// A permission denial anywhere in the read/backup/write chain (the errors
 	// preserve their OS cause via %w) surfaces as a typed *AccessError with
 	// remediation; other errors keep their existing semantics (Spec 075 FR-004).
 	return res, s.asAccessError(client, cfgPath, err)
+}
+
+// connectRefusal reports the reason a connect would refuse for this client
+// regardless of user intent, or nil when the client is connectable.
+//
+// Today the single case is a non-create-capable client whose config is absent:
+// OpenCode owns a config schema mcpproxy will not invent, so connect refuses
+// rather than creating one. It is a package-level function, not a method,
+// precisely so the PREVIEW can run the exact same guard the write runs and
+// surface the reason verbatim before the user ever presses Connect (Spec 091
+// FR-003, research D8) — a divergent copy would let the form promise "a new
+// file will be created; Undo removes it" for a client where that is false.
+func connectRefusal(client *ClientDef, cfgPath string) error {
+	if client.ID != "opencode" {
+		return nil
+	}
+	// configPath already prefers whichever candidate exists; reaching a
+	// nonexistent path here means NO OpenCode global config was found.
+	if _, err := os.Stat(cfgPath); os.IsNotExist(err) {
+		return fmt.Errorf(
+			"no OpenCode config found (looked for opencode.jsonc and opencode.json in %s) — is OpenCode installed?",
+			filepath.Dir(cfgPath))
+	}
+	return nil
 }
 
 // Disconnect removes the MCPProxy entry from the specified client's configuration.
@@ -409,7 +562,7 @@ func (s *Service) Disconnect(clientID, serverName string) (*ConnectResult, error
 		serverName = defaultServerName
 	}
 
-	cfgPath := ConfigPath(clientID, s.homeDir)
+	cfgPath := s.configPath(clientID)
 	if cfgPath == "" {
 		return nil, fmt.Errorf("cannot determine config path for %s", clientID)
 	}
@@ -421,13 +574,65 @@ func (s *Service) Disconnect(clientID, serverName string) (*ConnectResult, error
 	} else {
 		res, err = s.disconnectJSON(client, cfgPath, serverName)
 	}
+	// OpenCode candidate drift (#922): if the entry was written to opencode.json
+	// and OpenCode later bootstrapped opencode.jsonc, the resolver now targets
+	// the .jsonc — but the entry still lives in the .json. When the resolved
+	// file has no entry, retry the other existing candidate before giving up.
+	if err == nil && res != nil && !res.Success && res.Action == "not_found" && clientID == "opencode" {
+		for _, alt := range opencodeConfigCandidates(s.homeDir) {
+			if alt == cfgPath {
+				continue
+			}
+			if _, statErr := os.Stat(alt); statErr != nil {
+				continue
+			}
+			altRes, altErr := s.disconnectJSON(client, alt, serverName)
+			if altErr != nil {
+				// An unreadable/malformed/comment-guarded alternate is a real
+				// failure — surfacing "not_found" would wrongly claim the entry
+				// is absent when we could not actually check the file.
+				return altRes, s.asAccessError(client, alt, altErr)
+			}
+			if altRes != nil && altRes.Success {
+				return altRes, nil
+			}
+		}
+	}
 	return res, s.asAccessError(client, cfgPath, err)
 }
 
 // ---------- JSON helpers ----------
 
 // connectJSON adds or updates the mcpproxy entry in a JSON config file.
-func (s *Service) connectJSON(client *ClientDef, cfgPath, serverName string, force bool) (*ConnectResult, error) {
+// guardJsoncComments refuses to rewrite a .jsonc file that actually uses
+// comments: mcpproxy re-serializes plain JSON, which would silently strip them
+// (#922). Comment-free .jsonc (OpenCode's bootstrap stub) rewrites safely.
+// Absent or unreadable files pass — the normal read/write path handles those.
+func (s *Service) guardJsoncComments(cfgPath string) error {
+	if !strings.HasSuffix(cfgPath, ".jsonc") {
+		return nil
+	}
+	raw, err := s.read(cfgPath)
+	if err != nil {
+		return nil
+	}
+	if jsonHasComments(raw) {
+		return fmt.Errorf(
+			"%s contains comments, which mcpproxy would strip on rewrite — edit the \"mcp\" section manually or remove the comments and retry",
+			cfgPath)
+	}
+	return nil
+}
+
+// connectJSON writes the entry, adopting the entry `resolved` names when it
+// differs from serverName. The resolution is passed in rather than recomputed
+// so the write acts on exactly the entry the preview described and the
+// precondition token hashed (Spec 091 FR-005); nil means "resolve nothing" for
+// the tokenless callers that never previewed.
+func (s *Service) connectJSON(client *ClientDef, cfgPath, serverName string, force bool, resolved *existingEntry) (*ConnectResult, error) {
+	if err := s.guardJsoncComments(cfgPath); err != nil {
+		return nil, err
+	}
 	// Read existing config or start fresh
 	data, perm, err := s.readOrCreateJSON(cfgPath)
 	if err != nil {
@@ -456,8 +661,12 @@ func (s *Service) connectJSON(client *ClientDef, cfgPath, serverName string, for
 		action = "updated"
 	}
 
-	if client.ID == "opencode" {
-		if adoptedName, found := findEquivalentJSONServerName(serversMap, s.baseURL(), serverName); found && adoptedName != serverName {
+	// Adopt the entry the caller already resolved — never a freshly looked-up
+	// one. A key that has vanished from the file since is not adopted: there is
+	// nothing left to delete.
+	if client.ID == "opencode" && resolved != nil && resolved.name != serverName {
+		if _, present := serversMap[resolved.name]; present {
+			adoptedName := resolved.name
 			if !force {
 				return &ConnectResult{
 					Success:    true,
@@ -513,6 +722,9 @@ func (s *Service) connectJSON(client *ClientDef, cfgPath, serverName string, for
 
 // disconnectJSON removes the mcpproxy entry from a JSON config file.
 func (s *Service) disconnectJSON(client *ClientDef, cfgPath, serverName string) (*ConnectResult, error) {
+	if err := s.guardJsoncComments(cfgPath); err != nil {
+		return nil, err
+	}
 	raw, err := s.read(cfgPath)
 	if os.IsNotExist(err) {
 		return &ConnectResult{
@@ -828,9 +1040,28 @@ func (s *Service) verifyJSONEntry(path, serversKey, serverName string) error {
 	return nil
 }
 
+// findEquivalentJSONServerName resolves the entry a connect would adopt: the
+// requested name when it is already taken, otherwise an entry pointing at our
+// MCP endpoint under some other key (including the legacy ?apikey= shape) so an
+// upgrade updates the existing entry rather than duplicating it.
+//
+// The resolution is DETERMINISTIC by construction — exact name first, then the
+// lowest URL-equivalent name in sorted order. Go randomizes map iteration, and
+// this lookup feeds the preview's summary, the precondition token and the
+// write's delete: an order-dependent answer would let those cover different
+// entries, producing spurious precondition_failed refusals and, under force,
+// silently deleting an entry the user was never shown (Spec 091 FR-005).
 func findEquivalentJSONServerName(serversMap map[string]interface{}, baseURL, requestedServerName string) (string, bool) {
-	for name, rawEntry := range serversMap {
-		entry, ok := rawEntry.(map[string]interface{})
+	if _, taken := serversMap[requestedServerName]; taken {
+		return requestedServerName, true
+	}
+	names := make([]string, 0, len(serversMap))
+	for name := range serversMap {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		entry, ok := serversMap[name].(map[string]interface{})
 		if !ok {
 			continue
 		}
@@ -839,14 +1070,9 @@ func findEquivalentJSONServerName(serversMap map[string]interface{}, baseURL, re
 			if !ok {
 				continue
 			}
-			// Match both a clean base URL and a legacy ?apikey= variant so an
-			// upgrade adopts/updates the existing entry rather than duplicating.
 			if entryURL == baseURL || strings.HasPrefix(entryURL, baseURL+"?") {
 				return name, true
 			}
-		}
-		if name == requestedServerName {
-			return name, true
 		}
 	}
 	return "", false
@@ -857,29 +1083,46 @@ func findEquivalentJSONServerName(serversMap map[string]interface{}, baseURL, re
 // whether the bytes parsed successfully (parsedOK=false => malformed). All
 // content reads route through s.read (Spec 075 T010); this function never
 // touches the filesystem.
-func (s *Service) findEntryFromBytes(client ClientDef, raw []byte) (name string, found, parsedOK bool) {
+func (s *Service) findEntryFromBytes(client ClientDef, raw []byte) (loc entryLocation, found, parsedOK bool) {
 	if client.Format == "toml" {
 		return s.findEntryTOMLBytes(raw)
 	}
 	return s.findEntryJSONBytes(client, raw)
 }
 
+// entryLocation describes a matched mcpproxy-like entry in a client config.
+//
+// PointsHere separates the two very different ways an entry matches: its
+// endpoint really is this instance, or it merely carries the well-known
+// "mcpproxy" key and could be pointing anywhere. Endpoint is the sanitized
+// address it points at ("" when the entry carries no URL-shaped value), so the
+// UI can name the other instance instead of claiming a bare "Connected".
+type entryLocation struct {
+	Name       string
+	Endpoint   string
+	PointsHere bool
+}
+
 // findEntryJSONBytes parses JSON config bytes and looks for an entry that points
 // to our MCP URL.
-func (s *Service) findEntryJSONBytes(client ClientDef, raw []byte) (name string, found, parsedOK bool) {
+func (s *Service) findEntryJSONBytes(client ClientDef, raw []byte) (loc entryLocation, found, parsedOK bool) {
 	var data map[string]interface{}
 	if err := unmarshalLenientJSON(raw, &data); err != nil {
-		return "", false, false
+		return entryLocation{}, false, false
 	}
 
 	serversMap, ok := data[client.ServerKey].(map[string]interface{})
 	if !ok {
-		return "", false, true
+		return entryLocation{}, false, true
 	}
 
 	// Anchor on the credential-free base URL so both new clean entries and
 	// legacy entries carrying a ?apikey= query are recognized (Spec 078).
 	baseURL := s.baseURL()
+
+	// A name-only match is the weakest evidence, so it never short-circuits the
+	// scan: a sibling entry that genuinely points at us wins over it.
+	var nameOnly *entryLocation
 
 	for name, v := range serversMap {
 		entry, ok := v.(map[string]interface{})
@@ -891,7 +1134,7 @@ func (s *Service) findEntryJSONBytes(client ClientDef, raw []byte) (name string,
 		for _, field := range []string{"url", "serverUrl", "httpUrl"} {
 			if u, ok := entry[field].(string); ok {
 				if u == baseURL || strings.HasPrefix(u, baseURL+"?") {
-					return name, true, true
+					return entryLocation{Name: name, Endpoint: entrySummaryEndpoint(name, entry), PointsHere: true}, true, true
 				}
 			}
 		}
@@ -900,16 +1143,50 @@ func (s *Service) findEntryJSONBytes(client ClientDef, raw []byte) (name string,
 		// mcpproxy endpoint lives in the command args. Detect by inspecting
 		// args so a bridge written under a custom server name is still found.
 		if entryPointsToBridge(entry, baseURL) {
-			return name, true, true
+			return entryLocation{Name: name, Endpoint: entrySummaryEndpoint(name, entry), PointsHere: true}, true, true
 		}
 
-		// Also match by server name
-		if name == defaultServerName {
-			return name, true, true
+		// Also match by server name. This arm is why "connected" has historically
+		// over-reported: the entry is called mcpproxy but may address a different
+		// instance entirely (audit F18). Record where it actually points.
+		if name == defaultServerName && nameOnly == nil {
+			nameOnly = &entryLocation{Name: name, Endpoint: entrySummaryEndpoint(name, entry)}
 		}
 	}
 
-	return "", false, true
+	if nameOnly != nil {
+		return *nameOnly, true, true
+	}
+	return entryLocation{}, false, true
+}
+
+// classifyEndpointMatch turns a matched entry into the EndpointMatch value the
+// UI renders. PointsHere is authoritative — it means the matcher recognized our
+// exact base URL. Otherwise the entry matched on its name alone: if it names an
+// endpoint at all, that endpoint is somewhere else; if it names none (a stdio
+// command entry), we cannot tell.
+func classifyEndpointMatch(loc entryLocation) string {
+	switch {
+	case loc.PointsHere:
+		return EndpointMatchThis
+	case loc.Endpoint != "":
+		return EndpointMatchOther
+	default:
+		return EndpointMatchUnknown
+	}
+}
+
+// entrySummaryEndpoint projects the endpoint an entry addresses, reusing the
+// Spec 091 entry-summary sanitizer so query strings (which may carry ?apikey=),
+// userinfo and fragments never reach the status payload. Reused rather than
+// reimplemented on purpose: the status row and the connect preview must never
+// disagree about what a client's entry points at.
+func entrySummaryEndpoint(name string, entry map[string]interface{}) string {
+	summary := buildEntrySummary(name, entry)
+	if summary == nil {
+		return ""
+	}
+	return summary.Endpoint
 }
 
 // entryPointsToBridge reports whether a JSON config entry is an mcp-remote
@@ -943,29 +1220,100 @@ func unmarshalLenientJSON(raw []byte, out interface{}) error {
 	if err := json.Unmarshal(raw, out); err == nil {
 		return nil
 	}
-	cleaned := trailingCommaPattern.ReplaceAll(raw, []byte(`$1`))
+	// JSONC tolerance (#922): OpenCode bootstraps opencode.jsonc, which may
+	// carry // and /* */ comments plus trailing commas. Strip comments first —
+	// comment removal can expose new trailing commas — then clean commas.
+	cleaned, cerr := stripJSONComments(raw)
+	if cerr != nil {
+		return cerr
+	}
+	cleaned = trailingCommaPattern.ReplaceAll(cleaned, []byte(`$1`))
 	return json.Unmarshal(cleaned, out)
+}
+
+// stripJSONComments removes // line and /* */ block comments from JSONC input,
+// string-aware so slashes inside JSON strings survive. Comment bytes are
+// replaced with spaces (newlines kept) to preserve offsets for error messages.
+// An unterminated /* block is an error — silently blanking to EOF would make
+// truncated/malformed files parse as valid.
+func stripJSONComments(raw []byte) ([]byte, error) {
+	out := make([]byte, len(raw))
+	copy(out, raw)
+	inString := false
+	escaped := false
+	for i := 0; i < len(out); i++ {
+		c := out[i]
+		if inString {
+			if escaped {
+				escaped = false
+			} else if c == '\\' {
+				escaped = true
+			} else if c == '"' {
+				inString = false
+			}
+			continue
+		}
+		switch {
+		case c == '"':
+			inString = true
+		case c == '/' && i+1 < len(out) && out[i+1] == '/':
+			for i < len(out) && out[i] != '\n' {
+				out[i] = ' '
+				i++
+			}
+		case c == '/' && i+1 < len(out) && out[i+1] == '*':
+			out[i], out[i+1] = ' ', ' '
+			i += 2
+			closed := false
+			for i < len(out) {
+				if out[i] == '*' && i+1 < len(out) && out[i+1] == '/' {
+					out[i], out[i+1] = ' ', ' '
+					i++
+					closed = true
+					break
+				}
+				if out[i] != '\n' {
+					out[i] = ' '
+				}
+				i++
+			}
+			if !closed {
+				return nil, fmt.Errorf("unterminated /* block comment")
+			}
+		}
+	}
+	return out, nil
+}
+
+// jsonHasComments reports whether stripping comments would change the content —
+// i.e. the file actually uses JSONC comments (not just slashes inside strings).
+// An unterminated block comment counts as commented (the write guard refuses).
+func jsonHasComments(raw []byte) bool {
+	stripped, err := stripJSONComments(raw)
+	return err != nil || !bytes.Equal(stripped, raw)
 }
 
 // findEntryTOMLBytes parses TOML config bytes and looks for an entry that points
 // to our MCP URL.
-func (s *Service) findEntryTOMLBytes(raw []byte) (name string, found, parsedOK bool) {
+func (s *Service) findEntryTOMLBytes(raw []byte) (loc entryLocation, found, parsedOK bool) {
 	var data map[string]interface{}
 	if _, err := toml.Decode(string(raw), &data); err != nil {
-		return "", false, false
+		return entryLocation{}, false, false
 	}
 
 	serversRaw, ok := data["mcp_servers"]
 	if !ok {
-		return "", false, true
+		return entryLocation{}, false, true
 	}
 
 	serversMap, ok := serversRaw.(map[string]interface{})
 	if !ok {
-		return "", false, true
+		return entryLocation{}, false, true
 	}
 
 	baseURL := s.baseURL()
+
+	var nameOnly *entryLocation
 
 	for name, v := range serversMap {
 		entry, ok := v.(map[string]interface{})
@@ -974,13 +1322,16 @@ func (s *Service) findEntryTOMLBytes(raw []byte) (name string, found, parsedOK b
 		}
 		if u, ok := entry["url"].(string); ok {
 			if u == baseURL || strings.HasPrefix(u, baseURL+"?") {
-				return name, true, true
+				return entryLocation{Name: name, Endpoint: entrySummaryEndpoint(name, entry), PointsHere: true}, true, true
 			}
 		}
-		if name == defaultServerName {
-			return name, true, true
+		if name == defaultServerName && nameOnly == nil {
+			nameOnly = &entryLocation{Name: name, Endpoint: entrySummaryEndpoint(name, entry)}
 		}
 	}
 
-	return "", false, true
+	if nameOnly != nil {
+		return *nameOnly, true, true
+	}
+	return entryLocation{}, false, true
 }

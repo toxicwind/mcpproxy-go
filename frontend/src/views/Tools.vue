@@ -99,7 +99,7 @@
             <label class="label py-1">
               <span class="label-text text-xs">Server</span>
             </label>
-            <select v-model="filterServer" class="select select-bordered select-sm" data-test="filter-server">
+            <select v-model="filterServer" class="select select-bordered select-sm" aria-label="Filter by server" data-test="filter-server">
               <option value="">All Servers</option>
               <option v-for="srv in availableServers" :key="srv" :value="srv">{{ srv }}</option>
             </select>
@@ -110,7 +110,7 @@
             <label class="label py-1">
               <span class="label-text text-xs">Status</span>
             </label>
-            <select v-model="filterStatus" class="select select-bordered select-sm" data-test="filter-status">
+            <select v-model="filterStatus" class="select select-bordered select-sm" aria-label="Filter by status" data-test="filter-status">
               <option value="">All</option>
               <option value="enabled">Enabled</option>
               <option value="disabled">Disabled</option>
@@ -123,7 +123,7 @@
             <label class="label py-1">
               <span class="label-text text-xs">Risk</span>
             </label>
-            <select v-model="filterRisk" class="select select-bordered select-sm" data-test="filter-risk">
+            <select v-model="filterRisk" class="select select-bordered select-sm" aria-label="Filter by risk" data-test="filter-risk">
               <option value="">All</option>
               <option value="read">Read</option>
               <option value="write">Write</option>
@@ -136,7 +136,7 @@
             <label class="label py-1">
               <span class="label-text text-xs">Approval</span>
             </label>
-            <select v-model="filterApproval" class="select select-bordered select-sm" data-test="filter-approval">
+            <select v-model="filterApproval" class="select select-bordered select-sm" aria-label="Filter by approval state" data-test="filter-approval">
               <option value="">All</option>
               <option value="awaiting">Awaiting approval</option>
               <option value="approved">Approved</option>
@@ -245,12 +245,51 @@
           <svg class="w-16 h-16 mx-auto mb-4 opacity-30" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
           </svg>
-          <p class="text-lg">
-            {{ hasActiveFilters ? 'No matching tools' : 'No tools available' }}
-          </p>
-          <p class="text-sm mt-1">
-            {{ hasActiveFilters ? 'Try adjusting your filters or search query' : 'Connect MCP servers to see their tools here.' }}
-          </p>
+          <!-- Audit F11: a bare "No matching tools" cannot be told apart from a
+               typo, an empty catalogue, or a server still waiting in quarantine.
+               When a search ran, name the query, the scope it actually covered,
+               and a next step. -->
+          <div v-if="searchQuery" data-test="tools-empty-search">
+            <p class="text-lg">No tools match "{{ searchQuery }}"</p>
+            <!-- Zero scope has TWO causes and they need opposite advice.
+                 "Clear your filters" is itself a false claim when there was
+                 nothing to filter: with every server quarantined or none
+                 connected, GET /api/v1/tools returns an empty catalogue and no
+                 filter is responsible for it. Split on allTools. -->
+            <!-- States the OBSERVED catalogue and nothing else. Round-3 review:
+                 "no connected server is exposing any" was itself unsupportable —
+                 GET /api/v1/tools returns success with an empty list and
+                 `partial: true` when a server's tool fetch FAILED
+                 (internal/httpapi/server.go), which is "we could not read them",
+                 not "there are none". That case gets its own clause instead of a
+                 wrong cause. -->
+            <p v-if="allTools.length === 0" class="text-sm mt-1">
+              There are no tools in this list to search.<template v-if="partial"> Some servers
+              could not be read, so their tools are missing from it — see the warning above.</template>
+            </p>
+            <p v-else-if="searchScope.length === 0" class="text-sm mt-1">
+              Nothing was in scope to search — the other active filters excluded every
+              tool before the query ran. Clear them to search the full list.
+            </p>
+            <p v-else class="text-sm mt-1">
+              Searched {{ searchScope.length }} tool{{ searchScope.length === 1 ? '' : 's' }}
+              across {{ searchScopeServerCount }} server{{ searchScopeServerCount === 1 ? '' : 's' }}<template v-if="!filterStatus">, disabled tools included</template>.
+              Every word has to match — try fewer words.
+            </p>
+            <p v-if="quarantinedServerCount > 0" class="text-sm mt-1">
+              {{ quarantinedServerCount }} quarantined server{{ quarantinedServerCount === 1 ? '' : 's' }}
+              {{ quarantinedServerCount === 1 ? 'is' : 'are' }} not listed here —
+              <router-link to="/servers" class="link">review in Servers</router-link>.
+            </p>
+          </div>
+          <template v-else>
+            <p class="text-lg">
+              {{ hasActiveFilters ? 'No matching tools' : 'No tools available' }}
+            </p>
+            <p class="text-sm mt-1">
+              {{ hasActiveFilters ? 'Try adjusting your filters' : 'Connect MCP servers to see their tools here.' }}
+            </p>
+          </template>
           <div class="mt-4 space-x-2">
             <button v-if="hasActiveFilters" @click="clearFilters" class="btn btn-outline btn-sm">Clear Filters</button>
             <router-link v-else to="/servers" class="btn btn-primary btn-sm">Manage Servers</router-link>
@@ -266,6 +305,7 @@
                   <input
                     type="checkbox"
                     class="checkbox checkbox-sm"
+                    aria-label="Select all tools on this page"
                     :checked="allPageSelected"
                     :indeterminate="somePageSelected && !allPageSelected"
                     @change="toggleSelectAll"
@@ -309,6 +349,7 @@
                   <input
                     type="checkbox"
                     class="checkbox checkbox-sm"
+                    :aria-label="`Select tool ${tool.name}`"
                     :checked="selectedKeys.has(toolKey(tool))"
                     @change="toggleSelect(tool)"
                   />
@@ -326,7 +367,14 @@
                   </router-link>
                 </td>
                 <td>
-                  <div class="max-w-xs truncate text-sm text-base-content/70">
+                  <!-- Descriptions are clipped to keep the row height stable;
+                       without a title the clipped half was unreadable without
+                       opening the tool (audit F36) — expose the full text on
+                       hover/focus instead of losing it entirely. -->
+                  <div
+                    class="max-w-xs truncate text-sm text-base-content/70"
+                    :title="tool.description || undefined"
+                  >
                     {{ tool.description || '—' }}
                   </div>
                 </td>
@@ -340,6 +388,45 @@
                     {{ tool.approval_status }}
                   </span>
                   <span v-else class="text-base-content/30 text-xs">—</span>
+                  <!-- Compact hold evidence: reason icon + TPA ids + overflow. -->
+                  <div
+                    v-if="holdEvidenceFor(tool)"
+                    class="flex items-center gap-1 mt-1 text-xs whitespace-nowrap"
+                    :class="holdEvidenceFor(tool)!.toneClass"
+                    :title="holdEvidenceFor(tool)!.description"
+                    data-test="tool-hold-evidence"
+                  >
+                    <span aria-hidden="true">{{ holdEvidenceFor(tool)!.icon }}</span>
+                    <span
+                      v-if="holdEvidenceFor(tool)!.verdict"
+                      class="badge badge-xs"
+                      :class="holdEvidenceFor(tool)!.verdict!.badgeClass"
+                      data-test="tool-hold-verdict"
+                    >
+                      {{ holdEvidenceFor(tool)!.verdict!.label }}
+                    </span>
+                    <!-- The reason reads inline when no signal chips crowd it out;
+                         otherwise it stays available to screen readers. -->
+                    <span :class="holdEvidenceFor(tool)!.signals.length ? 'sr-only' : ''">
+                      {{ holdEvidenceFor(tool)!.label }}
+                    </span>
+                    <span
+                      v-for="signal in holdEvidenceFor(tool)!.signals"
+                      :key="signal.raw"
+                      class="badge badge-xs"
+                      :class="holdEvidenceFor(tool)!.chipClass"
+                      :title="signal.raw"
+                      data-test="tool-hold-signal"
+                    >
+                      {{ signal.label }}
+                    </span>
+                    <span
+                      v-if="holdEvidenceFor(tool)!.collapsedCount > 0"
+                      class="opacity-70"
+                      :title="`${holdEvidenceFor(tool)!.collapsedCount} more matched signal(s)`"
+                      data-test="tool-hold-signal-more"
+                    >+{{ holdEvidenceFor(tool)!.collapsedCount }}</span>
+                  </div>
                 </td>
                 <td>
                   <span v-if="tool.config_denied" class="badge badge-sm badge-error">config-denied</span>
@@ -370,7 +457,7 @@
               <button @click="currentPage = totalPages" :disabled="currentPage === totalPages" class="join-item btn btn-sm">»</button>
             </div>
             <div class="form-control">
-              <select v-model.number="pageSize" class="select select-bordered select-sm">
+              <select v-model.number="pageSize" class="select select-bordered select-sm" aria-label="Rows per page">
                 <option :value="25">25 / page</option>
                 <option :value="50">50 / page</option>
                 <option :value="100">100 / page</option>
@@ -463,14 +550,27 @@
 
 <script setup lang="ts">
 import { serverDetailPath } from '@/utils/serverRoute'
+import { formatDate } from '@/utils/datetime'
 import { ref, computed, onMounted, watch } from 'vue'
+import { useRoute } from 'vue-router'
 import CollapsibleHintsPanel from '@/components/CollapsibleHintsPanel.vue'
 import type { Hint } from '@/components/CollapsibleHintsPanel.vue'
 import type { GlobalTool, GlobalToolsStats } from '@/types/api'
+import { parseHoldEvidence, displaySignals, reasonPresentation, verdictPresentation } from '@/utils/holdEvidence'
 import api from '@/services/api'
 import { useSystemStore } from '@/stores/system'
+import { useServersStore } from '@/stores/servers'
 
 const systemStore = useSystemStore()
+const serversStore = useServersStore()
+
+// Quarantined servers contribute no tools to GET /api/v1/tools (#1064), so they
+// are silently outside every search on this page. App.vue already fetches the
+// server list app-wide; this only reads the count so the empty state can say so.
+const quarantinedServerCount = computed(() => serversStore.serverCount.quarantined)
+// Undefined when the view is mounted without a router — several unit suites do
+// exactly that, and a query prefill is not worth making them install one.
+const route = useRoute() as ReturnType<typeof useRoute> | undefined
 
 // ---- State ----
 const allTools = ref<GlobalTool[]>([])
@@ -723,18 +823,92 @@ function getApprovalBadgeClass(status: string): string {
   return 'badge-ghost'
 }
 
-// ---- Computed: filtering ----
-const filteredTools = computed(() => {
-  let tools = allTools.value
+// ---- Hold evidence (Spec 088 FR-008/FR-009/FR-012) ----
+// This page is a cross-server list, so its evidence stays COMPACT: the reason
+// icon carries the threat-vs-precaution distinction, plus the TPA signature ids
+// and an overflow count. The full badge — descriptions, verdict, scan-report
+// links — belongs to the server detail page, which is one click away.
 
-  if (searchQuery.value) {
-    const q = searchQuery.value.toLowerCase()
-    tools = tools.filter(t =>
-      t.name.toLowerCase().includes(q) ||
-      (t.description || '').toLowerCase().includes(q) ||
-      t.server_name.toLowerCase().includes(q)
-    )
+/** Compact cap: TPA ids are never collapsed by it (utils/holdEvidence). */
+const COMPACT_SIGNAL_CAP = 1
+
+interface CompactHoldEvidence {
+  icon: string
+  /** Plain-language reason; shown inline when there are no signal chips. */
+  label: string
+  description: string
+  toneClass: string
+  chipClass: string
+  signals: { label: string; raw: string }[]
+  /** Delivered-but-collapsed signals only — never a claim beyond the list. */
+  collapsedCount: number
+  /** FR-009: verdict severity must be visible, or a warnings hold and a
+      dangerous hold with the same signals would look identical. */
+  verdict: { label: string; badgeClass: string } | null
+}
+
+function buildHoldEvidence(tool: GlobalTool): CompactHoldEvidence | null {
+  // FR-012: only a tool still awaiting a decision may show hold evidence, so an
+  // approved/released record never renders stale findings.
+  if (!isApprovable(tool)) return null
+
+  const evidence = parseHoldEvidence(tool)
+  if (!evidence) return null
+  const reason = reasonPresentation(evidence)
+  if (!reason) return null
+
+  const { visible, collapsedCount } = displaySignals(evidence, COMPACT_SIGNAL_CAP)
+
+  return {
+    icon: reason.tone === 'threat' ? '⚠️' : reason.tone === 'precaution' ? '🛡️' : 'ℹ️',
+    label: reason.label,
+    description: reason.description,
+    toneClass:
+      reason.tone === 'threat'
+        ? 'text-error'
+        : reason.tone === 'precaution'
+          ? 'text-warning'
+          : 'text-base-content/70',
+    chipClass:
+      reason.tone === 'threat'
+        ? 'badge-error'
+        : reason.tone === 'precaution'
+          ? 'badge-warning'
+          : 'badge-ghost',
+    signals: visible.map(s => ({ label: s.label, raw: s.raw })),
+    collapsedCount,
+    verdict: (() => {
+      const v = verdictPresentation(evidence.verdict)
+      if (!v) return null
+      return {
+        label: v.label,
+        badgeClass: v.tone === 'danger' ? 'badge-error' : v.tone === 'warning' ? 'badge-warning' : 'badge-ghost',
+      }
+    })(),
   }
+}
+
+// Parsed once per visible page rather than on every template access.
+const holdEvidenceByKey = computed(() => {
+  const map = new Map<string, CompactHoldEvidence>()
+  for (const tool of paginatedTools.value) {
+    const evidence = buildHoldEvidence(tool)
+    if (evidence) map.set(toolKey(tool), evidence)
+  }
+  return map
+})
+
+function holdEvidenceFor(tool: GlobalTool): CompactHoldEvidence | undefined {
+  return holdEvidenceByKey.value.get(toolKey(tool))
+}
+
+// ---- Computed: filtering ----
+// The population the search runs against: every filter EXCEPT the search box.
+// Split out so the empty state can name a scope that is literally true even when
+// a stat card or dropdown is also narrowing the list. All the filters are ANDed,
+// so pulling the search to the end leaves the result identical.
+const searchScope = computed(() => {
+  let tools = allTools.value
 
   if (filterServer.value) {
     tools = tools.filter(t => t.server_name === filterServer.value)
@@ -762,6 +936,33 @@ const filteredTools = computed(() => {
 
   return tools
 })
+
+const filteredTools = computed(() => {
+  // Audit F11: the whole query used to have to appear as one contiguous
+  // substring of a single field, so "context7 documentation" matched nothing
+  // while "documentation" matched it. Match each whitespace-separated term
+  // independently instead (AND across terms, OR across fields). This is a strict
+  // superset of the old behaviour -- if the whole query was a substring of a
+  // field, so is every one of its terms -- so no result that matched before can
+  // disappear. Still a substring filter, not BM25: this page is an inventory,
+  // and the ranked index search is a separate surface.
+  if (!searchQuery.value) return searchScope.value
+
+  const terms = searchQuery.value.toLowerCase().split(/\s+/).filter(Boolean)
+  return searchScope.value.filter(t => {
+    const name = t.name.toLowerCase()
+    const description = (t.description || '').toLowerCase()
+    const server = t.server_name.toLowerCase()
+    return terms.every(term =>
+      name.includes(term) || description.includes(term) || server.includes(term)
+    )
+  })
+})
+
+// Scope actually covered by the search, for the empty state.
+const searchScopeServerCount = computed(
+  () => new Set(searchScope.value.map(t => t.server_name)).size
+)
 
 // ---- Computed: sorting ----
 const sortedTools = computed(() => {
@@ -864,7 +1065,7 @@ function formatRelativeTime(ts: string): string {
   if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`
   if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h ago`
   if (diff < 30 * 86_400_000) return `${Math.floor(diff / 86_400_000)}d ago`
-  return new Date(ts).toLocaleDateString()
+  return formatDate(ts)
 }
 
 // Reset page when filters/sort change
@@ -904,6 +1105,25 @@ const toolsHints = computed<Hint[]>(() => [
 
 // ---- Lifecycle ----
 onMounted(() => {
+  // Tools is the canonical search surface (audit F20): the header box and the
+  // retired /search route both arrive here with ?q=, so the query has to
+  // prefill the filter rather than being silently dropped.
+  applyQueryParam()
   loadTools()
 })
+
+// A second search from the header while Tools is already open is a route query
+// change, not a remount — without this watch the box would appear to do nothing.
+watch(
+  () => route?.query.q,
+  () => applyQueryParam()
+)
+
+function applyQueryParam() {
+  const q = route?.query.q
+  if (typeof q === 'string' && q !== searchQuery.value) {
+    searchQuery.value = q
+    currentPage.value = 1
+  }
+}
 </script>

@@ -166,18 +166,79 @@ func ConfigPath(clientID, homeDir string) string {
 		return filepath.Join(homeDir, ".gemini", "settings.json")
 
 	case "opencode":
-		if runtime.GOOS == "windows" {
-			localAppData := os.Getenv("LOCALAPPDATA")
-			if localAppData == "" {
-				localAppData = filepath.Join(homeDir, "AppData", "Local")
-			}
-			return filepath.Join(localAppData, "opencode", "opencode.json")
-		}
-		return filepath.Join(homeDir, ".config", "opencode", "opencode.json")
+		return filepath.Join(opencodeConfigDir(homeDir), "opencode.json")
 
 	default:
 		return ""
 	}
+}
+
+// opencodeConfigDir returns OpenCode's global config directory.
+func opencodeConfigDir(homeDir string) string {
+	if runtime.GOOS == "windows" {
+		localAppData := os.Getenv("LOCALAPPDATA")
+		if localAppData == "" {
+			localAppData = filepath.Join(homeDir, "AppData", "Local")
+		}
+		return filepath.Join(localAppData, "opencode")
+	}
+	return filepath.Join(homeDir, ".config", "opencode")
+}
+
+// opencodeConfigCandidates lists the global config files OpenCode itself loads,
+// highest precedence first: opencode.jsonc shadows opencode.json for the same
+// keys, and recent OpenCode versions bootstrap the .jsonc variant (#922).
+//
+// An empty homeDir resolves through os.UserHomeDir, exactly like ConfigPath —
+// production Services are built without one (NewService), and joining "" would
+// yield CWD-relative candidates that stat against the wrong directory.
+func opencodeConfigCandidates(homeDir string) []string {
+	if homeDir == "" {
+		var err error
+		homeDir, err = os.UserHomeDir()
+		if err != nil {
+			return nil
+		}
+	}
+	dir := opencodeConfigDir(homeDir)
+	return []string{
+		filepath.Join(dir, "opencode.jsonc"),
+		filepath.Join(dir, "opencode.json"),
+	}
+}
+
+// configPath resolves the config file a client operation should target. For
+// OpenCode it prefers the candidate that actually exists — writing next to an
+// existing .jsonc would be silently shadowed by it — falling back to the static
+// ConfigPath default (opencode.json) for the create-new case. Stat-only: no
+// config content is read (Spec 075 FR-001).
+func (s *Service) configPath(clientID string) string {
+	if clientID == "opencode" {
+		for _, p := range opencodeConfigCandidates(s.homeDir) {
+			// A candidate we cannot stat counts as PRESENT: the only reason to
+			// prefer .jsonc is that it shadows .json, and skipping an
+			// unstattable one would silently target the shadowed file, where
+			// the write has no effect. Targeting it instead surfaces the real
+			// permission error on the read that follows.
+			if _, err := s.stat(p); err == nil || !os.IsNotExist(err) {
+				return p
+			}
+		}
+	}
+	return ConfigPath(clientID, s.homeDir)
+}
+
+// checkedPaths lists the config files the existence check consults for a
+// client, highest precedence first — the paths a "no config found" UI should
+// name. Static: no stat calls, so it is safe on the content-read-free path.
+func (s *Service) checkedPaths(clientID string) []string {
+	if clientID == "opencode" {
+		return opencodeConfigCandidates(s.homeDir)
+	}
+	if p := ConfigPath(clientID, s.homeDir); p != "" {
+		return []string{p}
+	}
+	return nil
 }
 
 // buildServerEntry returns the JSON/TOML-serializable map inserted into the

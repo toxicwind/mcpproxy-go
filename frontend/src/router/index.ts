@@ -1,4 +1,4 @@
-import { createRouter, createWebHistory } from 'vue-router'
+import { createRouter, createWebHistory, type NavigationGuard } from 'vue-router'
 import Dashboard from '@/views/Dashboard.vue'
 
 const router = createRouter({
@@ -12,12 +12,37 @@ const router = createRouter({
       meta: { title: 'Sign In', public: true },
     },
     // Existing routes (admin/personal)
+    //
+    // The landing page (`/`) opens the Dashboard on its Usage (analytics)
+    // panel — that is the "analytics dashboard as default landing page"
+    // behaviour. `/usage` and `/overview` render the same Dashboard component
+    // so each panel is deep-linkable and survives a reload; `meta.dashboardView`
+    // is what the component reads to pick the active panel.
     {
       path: '/',
       name: 'dashboard',
       component: Dashboard,
       meta: {
         title: 'Dashboard',
+        dashboardView: 'usage',
+      },
+    },
+    {
+      path: '/usage',
+      name: 'usage',
+      component: Dashboard,
+      meta: {
+        title: 'Usage Analytics',
+        dashboardView: 'usage',
+      },
+    },
+    {
+      path: '/overview',
+      name: 'dashboard-overview',
+      component: Dashboard,
+      meta: {
+        title: 'Overview',
+        dashboardView: 'overview',
       },
     },
     {
@@ -45,13 +70,14 @@ const router = createRouter({
         title: 'Repositories',
       },
     },
+    // `/search` used to be a third, sidebar-less search surface duplicating the
+    // header box and the Tools page (audit F20). Tools is the canonical one —
+    // it is in the sidebar, it lists what it searches, and it can act on the
+    // results — so the orphan route now folds into it, carrying `?q=` across so
+    // old links and bookmarks still land on their query.
     {
       path: '/search',
-      name: 'search',
-      component: () => import('@/views/Search.vue'),
-      meta: {
-        title: 'Search',
-      },
+      redirect: (to) => ({ path: '/tools', query: to.query, hash: to.hash }),
     },
     {
       path: '/settings',
@@ -182,13 +208,20 @@ const router = createRouter({
   ],
 })
 
-// Auth guard
-router.beforeEach(async (to) => {
+// Auth guard. Exported so tests can mount it on a memory-history router with
+// stub views and replay a hard reload (App.vue's mount-time checkAuth racing
+// the initial navigation) without importing every lazy view.
+export const authGuard: NavigationGuard = async (to) => {
   const { useAuthStore } = await import('@/stores/auth')
   const authStore = useAuthStore()
 
-  // Initialize auth state on first navigation
-  if (authStore.loading) {
+  // Initialize auth state on first navigation. checkAuth() shares one
+  // in-flight probe, so if App.vue already started it this joins that run
+  // rather than issuing a second /status + /auth/me pair. Loop, not `if`: a
+  // `fresh` probe (reloadAfterAuth) queued behind the run we joined leaves
+  // `loading` true after our await, and the routing decision below must be
+  // made from the newest settled result, never the superseded one.
+  while (authStore.loading) {
     await authStore.checkAuth()
   }
 
@@ -229,6 +262,8 @@ router.beforeEach(async (to) => {
   if (title) {
     document.title = `${title} - MCPProxy Control Panel`
   }
-})
+}
+
+router.beforeEach(authGuard)
 
 export default router

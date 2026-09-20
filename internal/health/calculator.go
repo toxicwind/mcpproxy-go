@@ -40,6 +40,14 @@ type HealthCalculatorInput struct {
 	Connected bool
 	LastError string
 
+	// HasEndpointURL reports whether this server is addressed by a configured
+	// URL (an HTTP/SSE server) rather than by a spawned command (stdio). It
+	// gates ActionEditURL: a stdio server can perfectly well emit "no such
+	// host" — an npx/uvx install failing to reach its package registry does
+	// exactly that — and offering "Edit URL" for it would point the user at a
+	// field that does not exist.
+	HasEndpointURL bool
+
 	// OAuth state (only for OAuth-enabled servers)
 	OAuthRequired   bool
 	OAuthStatus     string     // "authenticated", "expired", "error", "none"
@@ -61,6 +69,20 @@ type HealthCalculatorInput struct {
 
 	// Tool info
 	ToolCount int
+
+	// RetryStopped reports that automatic reconnection has been permanently
+	// given up because the classifier proved the failure deterministic (GH
+	// #1145). It is checked ahead of the generic connection-state branches: a
+	// parked server IS in "error", but reporting it as an ordinary error hides
+	// the one thing the user needs to know — that nothing will retry on its own.
+	RetryStopped bool
+	// RetryStoppedCode is the stable MCPX_* code that justified stopping.
+	RetryStoppedCode string
+	// RetryStoppedReason is the human-readable cause from the diagnostics catalog.
+	RetryStoppedReason string
+	// RetryCount is the number of consecutive failed connection attempts, used
+	// only to say how many were made before giving up.
+	RetryCount int
 
 	// Refresh state (for health status integration - Spec 023)
 	RefreshState       RefreshState // Current refresh state from RefreshManager
@@ -102,12 +124,36 @@ func CalculateHealth(input HealthCalculatorInput, cfg *HealthCalculatorConfig) *
 	}
 
 	if input.Quarantined {
-		return &contracts.HealthStatus{
+		status := &contracts.HealthStatus{
 			Level:      LevelHealthy, // Quarantined is intentional, not broken
 			AdminState: StateQuarantined,
 			Summary:    "Quarantined for review",
 			Action:     ActionApprove,
 		}
+		// ...but a quarantined server that cannot START is broken, and this
+		// early return used to discard that. Being disconnected is NOT the
+		// signal: the supervisor deliberately disconnects a quarantined server
+		// and refuses to dial it (ActionDisconnect on
+		// `Quarantined && !IsInspectionExempted`), so `connected: false` is the
+		// designed state. A transport FAULT is different — the scanner dials
+		// quarantined servers under an inspection exemption, so a missing
+		// binary or a dead host is genuinely observable.
+		//
+		// Observed live: a quarantined stdio server pointed at a nonexistent
+		// command reported state="error" with a full spawn failure, while this
+		// function answered healthy/approve. Approving it hands the user a
+		// second failure.
+		//
+		// The admin contract is unchanged — still quarantined, and approval is
+		// still the operator's next step — so the review flow and the tray's
+		// quarantine handling keep working. Only the level and the summary
+		// stop claiming the server is fine.
+		if strings.EqualFold(input.State, "error") && input.LastError != "" {
+			status.Level = LevelUnhealthy
+			status.Summary = "Quarantined — " + formatErrorSummary(input.LastError)
+			status.Detail = input.LastError
+		}
+		return status
 	}
 
 	// 2. Missing secret check
@@ -132,6 +178,35 @@ func CalculateHealth(input HealthCalculatorInput, cfg *HealthCalculatorConfig) *
 		}
 	}
 
+	// 3b. Automatic reconnection permanently given up (GH #1145). Checked before
+	// the connection-state switch because a parked server sits in "error" and
+	// would otherwise render as a generic "Connection error" that looks like it
+	// is still retrying. Restart is the correct CTA: once the config is fixed it
+	// is the explicit user action that un-parks the server.
+	if input.RetryStopped {
+		summary := input.RetryStoppedReason
+		if summary == "" {
+			summary = formatErrorSummary(input.LastError)
+		}
+		detail := fmt.Sprintf("Automatic reconnection stopped after %s because this failure cannot be fixed by retrying.",
+			pluralAttempts(input.RetryCount))
+		if input.RetryStoppedCode != "" {
+			// The stable code is what the user pastes into a bug report and what
+			// docs.mcpproxy.app/errors/<CODE> is keyed on.
+			detail += " Diagnostic code: " + input.RetryStoppedCode + "."
+		}
+		if input.LastError != "" {
+			detail += " Last error: " + input.LastError
+		}
+		return &contracts.HealthStatus{
+			Level:      LevelUnhealthy,
+			AdminState: StateEnabled,
+			Summary:    summary,
+			Detail:     detail,
+			Action:     ActionRestart,
+		}
+	}
+
 	// 4. Connection state checks
 	// Normalize state to lowercase for consistent matching
 	// (ConnectionState.String() returns "Error", "Disconnected", etc.)
@@ -142,6 +217,9 @@ func CalculateHealth(input HealthCalculatorInput, cfg *HealthCalculatorConfig) *
 		level := LevelUnhealthy
 		action := ActionRestart
 		summary := formatErrorSummary(input.LastError)
+		if input.HasEndpointURL && isEndpointAddressError(input.LastError) {
+			action = ActionEditURL
+		}
 		if input.OAuthRequired && isOAuthRelatedError(input.LastError) {
 			level, action, summary = oauthAttentionState(input.LastError)
 		}
@@ -158,11 +236,27 @@ func CalculateHealth(input HealthCalculatorInput, cfg *HealthCalculatorConfig) *
 		action := ActionRestart
 		if input.LastError != "" {
 			summary = formatErrorSummary(input.LastError)
+			if input.HasEndpointURL && isEndpointAddressError(input.LastError) {
+				action = ActionEditURL
+			}
 			// For OAuth-required servers with OAuth-related errors, suggest login
 			if input.OAuthRequired && isOAuthRelatedError(input.LastError) {
 				level, action, summary = oauthAttentionState(input.LastError)
 			}
 		}
+		return &contracts.HealthStatus{
+			Level:      level,
+			AdminState: StateEnabled,
+			Summary:    summary,
+			Detail:     input.LastError,
+			Action:     action,
+		}
+	case "pending auth", "pending_auth":
+		// Parked awaiting user login (#1013): the client stopped redialing on
+		// purpose, so this never "resolves on its own" — it is always an
+		// attention item with a Sign-in CTA, regardless of OAuthRequired (a
+		// header-auth server whose token expired is parked the same way).
+		level, action, summary := oauthAttentionState(input.LastError)
 		return &contracts.HealthStatus{
 			Level:      level,
 			AdminState: StateEnabled,
@@ -402,6 +496,36 @@ func formatRefreshRetryDetail(retryCount int, nextAttempt *time.Time, lastError 
 	return detail
 }
 
+// isEndpointAddressError reports whether a connection failure is caused by the
+// configured address itself rather than by a transient outage. DNS resolution
+// failures, unsupported/absent schemes and unparseable URLs cannot be fixed by
+// restarting the server — offering "Restart" for them sends the user in a loop
+// (audit F11). "connection refused" is deliberately NOT in this set: the host
+// resolved, so the address is plausibly right and the peer merely down.
+//
+// Callers MUST gate this behind HasEndpointURL: the same phrases appear in the
+// output of a stdio server's own failed network calls, and a stdio server has
+// no URL field to send the user to.
+func isEndpointAddressError(err string) bool {
+	if err == "" {
+		return false
+	}
+	addressPatterns := []string{
+		"no such host",
+		"unsupported protocol scheme",
+		"missing protocol scheme",
+		"invalid url",
+		"invalid uri",
+		"first path segment in url",
+	}
+	for _, pattern := range addressPatterns {
+		if stringutil.ContainsIgnoreCase(err, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
 // isOAuthRelatedError checks if the error message indicates an OAuth issue.
 // Connection errors take precedence — when a server is simply offline,
 // the mcp-go client wraps the connection error inside "authentication strategies failed",
@@ -578,4 +702,12 @@ func findChar(s string, ch byte) int {
 		}
 	}
 	return -1
+}
+
+// pluralAttempts renders the attempt count for the retry-stopped detail line.
+func pluralAttempts(n int) string {
+	if n == 1 {
+		return "1 attempt"
+	}
+	return fmt.Sprintf("%d attempts", n)
 }

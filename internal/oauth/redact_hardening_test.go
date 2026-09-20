@@ -188,6 +188,32 @@ func TestUnmaskHeaders_RestoresEchoedMask(t *testing.T) {
 	assert.Equal(t, "Bearer realtokenvalue123", got["Authorization"])
 }
 
+// The read path (RedactStringHeaders) and the write path (UnmaskHeaders via
+// maskedHeaderValue) must agree on which header names are sensitive. When the
+// read path masks a custom credential header but the write path does not
+// recognise its own mask, an unedited echo persists `••••ue (16 chars)` OVER the
+// real credential (PATCH /api/v1/servers/{id}, upstream_servers patch).
+func TestUnmaskHeaders_RestoresEchoedMask_CustomCredentialHeaders(t *testing.T) {
+	stored := map[string]string{
+		"X-Custom-Secret":     "supersecretvalue",
+		"X-Client-Credential": "clientcredvalue",
+		"access_token":        "accesstokenvalue",
+	}
+	masked := RedactStringHeaders(stored)
+	incoming := make(map[string]string, len(masked))
+	for k, v := range masked {
+		require.NotContains(t, v, stored[k], "read path must mask %q", k)
+		incoming[k] = v
+	}
+
+	got := UnmaskHeaders(incoming, stored)
+
+	for k, plaintext := range stored {
+		assert.Equal(t, plaintext, got[k],
+			"echoed mask for %q must round-trip back to the stored credential", k)
+	}
+}
+
 // --- Codex round 2 ---
 
 // FINDING 1 (round 2) — UnmaskURL must NOT move a stored secret onto a different
@@ -322,4 +348,40 @@ func TestUnmaskEnvValues_URLValue_HostEditDoesNotRestorePassword(t *testing.T) {
 	got := UnmaskEnvValues(incoming, stored)
 	assert.NotContains(t, got["DATABASE_URL"], "realdbpassword",
 		"password must not be moved to a different host")
+}
+
+// TestRedactURL_MasksUserinfoPassword covers issue #1148, round 4 (final
+// sweep). RedactURL is the regex fallback RedactURLQueryParams takes whenever
+// url.Parse fails — and a URL that fails to parse is exactly the URL a
+// connection error is being logged about. It masked the sensitive QUERY params
+// but had no `user:pass@` rule at all, so every logSafeURL() call site in
+// internal/upstream/core, internal/upstream/managed and internal/transport
+// leaked the basic-auth password down that fallback path.
+//
+// RedactSensitiveData has masked userinfo since round 2 (urlUserinfoPattern);
+// this brings its sibling to the same contract. The username is kept, as
+// everywhere else: it says WHICH credential, and is not itself the secret.
+func TestRedactURL_MasksUserinfoPassword(t *testing.T) {
+	// The DEL byte is what makes url.Parse fail, which is how a real caller
+	// reaches this function through RedactURLQueryParams.
+	raw := "https://alice:hunter2phrase@host/mcp?token=urlsecret999&debug=1\x7f"
+
+	for name, got := range map[string]string{
+		"RedactURL":            RedactURL(raw),
+		"RedactURLQueryParams": RedactURLQueryParams(raw),
+	} {
+		assert.NotContains(t, got, "hunter2phrase", "%s must mask the userinfo password", name)
+		assert.NotContains(t, got, "urlsecret999", "%s must mask the query credential", name)
+		assert.Contains(t, got, "alice", "%s must keep the username", name)
+		assert.Contains(t, got, "host/mcp", "%s must keep host and path", name)
+		assert.Contains(t, got, "debug=1", "%s must keep non-sensitive parameters", name)
+	}
+
+	// A ${keyring:…}/${env:…} reference is a label, not a secret — same carve-out
+	// RedactSensitiveData makes.
+	ref := RedactURL("https://alice:${keyring:UPSTREAM_PW}@host/mcp\x7f")
+	assert.Contains(t, ref, "${keyring:UPSTREAM_PW}", "config references are labels, not secrets")
+
+	assert.Equal(t, "", RedactURL(""))
+	assert.Equal(t, "https://host/mcp", RedactURL("https://host/mcp"), "a clean URL is untouched")
 }

@@ -325,6 +325,256 @@ flip-gate metrics under `flip_gates` in `live_report.json` (FR-018):
 go run ./bench/cmd/bench -live -flip-gates -proxy http://127.0.0.1:8092 -api-key eval-corpus-snapshot
 ```
 
+## Real-workload replay + agent loop (Spec 103)
+
+Everything above scores a **frozen corpus**. Spec 103 adds the two entry points
+that score a **real workload**: a deterministic *replay* of recorded activity
+(no model spend, US1) and a live *agent loop* under a pinned model (US2). The
+replay entry point lands with US1; the agent loop is gated on an operator
+decision (pinned model + spend ceiling) and is tracked under "not yet built"
+below until that is made.
+
+Both cross the **five-cell mode matrix** — `retrieve_full`, `retrieve_compact`,
+`direct_full`, `direct_deferred`, `code_exec`. The three axes (routing mode ×
+response mode × schema detail) have twelve combinations, but only five are
+distinct behaviours; the other seven are configurable, redundant, and reported
+as skip rows naming the cell they collapse onto.
+
+### Replay — recompute a recorded workload (deterministic, no model spend)
+
+**1. Export a real workload**, from a machine that has been using mcpproxy for
+real work:
+
+```bash
+mcpproxy activity export --format json > ~/replay-corpus.jsonl
+```
+
+CSV is not a valid input: it drops `work_session_id`, the byte fields and the
+call arguments, so it can neither group units of work nor account tokens.
+
+**2. Recompute across the matrix. A fleet input is MANDATORY** — a menu cost is
+a property of the tool definitions the agent was shown, and the activity export
+carries no fleet snapshot. The recording contributes the *call shape* (sequence,
+tool mix, call counts); it does not contribute fleet size. A recording-only
+invocation is a **hard error, not a degraded run**.
+
+```bash
+# Frozen fleet (reproducible):
+go run ./bench/cmd/bench \
+  -replay ~/replay-corpus.jsonl \
+  -corpus-v2 specs/083-discovery-profiler/datasets/corpus_v2.tools.json \
+  -out bench/results
+
+# ...or read today's fleet from a live proxy instead:
+go run ./bench/cmd/bench -replay ~/replay-corpus.jsonl \
+  -proxy http://127.0.0.1:8092 -api-key "$KEY" -out bench/results
+```
+
+Either way the workload is scored against the **supplied** fleet, not the fleet
+as it stood when the session was recorded. That is internally valid across cells
+and is *not* a historical reconstruction — the report says so on every figure.
+
+**3. Bodies-off is the DEFAULT, and it decides which figures exist.** The export
+path does not mask (masking is wired into the list and detail handlers only), so
+a bodies-on export is raw and unmasked by design. Bodies-on is therefore a
+separate, explicit opt-in that prints a warning, and content is tokenized inside
+the loader — only counts cross the boundary, never text.
+
+| | bodies-off (default) | bodies-on (opt-in) |
+|---|---|---|
+| Menu cost, all five cells | **measured** (from the fleet input) | measured |
+| Absolute complete-workload cost | **unavailable for every cell** — reported unavailable, never as zero | measurable where bodies survive |
+| `direct_full` vs `direct_deferred` delta | **measured** — their call responses are identical and cancel | measured |
+| `retrieve_full` / `retrieve_compact` / `code_exec` deltas | unavailable — the mode changes the response body itself | measured |
+| Response cost generally | `estimated` at best (`request_bytes`/`response_bytes` are **byte lengths**, not token counts) | measured |
+
+**4. Read the exclusion report before the headline.** Truncated,
+bodies-missing, sensitive and unreplayable records are each detected and
+**counted**; a truncated record never contributes silently. A corpus that is 80%
+truncated yields a real number over a small slice, and the report says so.
+Two caveats worth internalizing: `has_sensitive_data` is derived from detection
+metadata added *asynchronously* after persistence, so exclude-by-flag is a
+best-effort reducer and never a guarantee; and the activity log stores the FULL
+pre-truncation `retrieve_tools` response while the agent consumed truncated
+text, so a truncated record tokenized as-is **overstates** cost.
+
+**5. Verify determinism** (SC-002) — two runs are byte-identical once the
+wall-clock stamp is removed:
+
+```bash
+CORPUS=specs/083-discovery-profiler/datasets/corpus_v2.tools.json
+go run ./bench/cmd/bench -replay ~/replay-corpus.jsonl -corpus-v2 $CORPUS -out /tmp/run-a
+go run ./bench/cmd/bench -replay ~/replay-corpus.jsonl -corpus-v2 $CORPUS -out /tmp/run-b
+diff <(jq 'del(.generated_at)' /tmp/run-a/report.json) \
+     <(jq 'del(.generated_at)' /tmp/run-b/report.json) \
+  && echo "byte-identical modulo generated_at (SC-002)"
+```
+
+**6. Delete the input when you are finished.**
+
+```bash
+rm -f ~/replay-corpus.jsonl
+```
+
+A replay input is raw user traffic. Keep it **outside the repository**, never
+commit it, and delete it when the run is done — it is gitignored nowhere
+precisely because it should never be inside the repo in the first place.
+
+### Agent loop — tokens per *completed* task (costs model spend)
+
+The replay half is a **counterfactual** over recorded traffic: what the same
+call shape would have cost per cell. It is not observed agent behaviour, and no
+replay figure may be published without that label. The agent loop is the half
+that observes behaviour, and it is the only part that costs spend.
+
+- **One instance, whole matrix.** All three routing-mode servers are mounted at
+  startup, so a cell is selected by **endpoint URL**; only the two serialization
+  axes need config, and both hot-reload. Enable code execution if `code_exec` is
+  in scope — without it that cell is degenerate and is skipped with a reason.
+- **Stand up the full fleet**, even when running one service's tasks. A single
+  server's toolset is too small a fleet for proxy modes to differ from baseline,
+  and the full fleet is also the honest **baseline arm**: same agent, same
+  tasks, all tools loaded directly.
+- **k ≥ 4 runs per cell.** A single agentic run is noise; every
+  model-dependent figure is an average over at least four runs with its spread,
+  or it is not a headline.
+- **Four figures per cell**: tokens per completed task, completion rate,
+  first-attempt success and retry rate. The retry classification rule
+  (corrective vs infrastructure) must be applied **identically to the baseline
+  arm and the proxy arms**, or the comparison is biased toward whichever arm
+  carries richer error signal.
+- **Accounting sources are never summed.** Deterministic figures come from the
+  local tiktoken estimator; live figures come from provider-reported usage. A
+  cross-source aggregate is withheld with a stated reason instead — and a mode
+  that costs less while completing less is marked a **regression**, whatever its
+  token figure says.
+
+### Offline prerequisite (both halves)
+
+`tiktoken` downloads its vocabulary on first use unless the cache directory is
+both named **and populated**:
+
+```bash
+export TIKTOKEN_CACHE_DIR="$HOME/.cache/tiktoken"
+go run ./bench/cmd/bench -corpus-v2 specs/083-discovery-profiler/datasets/corpus_v2.tools.json \
+  -out /tmp/warm   # warms the cache; needs network exactly once
+```
+
+Setting the variable only *names* a cache; it does not fill one. A genuinely
+offline reproduction needs the cache pre-populated — warm it once with network
+access, or restore a known-good copy (which is what `.github/workflows/bench.yml`
+does via its `actions/cache` step).
+
+### Reproducing a published figure (SC-004)
+
+Someone with no prior context reproduces the deterministic figures **exactly**,
+and the model-dependent ones within the stated numeric tolerance (FR-022 — see
+the tokenizer caveat under "Known limitations"), by following these steps and
+nothing else.
+
+**1. Populate the tokenizer cache. Naming it is not filling it.**
+
+```bash
+export TIKTOKEN_CACHE_DIR="$HOME/.cache/tiktoken"
+go run ./bench/cmd/bench \
+  -corpus-v2 specs/083-discovery-profiler/datasets/corpus_v2.tools.json \
+  -out /tmp/warm             # downloads the vocabulary once — needs network
+ls "$TIKTOKEN_CACHE_DIR"     # non-empty ⇒ every later run is genuinely offline
+```
+
+`TIKTOKEN_CACHE_DIR` only *names* a directory. A first run with the variable set
+and the directory empty still reaches the network, so a machine "configured for
+offline" but never warmed fails at the first token count rather than at
+configuration time — and it fails the same way on an air-gapped reviewer's
+laptop as it does in a network-restricted CI job. Warm it once with network
+access, or restore a known-good copy (which is what `.github/workflows/bench.yml`
+does via its `actions/cache` step).
+
+**2. Supply a fleet input. There is no default, and there is no fallback.**
+
+A menu cost is a property of the tool definitions the agent was shown. A
+recording carries the *call shape* — sequence, tool mix, call counts — and no
+fleet snapshot whatsoever, so a recording-only invocation has nothing to price:
+
+```bash
+go run ./bench/cmd/bench -replay ~/replay-corpus.jsonl -out bench/results
+# bench: replay requires a fleet input as well as a recording: a menu is a
+# property of the tool definitions and the activity export carries no fleet
+# snapshot, so a recording on its own computes nothing — pass a frozen corpus
+# or a live-proxy catalog (this is an error, not a degraded run)
+# exit status 1
+```
+
+That is a **hard error, not a degraded run**. The alternative — quietly scoring
+against an empty or assumed fleet — would produce a plausible-looking number
+with no fleet shape behind it, which is exactly the failure every percentage in
+this report carries a `fleet_shape` to prevent. Pass the frozen corpus for a
+reproducible figure, or a live `-proxy` for today's fleet.
+
+**3. Run the pinned command, twice.** The deterministic half is byte-identical
+across runs once the wall-clock stamp is removed — the `diff` recipe under
+"Verify determinism" above is the check, and it is what SC-002 means. If two
+runs on the same machine differ by anything other than `generated_at`, stop:
+nothing downstream is worth comparing yet.
+
+**4. Read the three honesty marks before quoting anything.** They are fields in
+`report.json`, not prose in this file, because a report travels without its
+README:
+
+| Field | Says | If it is missing |
+|-------|------|------------------|
+| `run_status.completeness` | `complete`, or `partial` with a reason and the unmeasured cells named | Undeclared completeness — the run is **not publishable** as a complete comparison (FR-032) |
+| `<block>.inputs.independently_reproducible` | whether an outsider can obtain the inputs at all | Undeclared availability — treated as **not** reproducible, and blocks publication (FR-030) |
+| `<block>.records` | where this block's raw per-run records sit, as a path relative to the run directory | No `records` key at all blocks publication; `retention: not_retained` does not — the figure is real, just no longer traceable to its inputs (FR-029) |
+
+`bench.ReportV2.PublicationCheck()` applies all three and returns blockers plus
+caveats. A partial run blocks. An undeclared input blocks. A report in which
+*every* block rests on a private recording blocks — see step 5.
+
+**5. Know what you cannot reproduce.** A replay run over someone's own exported
+activity is scored from **private recorded sessions**: the recording is raw user
+traffic, it is never published (FR-006), and no procedure exists that would hand
+it to you. Such a block is marked `independently_reproducible: false` with the
+limitation stated in the document, and it may **never be the sole support for a
+published claim** — a report whose only figures come from one operator's
+recording is a claim nobody outside can check, however honestly each row is
+labelled. Publish it beside a block an outsider *can* reproduce (the committed
+corpora, or a pinned public task suite), and keep the caveat attached.
+
+**6. Raw records are run-local and not durable.** They are written under the
+gitignored `bench/results/` tree — the same tree SC-011 forbids committing and
+the same tree a cleanup empties. The report references them by a path relative
+to its own directory, never an absolute one: an absolute path would carry the
+operator's filesystem into a published document and would dangle on every other
+machine. Copy the run directory elsewhere before relying on those records; once
+they are gone the reference degrades to `records not retained` rather than
+pointing at nothing.
+
+Each mark is written by the run that produces the block: the replay entry point
+sets `replay.inputs` (`private-recording` for an operator's own export) and
+`replay.records`; the agent loop sets its own pair plus the report-level
+`run_status`, derived from the cells it planned against the cells it actually
+measured. `WriteJSON` re-checks every records reference against the directory it
+is writing into, so a reference cannot be published pointing at a file that is
+already gone.
+
+### Before publishing a replay or agent-loop number
+
+1. Recompute the achievable ceiling **for each fleet shape**; never carry a
+   previous fleet's ceiling forward.
+2. Quote the fleet shape beside every percentage.
+3. Confirm the run is not `partial`, and that no private-recording figure is
+   standing alone — `PublicationCheck()` answers both, and returns the caveats
+   that must travel with the number even when it publishes.
+4. Confirm no report is tracked:
+   ```bash
+   test -z "$(git ls-files bench/results)" && echo "clean (SC-011)"
+   ```
+   Use `git ls-files`, **not** `git status --porcelain` — porcelain does not
+   list ignored files and would stay silent about an already-tracked report.
+   `.github/workflows/bench-results-untracked.yml` runs this same assertion on
+   every pull request.
+
 ## What is scoped but not yet built (follow-ups)
 
 These require decisions and/or other roles, so they are tracked as child issues
@@ -434,3 +684,17 @@ headline numbers (image drift can change the tool corpus).
 
 Methodology questions / disputes: open an issue in `smart-mcp-proxy/mcpproxy-go`
 and tag the maintainers, or comment on the roadmap benchmark ticket (MCP-42).
+
+Warm it with the one-line command rather than by hand — the same step CI runs
+before its parallel test sweep:
+
+```bash
+export TIKTOKEN_CACHE_DIR="$HOME/.cache/tiktoken"
+go run ./bench/cmd/warmtiktoken
+```
+
+Why a dedicated step: `go test ./...` runs packages in parallel, and several
+test binaries race to download the same vocabulary into one cache dir. On
+Windows the loser fails its whole package on the atomic rename — it surfaced as
+`bench/arms` flaking with no code change near it. Naming the cache does not fix
+that; populating it first does.

@@ -11,7 +11,14 @@
     <div class="flex-1">
       <span>
         Update available: <span class="font-semibold">{{ latestVersion }}</span>
-        <template v-if="currentVersion"> — you are running {{ currentVersion }}</template>.
+        <template v-if="currentVersion"> — you are running {{ currentVersion }}</template
+        ><!-- Spec 079 FR-002: the "N releases / M weeks behind" delta. The
+             clause is rendered by the daemon (updatecheck.FormatBehindSummary)
+             and printed verbatim, so this banner cannot word it differently
+             from status/doctor/the tray — do not rebuild it from the numeric
+             fields. Absent when the delta could not be resolved or the daemon
+             predates it, and the sentence then reads exactly as before. -->
+        <template v-if="behindSummary">, <span data-test="update-banner-behind">{{ behindSummary }}</span></template>.
       </span>
       <a
         v-if="releaseUrl"
@@ -23,7 +30,11 @@
       >Release notes</a>
       <!-- Spec 079 US2 (FR-009): the exact one-line command for the detected
            install channel, copyable. Absent for channels without a safe
-           command (dmg/windows-installer/tarball/docker/unknown). -->
+           command (dmg/windows-installer/docker/unknown). Spec 092 FR-020
+           added `tarball` to the CHANNELS WITH a command (`mcpproxy update`),
+           so it is no longer in that list. Nothing here needed changing: the
+           branch keys off the presence of update_command, never the channel
+           name. -->
       <div v-if="updateCommand" class="mt-2 flex items-center gap-2">
         <code
           class="rounded bg-base-200 px-2 py-1 font-mono text-sm text-base-content"
@@ -42,7 +53,7 @@
         </button>
       </div>
       <!-- Guidance fallback for channels that intentionally have no safe
-           command (dmg/windows-installer/docker/tarball/unknown), mirroring
+           command (dmg/windows-installer/docker/unknown), mirroring
            internal/updatecheck.GuidanceLine so the Web UI matches the status/
            doctor surfaces (FR-009/FR-010). The Release notes link above is
            the deep link, so the text references it generically. -->
@@ -92,6 +103,8 @@ function readDismissedVersion(): string {
 const dismissedVersion = ref(readDismissedVersion())
 
 const latestVersion = computed(() => systemStore.latestVersion)
+// Spec 079 FR-002 — see the template comment; rendered, never re-derived.
+const behindSummary = computed(() => systemStore.updateBehindSummary)
 const currentVersion = computed(() => systemStore.version)
 const releaseUrl = computed(() => systemStore.info?.update?.release_url ?? '')
 // Spec 079 US2: channel-aware one-line update command (empty when the
@@ -115,7 +128,10 @@ const guidance = computed(() => {
       return 'Pull or rebuild the newer image for your deployment.'
     case '':
       return ''
-    default: // tarball, unknown, prerelease-suppressed command channels, …
+    // Spec 092: `tarball` carries `mcpproxy update` for stable AND prerelease
+    // offers alike, so it never reaches this switch — the `updateCommand`
+    // guard above returns first. Listing it here would be misleading.
+    default: // unknown, prerelease-suppressed command channels, …
       return 'Download the latest release from the releases page.'
   }
 })

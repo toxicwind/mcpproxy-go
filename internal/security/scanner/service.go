@@ -63,6 +63,18 @@ type EventEmitter interface {
 	// changed (e.g., background pull started/finished/failed) so the web UI
 	// can refresh its scanner list without polling.
 	EmitSecurityScannerChanged(scannerID, status, errMsg string)
+	// EmitSecurityScanTelemetry records ONE anonymous, counts-only sample for a
+	// terminal scan JOB. It is deliberately separate from the UI-facing
+	// EmitSecurityScanCompleted/EmitSecurityScanFailed events, which fire per
+	// SCANNER and per PASS and would therefore over-count: the unit measured
+	// here is "one non-deep-scan (Pass 1) scan job".
+	//
+	// Only the scanner package knows a job's pass and dry-run status, so the
+	// decision of whether a job counts lives here (scanCallbackAdapter) rather
+	// than in the emitter. Implementations must accept counts only:
+	// findingsBySeverity is severity -> count and carries no server name,
+	// scanner id, rule id, or free text.
+	EmitSecurityScanTelemetry(completed bool, findingsBySeverity map[string]int)
 }
 
 // NoopEmitter is a no-op implementation of EventEmitter
@@ -74,6 +86,7 @@ func (n *NoopEmitter) EmitSecurityScanCompleted(string, map[string]int)     {}
 func (n *NoopEmitter) EmitSecurityScanFailed(string, string, string)        {}
 func (n *NoopEmitter) EmitSecurityIntegrityAlert(string, string, string)    {}
 func (n *NoopEmitter) EmitSecurityScannerChanged(string, string, string)    {}
+func (n *NoopEmitter) EmitSecurityScanTelemetry(bool, map[string]int)       {}
 
 // ServerInfoProvider resolves server configuration for auto-source resolution
 type ServerInfoProvider interface {
@@ -132,23 +145,32 @@ type Service struct {
 	// resolver. Nil ⇒ fall back to the engine-wide default.
 	isolationModeResolver func(serverName string) string
 
-	// In-memory scan summary cache — avoids expensive BBolt reads per server
-	summaryCache   map[string]*ScanSummary
-	summaryCacheMu sync.RWMutex
+	// In-memory scan summary cache — avoids expensive BBolt reads per server.
+	//
+	// summaryCacheGen is a per-server invalidation counter. GetScanSummary
+	// computes a summary from BBolt OUTSIDE the cache lock, so a scan that
+	// starts mid-computation would otherwise have its invalidation overwritten
+	// by the in-flight reader storing the pre-scan summary — leaving a stale
+	// "clean" verdict cached for a server whose scan is running. The reader
+	// samples the generation on the cache miss and refuses to store if it moved.
+	summaryCache    map[string]*ScanSummary
+	summaryCacheGen map[string]uint64
+	summaryCacheMu  sync.RWMutex
 }
 
 // NewService creates a new SecurityService
 func NewService(storage Storage, registry *Registry, docker *DockerRunner, dataDir string, logger *zap.Logger) *Service {
 	engine := NewEngine(docker, registry, dataDir, logger)
 	svc := &Service{
-		storage:        storage,
-		engine:         engine,
-		registry:       registry,
-		docker:         docker,
-		sourceResolver: NewSourceResolver(logger),
-		queue:          NewScanQueue(logger),
-		summaryCache:   make(map[string]*ScanSummary),
-		logger:         logger,
+		storage:         storage,
+		engine:          engine,
+		registry:        registry,
+		docker:          docker,
+		sourceResolver:  NewSourceResolver(logger),
+		queue:           NewScanQueue(logger),
+		summaryCache:    make(map[string]*ScanSummary),
+		summaryCacheGen: make(map[string]uint64),
+		logger:          logger,
 	}
 	var noop EventEmitter = &NoopEmitter{}
 	svc.emitter.Store(&noop)
@@ -163,6 +185,13 @@ func NewService(storage Storage, registry *Registry, docker *DockerRunner, dataD
 // SetEmitter sets the event emitter for the service.
 func (s *Service) SetEmitter(emitter EventEmitter) {
 	s.emitter.Store(&emitter)
+}
+
+// SetInstanceID scopes this service's Docker container-ownership lookups to
+// the given mcpproxy instance ID (internal/upstream/core.GetInstanceID()).
+// See SourceResolver.instanceID for why this is injected rather than imported.
+func (s *Service) SetInstanceID(instanceID string) {
+	s.sourceResolver.SetInstanceID(instanceID)
 }
 
 // SetScannerDisableNoNewPrivileges controls whether scanner containers are
@@ -214,16 +243,14 @@ func (s *Service) SetDeepScan(enabled bool, scanners []string) {
 	if s.engine == nil {
 		return
 	}
-	s.engine.deepScanEnabled = enabled
+	var allow map[string]bool
 	if len(scanners) > 0 {
-		allow := make(map[string]bool, len(scanners))
+		allow = make(map[string]bool, len(scanners))
 		for _, id := range scanners {
 			allow[id] = true
 		}
-		s.engine.deepScanScanners = allow
-	} else {
-		s.engine.deepScanScanners = nil
 	}
+	s.engine.setDeepScan(enabled, allow)
 	// Spec 077 US3: published-package-source extraction is part of the opt-in
 	// deep-scan layer, so it must never run (and never cause network egress)
 	// while deep scan is off. Force the resolver's fetch fallback off here as
@@ -243,7 +270,7 @@ func (s *Service) SetDeepScan(enabled bool, scanners []string) {
 
 // deepScanEnabled reports whether the opt-in deep-scan layer is currently on.
 func (s *Service) deepScanEnabled() bool {
-	return s.engine != nil && s.engine.deepScanEnabled
+	return s.engine != nil && s.engine.deepScanIsEnabled()
 }
 
 // DeepScanEnabled reports whether the opt-in deep-scan layer is currently on.
@@ -263,6 +290,13 @@ func (s *Service) DeepScanEnabled() bool {
 // nil-safe, so a nil SecurityConfig forces the layer fully off (baseline-only).
 // Idempotent: safe to call on every config.reloaded event.
 func (s *Service) ApplySecurityConfig(sec *config.SecurityConfig) {
+	// Spec 086 FR-019: the offline TPA signature corpus location is
+	// configuration-driven (security.tpa_bundle_path / MCPPROXY_TPA_BUNDLE_PATH)
+	// and re-read here, which is what makes it hot-reloadable. An empty path
+	// means the corpus embedded in this build; a broken configured bundle keeps
+	// the previously active corpus and surfaces the reason via BundleStatus().
+	ConfigureBundle(sec.EffectiveTPABundlePath(), s.logger)
+
 	enabled := sec.IsDeepScanEnabled()
 	s.SetDeepScan(enabled, sec.DeepScanScanners())
 	s.SetScannerDisableNoNewPrivileges(sec.IsDisableNoNewPrivileges())
@@ -271,6 +305,14 @@ func (s *Service) ApplySecurityConfig(sec *config.SecurityConfig) {
 		fetchPref = *f
 	}
 	s.SetFetchPackageSource(enabled && fetchPref)
+}
+
+// BundleStatus reports the offline TPA signature corpus this process is
+// running (spec 086 FR-019). Exposed on the service so the REST/CLI surfaces
+// can answer "which signatures is my proxy running, and how old are they?"
+// without importing the loader internals (GH #938 finding 2).
+func (s *Service) BundleStatus() BundleInfo {
+	return BundleStatus()
 }
 
 // isBaselineScanner reports whether a scanner id belongs to the deterministic
@@ -449,11 +491,11 @@ func (s *Service) syncRegistryFromStorage() {
 		}
 
 		_ = s.registry.UpdateStatus(inst.ID, inst.Status)
-		// Also update configured env so the engine can pass it to containers
+		// Also update configured env so the engine can pass it to containers.
+		// Registry.Get hands back a copy, so this must go through the locked
+		// setter to actually land on the record the engine reads.
 		if inst.ConfiguredEnv != nil {
-			if reg, err := s.registry.Get(inst.ID); err == nil {
-				reg.ConfiguredEnv = inst.ConfiguredEnv
-			}
+			_ = s.registry.SetConfiguredEnv(inst.ID, inst.ConfiguredEnv)
 		}
 	}
 	s.logger.Info("Synced scanner registry from storage", zap.Int("count", len(installed)))
@@ -545,6 +587,8 @@ func (s *Service) InstallScanner(ctx context.Context, id string) error {
 
 	// Reuse any previously-stored configured env / image override so that
 	// toggling the scanner off and back on doesn't wipe the user's API keys.
+	// `scanner` is a copy of the registry record, so the reused values are
+	// written back through the locked setter for the engine to see them.
 	if existing, err := s.storage.GetScanner(id); err == nil && existing != nil {
 		if len(existing.ConfiguredEnv) > 0 {
 			scanner.ConfiguredEnv = existing.ConfiguredEnv
@@ -552,6 +596,7 @@ func (s *Service) InstallScanner(ctx context.Context, id string) error {
 		if existing.ImageOverride != "" {
 			scanner.ImageOverride = existing.ImageOverride
 		}
+		_ = s.registry.SetRuntimeConfig(id, scanner.ConfiguredEnv, scanner.ImageOverride)
 	}
 
 	// In-process scanners (e.g. tpa-descriptions) run in Go with no Docker
@@ -773,11 +818,9 @@ func (s *Service) ConfigureScanner(_ context.Context, id string, env map[string]
 	_ = s.registry.UpdateStatus(id, sc.Status)
 
 	// Also update the registry's ConfiguredEnv and ImageOverride so the engine
-	// picks up changes without requiring a restart
-	if reg, err := s.registry.Get(id); err == nil {
-		reg.ConfiguredEnv = sc.ConfiguredEnv
-		reg.ImageOverride = sc.ImageOverride
-	}
+	// picks up changes without requiring a restart. Both fields land in one
+	// locked update — a reader never sees the new env against the old image.
+	_ = s.registry.SetRuntimeConfig(id, sc.ConfiguredEnv, sc.ImageOverride)
 
 	s.emit().EmitSecurityScannerChanged(id, sc.Status, "")
 
@@ -816,6 +859,17 @@ type scanCallbackAdapter struct {
 	serverInfo *ServerInfo // Cached server info for pass 2 auto-start
 }
 
+// countsForTelemetry reports whether this job is the unit the anonymous
+// schema-v8 scanner counters measure: one real (non-dry-run) Pass-1 scan job.
+//
+// Pass 2 (the deep supply-chain audit auto-started after Pass 1) is excluded
+// deliberately — counting it would double the reported scan volume of exactly
+// the deep-scan cohort the counters exist to compare. Dry-run jobs are excluded
+// because they do not affect quarantine state and are not real scans.
+func (a *scanCallbackAdapter) countsForTelemetry(job *ScanJob) bool {
+	return job != nil && a.scanPass == ScanPassSecurityScan && !job.DryRun
+}
+
 func (a *scanCallbackAdapter) OnScanStarted(job *ScanJob) {
 	_ = a.service.storage.SaveScanJob(job)
 	a.service.emit().EmitSecurityScanStarted(job.ServerName, job.Scanners, job.ID)
@@ -851,6 +905,11 @@ func (a *scanCallbackAdapter) OnScanCompleted(job *ScanJob, reports []*ScanRepor
 		}
 	}
 	a.service.emit().EmitSecurityScanCompleted(job.ServerName, summary)
+	// Anonymous telemetry (schema v8): one sample per real Pass-1 job, NOT per
+	// scanner and NOT for the Pass-2 deep audit.
+	if a.countsForTelemetry(job) {
+		a.service.emit().EmitSecurityScanTelemetry(true, summary)
+	}
 	// Cleanup auto-resolved source directory
 	if a.cleanup != nil {
 		a.cleanup()
@@ -875,6 +934,13 @@ func (a *scanCallbackAdapter) OnScanFailed(job *ScanJob, err error) {
 	_ = a.service.storage.SaveScanJob(job)
 	// Invalidate cached summary
 	a.service.invalidateScanSummaryCache(job.ServerName)
+	// Anonymous telemetry (schema v8): a FAILED job counts once here. The
+	// per-scanner OnScannerFailed path must not record — a job with three
+	// failing scanners is still one failed scan, and a job that fails some
+	// scanners but still completes is a completion, not a failure.
+	if a.countsForTelemetry(job) {
+		a.service.emit().EmitSecurityScanTelemetry(false, nil)
+	}
 	// Cleanup auto-resolved source directory
 	if a.cleanup != nil {
 		a.cleanup()
@@ -954,6 +1020,7 @@ func (s *Service) StartScan(ctx context.Context, serverName string, dryRun bool,
 				scanCtx.SourcePath = resolved.ServerURL
 			}
 			scanCtx.ContainerID = resolved.ContainerID
+			scanCtx.ContainerOwner = resolved.ContainerOwner
 			// Docker-image servers (`docker run mcp/fetch`): the scan target is the
 			// image itself, not a source dir. Carry the reference so image-capable
 			// scanners (Trivy) run in image mode, and surface it in the context.
@@ -1097,6 +1164,16 @@ func (s *Service) StartScan(ctx context.Context, serverName string, dryRun bool,
 	}
 	job, err := s.engine.StartScan(ctx, req, callback)
 	if err != nil {
+		// The callback owns resolvedCleanup, but the engine only ever invokes
+		// the callback for a scan it ACCEPTED. Every rejection path here —
+		// "scan already in progress", scanner resolution failure, no scanners
+		// installed — returns before OnScanStarted, so the temp source
+		// directory prepared above would be orphaned on disk. Release it on the
+		// way out; the automatic baseline paths retry, and the concurrent-scan
+		// rejection is exactly what they hit when they race a manual scan.
+		if resolvedCleanup != nil {
+			resolvedCleanup()
+		}
 		return nil, err
 	}
 
@@ -1152,6 +1229,7 @@ func (s *Service) startPass2(serverName string, serverInfo *ServerInfo) {
 			scanCtx.SourcePath = resolved.ServerURL
 		}
 		scanCtx.ContainerID = resolved.ContainerID
+		scanCtx.ContainerOwner = resolved.ContainerOwner
 		// Docker-image servers: scan the image (Trivy image mode reports OS-package
 		// and bundled-dependency CVEs). No source dir to enrich or export tools into.
 		if resolved.ContainerImage != "" {
@@ -1789,17 +1867,36 @@ func (s *Service) GetOverview(ctx context.Context) (*SecurityOverview, error) {
 	overview := &SecurityOverview{}
 
 	// Count installed scanners. ScannersInstalled is the total number of
-	// scanners persisted in storage; ScannersEnabled is the subset the engine
-	// will actually run (status installed or configured). UI uses
-	// ScannersEnabled to decide whether to show scan-trigger buttons.
+	// scanners the proxy holds an install record for; ScannersEnabled is the
+	// subset the engine will actually run (status installed or configured). UI
+	// uses ScannersEnabled to decide whether to show scan-trigger buttons.
+	//
+	// Both counts have to include the in-process baseline scanner
+	// (tpa-descriptions), which is always installed+enabled and lives in the
+	// in-memory registry — nothing persists it to BBolt until a Docker scanner
+	// is installed. Counting storage alone reported 0/0 on a fresh install and
+	// hid the web UI's "Scan All Servers" button on exactly the installs that
+	// have never scanned anything.
+	seen := make(map[string]bool)
 	scanners, err := s.storage.ListScanners()
 	if err == nil {
 		overview.ScannersInstalled = len(scanners)
 		for _, sc := range scanners {
+			seen[sc.ID] = true
 			if sc.Status == ScannerStatusInstalled || sc.Status == ScannerStatusConfigured {
 				overview.ScannersEnabled++
 			}
 		}
+	}
+	// InProcessRunnableIDs resolves the predicate under the registry lock:
+	// List() returns the live *ScannerPlugin records that UpdateStatus mutates,
+	// so reading Status out here would race with a concurrent install/pull.
+	for _, id := range s.registry.InProcessRunnableIDs() {
+		if seen[id] {
+			continue
+		}
+		overview.ScannersInstalled++
+		overview.ScannersEnabled++
 	}
 
 	// Count scan jobs
@@ -1858,6 +1955,12 @@ func (s *Service) GetOverview(ctx context.Context) (*SecurityOverview, error) {
 	// Check Docker availability
 	overview.DockerAvailable = s.docker.IsDockerAvailable(ctx)
 
+	// Spec 086 FR-019 / GH #938: report the live TPA signature corpus so an
+	// operator can see which signatures are running, where they came from, and
+	// how fresh they are — including a failed configured-bundle load.
+	bundle := BundleStatus()
+	overview.SignatureBundle = &bundle
+
 	return overview, nil
 }
 
@@ -1887,6 +1990,11 @@ func (s *Service) GetScanSummary(ctx context.Context, serverName string) *ScanSu
 		s.summaryCacheMu.RUnlock()
 		return cached
 	}
+	// Sample the invalidation generation in the same critical section as the
+	// miss. Everything below reads BBolt with no lock held, so this is the
+	// token that lets cacheScanSummary tell "still current" from "a scan
+	// started while I was computing".
+	cacheGen := s.summaryCacheGen[serverName]
 	s.summaryCacheMu.RUnlock()
 
 	// Check for active scan (Pass 1 takes priority in status display)
@@ -1908,7 +2016,7 @@ func (s *Service) GetScanSummary(ctx context.Context, serverName string) *ScanSu
 		// Only cache the explicit "no scans found" sentinel — transient
 		// I/O errors must retry on the next call.
 		if errors.Is(err, errNoScans) {
-			s.cacheScanSummary(serverName, nil)
+			s.cacheScanSummary(serverName, nil, cacheGen)
 		}
 		return nil
 	}
@@ -1934,7 +2042,7 @@ func (s *Service) GetScanSummary(ctx context.Context, serverName string) *ScanSu
 	// Check if the primary job failed
 	if primaryJob.Status == ScanJobStatusFailed {
 		summary.Status = "failed"
-		s.cacheScanSummary(serverName, summary)
+		s.cacheScanSummary(serverName, summary, cacheGen)
 		return summary
 	}
 
@@ -1954,7 +2062,7 @@ func (s *Service) GetScanSummary(ctx context.Context, serverName string) *ScanSu
 		}
 		if summary.ScannersRun == 0 {
 			summary.Status = "failed"
-			s.cacheScanSummary(serverName, summary)
+			s.cacheScanSummary(serverName, summary, cacheGen)
 			return summary
 		}
 	}
@@ -1997,7 +2105,7 @@ func (s *Service) GetScanSummary(ctx context.Context, serverName string) *ScanSu
 				summary.Status = "failed"
 			}
 		}
-		s.cacheScanSummary(serverName, summary)
+		s.cacheScanSummary(serverName, summary, cacheGen)
 		return summary
 	}
 
@@ -2014,7 +2122,7 @@ func (s *Service) GetScanSummary(ctx context.Context, serverName string) *ScanSu
 	summary.Status = verdict
 
 	// Cache for fast subsequent reads
-	s.cacheScanSummary(serverName, summary)
+	s.cacheScanSummary(serverName, summary, cacheGen)
 	return summary
 }
 
@@ -2148,10 +2256,14 @@ type FindingCounts struct {
 }
 
 // invalidateScanSummaryCache removes a server's cached scan summary,
-// forcing the next GetScanSummary call to recompute from storage.
+// forcing the next GetScanSummary call to recompute from storage. It also bumps
+// the server's cache generation so any GetScanSummary already mid-flight — it
+// read BBolt before this scan existed — cannot store its now-stale result on
+// top of this invalidation.
 func (s *Service) invalidateScanSummaryCache(serverName string) {
 	s.summaryCacheMu.Lock()
 	delete(s.summaryCache, serverName)
+	s.summaryCacheGen[serverName]++
 	s.summaryCacheMu.Unlock()
 }
 
@@ -2159,10 +2271,21 @@ func (s *Service) invalidateScanSummaryCache(serverName string) {
 // is stored as a sentinel meaning "we already checked, this server has no
 // scans" — used by spec 047 to avoid re-scanning the BBolt scan-job bucket on
 // every poll for untouched servers.
-func (s *Service) cacheScanSummary(serverName string, summary *ScanSummary) {
+//
+// gen is the generation sampled when the caller missed the cache. If the server
+// was invalidated since (a scan started, progressed or finished while this
+// summary was being computed) the result describes a superseded state, so it is
+// dropped rather than published: a resurrected pre-scan summary would report a
+// stale "clean" verdict for a server that is being scanned right now, and
+// quarantine_security's scan_server/get_scan_report hand that verdict straight
+// to an agent.
+func (s *Service) cacheScanSummary(serverName string, summary *ScanSummary, gen uint64) {
 	s.summaryCacheMu.Lock()
+	defer s.summaryCacheMu.Unlock()
+	if s.summaryCacheGen[serverName] != gen {
+		return
+	}
 	s.summaryCache[serverName] = summary
-	s.summaryCacheMu.Unlock()
 }
 
 // waitForConnection polls IsConnected until the server connects or the timeout expires.

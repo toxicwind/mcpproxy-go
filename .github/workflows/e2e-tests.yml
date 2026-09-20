@@ -29,7 +29,7 @@ jobs:
         run: cd frontend && npm run build
 
       - name: Upload frontend artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: frontend-dist-e2e
           path: frontend/dist/
@@ -46,11 +46,11 @@ jobs:
     strategy:
       matrix:
         # On PRs: test only ubuntu-latest. On main/push: test all OSes.
-        # Go is pinned to "1.25" because go.mod requires go 1.25.5 — older
-        # toolchains can't build the module, and auto-downloading 1.25.x under
+        # Go is pinned to "1.26" because go.mod requires go 1.26.0 — older
+        # toolchains can't build the module, and auto-downloading 1.26.x under
         # setup-go's module cache collides ("tar: ... File exists").
         os: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu-latest"]') || fromJSON('["ubuntu-latest", "macos-latest", "windows-latest"]') }}
-        go-version: ["1.25"]
+        go-version: ["1.26"]
 
     steps:
       - name: Checkout code
@@ -95,8 +95,19 @@ jobs:
       - name: Run unit tests
         # -short skips the heavy property/timing tests (TestRapidQuarantine* etc.);
         # they run unguarded in the main-only stress-tests job below so coverage
-        # is preserved. Bumped to 4m for headroom under -race on slow runners.
-        run: go test -v -short -race -timeout 4m -skip "Binary|MCP|E2E|TestInfoEndpoint|TestGracefulShutdownNoPanic|TestSocketInfoEndpoint" ./internal/...
+        # is preserved.
+        #
+        # Timeout is 20m to match the Windows sweep in unit-tests.yml. It was
+        # 4m, which the windows-latest runner could not meet: internal/server
+        # took 240s and died at `panic: test timed out after 4m0s` — with a
+        # single test only 2s in, so cumulative slowness (Bleve index creation
+        # on the Windows filesystem), never a hang. That kept this job red on
+        # main from 2026-08-13 (issue #1034). The same signature returned at
+        # 10m on 2026-09-12 (a74a7cf0f: 449s one push, 600s+ the next, a 4s
+        # test in flight), so both budgets moved to 20m. Keep them in step;
+        # the same code timing out in one and passing in the other is the
+        # signature of this bug returning.
+        run: go test -v -short -race -timeout 20m -skip "Binary|MCP|E2E|TestInfoEndpoint|TestGracefulShutdownNoPanic|TestSocketInfoEndpoint" ./internal/...
 
       # Binary tests are too flaky in CI due to server startup timing issues
       # All Binary tests consistently timeout waiting for server to be ready
@@ -157,13 +168,13 @@ jobs:
           GO_TEST_TIMEOUT: 300s
 
       - name: Run E2E tests with race detector
-        if: matrix.os == 'ubuntu-latest' && matrix.go-version == '1.25'
+        if: matrix.os == 'ubuntu-latest' && matrix.go-version == '1.26'
         run: go test -v -race -timeout 10m ./internal/server -run TestE2E
         env:
           GO_TEST_TIMEOUT: 600s
 
       - name: Run Logging E2E tests with race detector
-        if: matrix.os == 'ubuntu-latest' && matrix.go-version == '1.25'
+        if: matrix.os == 'ubuntu-latest' && matrix.go-version == '1.26'
         run: go test -v -race -timeout 10m ./internal/logs -run TestE2E
         env:
           GO_TEST_TIMEOUT: 600s
@@ -183,7 +194,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
         with:
-          go-version: "1.25"
+          go-version: "1.26"
           cache: true
 
       - name: Download frontend artifact
@@ -279,7 +290,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
         with:
-          go-version: "1.25"
+          go-version: "1.26"
           cache: true
 
       - name: Download frontend artifact
@@ -440,7 +451,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
         with:
-          go-version: "1.25"
+          go-version: "1.26"
           cache: true
 
       - name: Download dependencies
@@ -467,7 +478,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
         with:
-          go-version: "1.25"
+          go-version: "1.26"
           cache: true
 
       - name: Download frontend artifact

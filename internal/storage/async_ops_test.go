@@ -118,8 +118,11 @@ func TestSaveServerSyncPreservesAllFields(t *testing.T) {
 	if record.Isolation == nil {
 		t.Fatal("Isolation config is nil - data loss detected!")
 	}
-	if record.Isolation.IsEnabled() != serverConfig.Isolation.IsEnabled() {
-		t.Errorf("Isolation.Enabled mismatch: got %v, want %v", record.Isolation.IsEnabled(), serverConfig.Isolation.IsEnabled())
+	// GH #1142: assert the tri-state POINTER, not a flattened bool — a nil
+	// (inherit) override that came back as an explicit false would otherwise
+	// pass unnoticed.
+	if !reflect.DeepEqual(record.Isolation.Enabled, serverConfig.Isolation.Enabled) {
+		t.Errorf("Isolation.Enabled mismatch: got %v, want %v", record.Isolation.Enabled, serverConfig.Isolation.Enabled)
 	}
 	// MCP-34.2: per-server isolation.mode must survive the BBolt round-trip.
 	if !reflect.DeepEqual(record.Isolation.Mode, serverConfig.Isolation.Mode) {
@@ -361,6 +364,19 @@ func TestSaveServerSyncFieldCoverage(t *testing.T) {
 		// UpstreamRecord so a REST/UI-set override survives a restart and a
 		// SaveConfiguration rebuild of the JSON server list.
 		"ToonOutput": true,
+		// Spec 093: per-server concurrency-limit overrides; round-tripped
+		// through UpstreamRecord so a REST/UI-set limit survives a restart and a
+		// SaveConfiguration rebuild of the JSON server list.
+		"MaxConcurrentRequests": true,
+		"QueueSize":             true,
+		"QueueTimeout":          true,
+		// Issue #937: unexported parse-time bit recording whether the JSON
+		// document carried a "quarantined" key. It describes the DOCUMENT that
+		// was parsed, not the server, so it is deliberately NOT persisted — a
+		// record read back from BBolt is not a config file and must not claim
+		// the operator stated anything.
+		"quarantineExplicitlySet": true,
+		"ExposePrompts":           true, // persisted to BBolt so the per-server override survives restarts
 	}
 
 	// Get all fields from ServerConfig
@@ -398,6 +414,10 @@ func TestSaveServerSyncFieldCoverage(t *testing.T) {
 		}
 		if fieldName == "AuthBroker" {
 			// Spec 074: server-edition JSON-config field, not persisted to BBolt
+			continue
+		}
+		if fieldName == "quarantineExplicitlySet" {
+			// Issue #937: parse-time-only bit, never persisted (see above)
 			continue
 		}
 		if !upstreamFields[fieldName] {

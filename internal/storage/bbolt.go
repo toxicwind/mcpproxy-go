@@ -87,6 +87,7 @@ func (b *BoltDB) initBuckets() error {
 			ToolStatsBucket,
 			ToolHashBucket,
 			ToolApprovalBucket,
+			PromptApprovalBucket,
 			OAuthTokenBucket,
 			MetaBucket,
 			ActivityRecordsBucket,
@@ -112,6 +113,14 @@ func (b *BoltDB) initBuckets() error {
 		// Idempotent; leaves auth sessions untouched, so nobody is logged out.
 		if err := migrateLegacySessions(tx); err != nil {
 			return fmt.Errorf("failed to migrate legacy sessions bucket: %w", err)
+		}
+
+		// Migration is a write path into the sessions bucket like any other, and
+		// it can move in an arbitrary number of records. Enforce the retention
+		// cap here so it is an invariant of an open database rather than
+		// something only CreateSession happens to maintain.
+		if err := enforceSessionRetentionOnOpen(tx, b.logger); err != nil {
+			return fmt.Errorf("failed to enforce session retention: %w", err)
 		}
 
 		// Backfill the scan-job index for databases created before MCP-2205.
@@ -192,7 +201,7 @@ func (b *BoltDB) GetUpstream(id string) (*UpstreamRecord, error) {
 		bucket := tx.Bucket([]byte(UpstreamsBucket))
 		data := bucket.Get([]byte(id))
 		if data == nil {
-			return fmt.Errorf("upstream not found")
+			return ErrUpstreamNotFound
 		}
 
 		record = &UpstreamRecord{}
@@ -363,6 +372,52 @@ func (b *BoltDB) SaveToolApproval(record *ToolApprovalRecord) error {
 	})
 }
 
+// StampToolApprovalsIdentityKeyed marks the named records of one server
+// identity-keyed (Spec 105 FR-009) in ONE update transaction, re-reading each
+// record INSIDE the transaction and stamping it only if it is still unstamped
+// and still does not Restricts() at write time. Used by the discovery
+// producer to end the legacy consults for a server's remaining pre-105
+// records after its first pass. The in-transaction re-read is what makes the
+// sweep safe against an operator write (SetToolEnabled / BlockTools) that
+// lands between the caller's listing and this stamp (astra r1 P4): a stale
+// listed copy is never written back, so the operator's Disabled=true is
+// neither discarded nor stamped over — only the IdentityKeyed bit is ever
+// touched. Returns the names actually stamped.
+func (b *BoltDB) StampToolApprovalsIdentityKeyed(serverName string, toolNames []string) ([]string, error) {
+	if len(toolNames) == 0 {
+		return nil, nil
+	}
+	var stamped []string
+	err := b.db.Update(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket([]byte(ToolApprovalBucket))
+		for _, name := range toolNames {
+			key := []byte(ToolApprovalKey(serverName, name))
+			data := bucket.Get(key)
+			if data == nil {
+				continue
+			}
+			record := &ToolApprovalRecord{}
+			if err := record.UnmarshalBinary(data); err != nil {
+				return err
+			}
+			if record.IdentityKeyed || record.Restricts() {
+				continue
+			}
+			record.IdentityKeyed = true
+			out, err := record.MarshalBinary()
+			if err != nil {
+				return err
+			}
+			if err := bucket.Put(key, out); err != nil {
+				return err
+			}
+			stamped = append(stamped, name)
+		}
+		return nil
+	})
+	return stamped, err
+}
+
 // GetToolApproval retrieves a tool approval record by server and tool name.
 // Returns ErrToolApprovalNotFound (wrapped so callers can use errors.Is) when
 // no record exists. Any other error indicates a real read failure (decode
@@ -383,6 +438,37 @@ func (b *BoltDB) GetToolApproval(serverName, toolName string) (*ToolApprovalReco
 	})
 
 	return record, err
+}
+
+// GetToolApprovals reads the approval records for several tools of ONE server
+// inside a single read transaction, so the result is a consistent snapshot: no
+// write can land between the individual key reads the way it can between
+// consecutive GetToolApproval calls. Tools without a record are simply absent
+// from the returned map (there is no ErrToolApprovalNotFound for a partial
+// miss); a decode failure on any key fails the whole read.
+func (b *BoltDB) GetToolApprovals(serverName string, toolNames ...string) (map[string]*ToolApprovalRecord, error) {
+	records := make(map[string]*ToolApprovalRecord, len(toolNames))
+
+	err := b.db.View(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket([]byte(ToolApprovalBucket))
+		for _, toolName := range toolNames {
+			data := bucket.Get([]byte(ToolApprovalKey(serverName, toolName)))
+			if data == nil {
+				continue
+			}
+			record := &ToolApprovalRecord{}
+			if err := record.UnmarshalBinary(data); err != nil {
+				return err
+			}
+			records[toolName] = record
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return records, nil
 }
 
 // ListToolApprovals returns all tool approval records for a server.
@@ -486,6 +572,95 @@ func (b *BoltDB) PruneToolApprovalsNotIn(keep map[string]bool) (int, error) {
 	return removed, err
 }
 
+// --- Prompt approval CRUD (spec 100, mirrors the tool approval ops 1:1) ---
+
+// SavePromptApproval upserts a prompt approval record.
+func (b *BoltDB) SavePromptApproval(record *PromptApprovalRecord) error {
+	return b.db.Update(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket([]byte(PromptApprovalBucket))
+		data, err := record.MarshalBinary()
+		if err != nil {
+			return err
+		}
+		return bucket.Put([]byte(record.Key()), data)
+	})
+}
+
+// GetPromptApproval retrieves a prompt approval record by server and prompt
+// name. Returns ErrPromptApprovalNotFound (wrapped) when no record exists; any
+// other error is a real read failure and MUST NOT be treated as "missing".
+func (b *BoltDB) GetPromptApproval(serverName, promptName string) (*PromptApprovalRecord, error) {
+	var record *PromptApprovalRecord
+	err := b.db.View(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket([]byte(PromptApprovalBucket))
+		key := PromptApprovalKey(serverName, promptName)
+		data := bucket.Get([]byte(key))
+		if data == nil {
+			return fmt.Errorf("%w: %s", ErrPromptApprovalNotFound, key)
+		}
+		record = &PromptApprovalRecord{}
+		return record.UnmarshalBinary(data)
+	})
+	return record, err
+}
+
+// ListPromptApprovals returns all prompt approval records for a server. If
+// serverName is empty, returns all records across all servers.
+func (b *BoltDB) ListPromptApprovals(serverName string) ([]*PromptApprovalRecord, error) {
+	var records []*PromptApprovalRecord
+	prefix := ""
+	if serverName != "" {
+		prefix = serverName + ":"
+	}
+	err := b.db.View(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket([]byte(PromptApprovalBucket))
+		return bucket.ForEach(func(k, v []byte) error {
+			if prefix != "" && !bytes.HasPrefix(k, []byte(prefix)) {
+				return nil
+			}
+			record := &PromptApprovalRecord{}
+			if err := record.UnmarshalBinary(v); err != nil {
+				return err
+			}
+			records = append(records, record)
+			return nil
+		})
+	})
+	return records, err
+}
+
+// DeletePromptApproval deletes a prompt approval record.
+func (b *BoltDB) DeletePromptApproval(serverName, promptName string) error {
+	return b.db.Update(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket([]byte(PromptApprovalBucket))
+		return bucket.Delete([]byte(PromptApprovalKey(serverName, promptName)))
+	})
+}
+
+// DeleteServerPromptApprovals deletes all prompt approval records for a server.
+func (b *BoltDB) DeleteServerPromptApprovals(serverName string) error {
+	prefix := serverName + ":"
+	return b.db.Update(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket([]byte(PromptApprovalBucket))
+		var keysToDelete [][]byte
+		err := bucket.ForEach(func(k, _ []byte) error {
+			if bytes.HasPrefix(k, []byte(prefix)) {
+				keysToDelete = append(keysToDelete, k)
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		for _, key := range keysToDelete {
+			if err := bucket.Delete(key); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
 // Generic operations
 
 // Backup creates a backup of the database
@@ -570,10 +745,13 @@ func (b *BoltDB) DeleteOAuthToken(serverName string) error {
 	})
 }
 
-// UpdateOAuthClientCredentials updates the client credentials (from DCR) and callback port on an existing token
-// This is called after successful Dynamic Client Registration to persist the obtained client_id/secret
-// and the callback port used for the redirect_uri (Spec 022: OAuth Redirect URI Port Persistence)
-func (b *BoltDB) UpdateOAuthClientCredentials(serverKey, clientID, clientSecret string, callbackPort int) error {
+// UpdateOAuthClientCredentials updates the client credentials (from DCR), callback port and the
+// exact redirect URI used, on an existing token record. This is called after successful Dynamic
+// Client Registration to persist the obtained client_id/secret, the callback port used for the
+// redirect_uri (Spec 022: OAuth Redirect URI Port Persistence), and the redirect URI itself so a
+// later change to `oauth.redirect_uri` that keeps the same port but changes the path (issue #1304)
+// can still be detected as stale (comparing port alone would miss it).
+func (b *BoltDB) UpdateOAuthClientCredentials(serverKey, clientID, clientSecret string, callbackPort int, redirectURI string) error {
 	return b.db.Update(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket([]byte(OAuthTokenBucket))
 		data := bucket.Get([]byte(serverKey))
@@ -588,6 +766,7 @@ func (b *BoltDB) UpdateOAuthClientCredentials(serverKey, clientID, clientSecret 
 			record.ClientID = clientID
 			record.ClientSecret = clientSecret
 			record.CallbackPort = callbackPort
+			record.RedirectURI = redirectURI
 			record.Updated = time.Now()
 		} else {
 			// Create minimal record with just client credentials
@@ -597,6 +776,7 @@ func (b *BoltDB) UpdateOAuthClientCredentials(serverKey, clientID, clientSecret 
 				ClientID:     clientID,
 				ClientSecret: clientSecret,
 				CallbackPort: callbackPort,
+				RedirectURI:  redirectURI,
 				Created:      time.Now(),
 				Updated:      time.Now(),
 			}
@@ -610,9 +790,10 @@ func (b *BoltDB) UpdateOAuthClientCredentials(serverKey, clientID, clientSecret 
 	})
 }
 
-// GetOAuthClientCredentials retrieves the client credentials and callback port for token refresh
-// callbackPort returns 0 if not stored (legacy records or fresh records without DCR)
-func (b *BoltDB) GetOAuthClientCredentials(serverKey string) (clientID, clientSecret string, callbackPort int, err error) {
+// GetOAuthClientCredentials retrieves the client credentials, callback port and redirect URI for
+// token refresh. callbackPort returns 0 and redirectURI returns "" if not stored (legacy records
+// or fresh records without DCR).
+func (b *BoltDB) GetOAuthClientCredentials(serverKey string) (clientID, clientSecret string, callbackPort int, redirectURI string, err error) {
 	err = b.db.View(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket([]byte(OAuthTokenBucket))
 		data := bucket.Get([]byte(serverKey))
@@ -627,6 +808,7 @@ func (b *BoltDB) GetOAuthClientCredentials(serverKey string) (clientID, clientSe
 		clientID = record.ClientID
 		clientSecret = record.ClientSecret
 		callbackPort = record.CallbackPort
+		redirectURI = record.RedirectURI
 		return nil
 	})
 	return

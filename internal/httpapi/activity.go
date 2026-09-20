@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/contracts"
 	internalRuntime "github.com/smart-mcp-proxy/mcpproxy-go/internal/runtime"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/security"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/storage"
 )
 
@@ -88,8 +90,16 @@ func parseActivityFilters(r *http.Request) storage.ActivityFilter {
 		filter.RequestID = requestID
 	}
 
-	// Include call_tool_* internal tool calls (default: exclude successful ones)
-	// Set include_call_tool=true to show all internal tool calls including successful call_tool_*
+	// Parent ID filter: the sub-calls one code_execution issued. Navigation is
+	// symmetric — parent→children is ?parent_id=<parent request_id>, and
+	// child→parent is ?request_id=<child parent_id>.
+	if parentID := q.Get("parent_id"); parentID != "" {
+		filter.ParentID = parentID
+	}
+
+	// Include call_tool_* internal tool calls (default: exclude the ones a
+	// tool_call record already covers — successful and concurrency-rejected).
+	// Set include_call_tool=true to show every internal tool call.
 	if q.Get("include_call_tool") == "true" {
 		filter.ExcludeCallToolSuccess = false
 	}
@@ -120,20 +130,41 @@ func parseActivityFilters(r *http.Request) storage.ActivityFilter {
 	return filter
 }
 
+// applyActivityScope stamps the caller's server entitlement onto a filter
+// (#1166 follow-up, G2).
+//
+// The activity log is the widest read door on the mux: it carries tool-call
+// ARGUMENTS and RESPONSES for every server, which is strictly more than the
+// enumeration the earlier round closed. The entitlement goes into
+// storage.ActivityFilter so ListActivities' `total` and StreamActivities' whole
+// pass see the same predicate the page does — a post-filter would shrink the
+// page while `total` kept counting the records it removed.
+//
+// It is applied AFTER parseActivityFilters on purpose: a caller-supplied
+// ?server= narrows within the entitlement, and can never widen past it, because
+// both live in the same Matches() call and the authorization term is evaluated
+// first.
+func applyActivityScope(ctx context.Context, filter *storage.ActivityFilter) {
+	if allowed, scoped := scopeAllowedServers(ctx); scoped {
+		filter.AllowedServers = allowed
+	}
+}
+
 // handleListActivity handles GET /api/v1/activity
 // @Summary List activity records
 // @Description Returns paginated list of activity records with optional filtering
 // @Tags Activity
 // @Accept json
 // @Produce json
-// @Param type query string false "Filter by activity type(s), comma-separated for multiple (Spec 024)" Enums(tool_call, policy_decision, quarantine_change, server_change, system_start, system_stop, internal_tool_call, config_change)
+// @Param type query string false "Filter by activity type(s), comma-separated for multiple (Spec 024)" Enums(tool_call, policy_decision, quarantine_change, server_change, system_start, system_stop, internal_tool_call, config_change, preflight, prompt_get)
 // @Param server query string false "Filter by server name"
 // @Param tool query string false "Filter by tool name"
 // @Param session_id query string false "Filter by MCP transport session ID"
 // @Param work_session_id query string false "Filter by work session (one client, one project, across reconnects)"
-// @Param status query string false "Filter by status" Enums(success, error, blocked)
+// @Param status query string false "Filter by status" Enums(success, error, blocked, rejected)
 // @Param intent_type query string false "Filter by intent operation type (Spec 018)" Enums(read, write, destructive)
 // @Param request_id query string false "Filter by HTTP request ID for log correlation (Spec 021)"
+// @Param parent_id query string false "Filter by parent call id — returns the sub-calls one code_execution issued"
 // @Param include_call_tool query bool false "Include successful call_tool_* internal tool calls (default: false, excluded to avoid duplicates)"
 // @Param sensitive_data query bool false "Filter by sensitive data detection (true=has detections, false=no detections)"
 // @Param detection_type query string false "Filter by specific detection type (e.g., 'aws_access_key', 'credit_card')"
@@ -144,6 +175,7 @@ func parseActivityFilters(r *http.Request) storage.ActivityFilter {
 // @Param end_time query string false "Filter activities before this time (RFC3339)"
 // @Param limit query int false "Maximum records to return (1-100, default 50)"
 // @Param offset query int false "Pagination offset (default 0)"
+// @Param exclude_payloads query bool false "Omit arguments, response and metadata except a contextual whitelist (intent.reason, intent.operation_type, decision, reason, client_name, client_version) (default: false). For clients that render summary fields only; has_sensitive_data is still derived before metadata is dropped."
 // @Success 200 {object} contracts.APIResponse{data=contracts.ActivityListResponse}
 // @Failure 400 {object} contracts.APIResponse
 // @Failure 401 {object} contracts.APIResponse
@@ -153,6 +185,7 @@ func parseActivityFilters(r *http.Request) storage.ActivityFilter {
 // @Router /api/v1/activity [get]
 func (s *Server) handleListActivity(w http.ResponseWriter, r *http.Request) {
 	filter := parseActivityFilters(r)
+	applyActivityScope(r.Context(), &filter)
 
 	activities, total, err := s.controller.ListActivities(filter)
 	if err != nil {
@@ -161,10 +194,32 @@ func (s *Server) handleListActivity(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Convert storage records to contract records
+	// Convert storage records to contract records.
+	//
+	// `exclude_payloads` is a projection, not a filter: it changes what is
+	// serialised, never which records match, so it is applied here rather than
+	// in the storage filter. Arguments, Response and Metadata are unbounded in
+	// practice (only Response is truncated, at 64KB), and a client that renders
+	// summary fields alone pays for them on every poll — measured against a real
+	// log, the newest 100 tool-call records are ~848KB whole and ~30KB projected.
+	// HasSensitiveData is derived by storageToContractActivity from Metadata
+	// BEFORE it is dropped, so the flag survives its source.
+	//
+	// Metadata is not dropped wholesale: a small whitelist of short contextual
+	// strings (why a call happened, whether policy blocked it, who called)
+	// survives, because the tray renders them and re-fetching each record in
+	// full to get an 80-character reason would undo the projection's point.
+	excludePayloads := r.URL.Query().Get("exclude_payloads") == "true"
 	contractActivities := make([]contracts.ActivityRecord, len(activities))
 	for i, a := range activities {
 		contractActivities[i] = storageToContractActivity(a)
+		s.maskActivityPayloads(&contractActivities[i])
+		if excludePayloads {
+			contractActivities[i].Arguments = nil
+			contractActivities[i].Response = ""
+			contractActivities[i].ResponseTruncated = false
+			contractActivities[i].Metadata = projectContextualMetadata(contractActivities[i].Metadata)
+		}
 	}
 
 	response := contracts.ActivityListResponse{
@@ -205,16 +260,139 @@ func (s *Server) handleGetActivityDetail(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	if activity == nil {
+	// #1166 follow-up (G2): a record the caller is not entitled to takes the
+	// SAME exit as one that does not exist — same status, same message. The
+	// oracle is status parity with an absent id, not "the body omits the server
+	// name": this route's 404 body carries no echo of the caller's input, so an
+	// absence assertion would pass vacuously.
+	if activity == nil || !canSeeServer(r.Context(), activity.ServerName) {
 		s.writeError(w, r, http.StatusNotFound, "Activity not found")
 		return
 	}
 
+	record := storageToContractActivity(activity)
+	s.maskActivityPayloads(&record)
+
 	response := contracts.ActivityDetailResponse{
-		Activity: storageToContractActivity(activity),
+		Activity: record,
 	}
 
 	s.writeSuccess(w, response)
+}
+
+// maskActivityPayloads sanitises a record's request/response payloads before
+// they leave the process.
+//
+// Two separate problems, deliberately handled differently:
+//
+//   - Internal `_auth_*` arguments are MCPProxy's own plumbing, never something
+//     the caller sent, so they are dropped from EVERY record unconditionally.
+//   - A record the detector flagged carries the very credential the detection
+//     exists to warn about. The drawer that renders it is the surface most
+//     likely to end up in a screenshot or a screen-share, so the secret is
+//     replaced with a recognisable preview (`AKIA…****`) HERE, on the server:
+//     redacting in the client would leave the raw value on the wire and in the
+//     browser's network log, which is not a fix.
+//
+// Masking is scoped to flagged records so an unflagged payload costs nothing —
+// the detector already ran asynchronously when the call was recorded, and its
+// verdict is what `has_sensitive_data` reports.
+//
+// Full values remain reachable through the deliberate, separately-flagged
+// export path (`GET /api/v1/activity/export?include_bodies=true`), which is the
+// compliance/incident-response surface rather than a browsing one.
+func (s *Server) maskActivityPayloads(record *contracts.ActivityRecord) {
+	record.Arguments = security.StripInternalArgs(record.Arguments)
+
+	if !record.HasSensitiveData || s.sensitiveMasker == nil {
+		return
+	}
+
+	record.Arguments = s.sensitiveMasker.MaskArguments(record.Arguments)
+	if record.Response != "" {
+		masked, _ := s.sensitiveMasker.MaskText(record.Response)
+		record.Response = masked
+	}
+	// An upstream error commonly quotes the request or the response it choked
+	// on, so a failed call can carry the same credential the successful one
+	// would have — masking the body and not the error would just move the leak.
+	if record.ErrorMessage != "" {
+		masked, _ := s.sensitiveMasker.MaskText(record.ErrorMessage)
+		record.ErrorMessage = masked
+	}
+	// Metadata is not all machine-generated: `intent.reason` is prose the
+	// calling agent wrote, and an agent explaining itself ("rotating
+	// AKIA…") lands the same value in a field nobody was masking. The
+	// detection block itself is short identifiers no pattern matches, so the
+	// sweep passes over it untouched.
+	record.Metadata = s.sensitiveMasker.MaskArguments(record.Metadata)
+}
+
+// ActivityProjector returns the exact convert+mask composition core
+// GET /activity applies to a storage record before it reaches a caller
+// (Spec 107 T086, contracts/rest-endpoints.md §"user/activity"): the
+// server-edition GET /api/v1/user/activity door holds *storage.ActivityRecord
+// values and has no access to this package's unexported
+// storageToContractActivity/maskActivityPayloads, so this is the one exported
+// seam that lets it emit the same JSON shape and the same masking as the core
+// door for the same record.
+func (s *Server) ActivityProjector() func(*storage.ActivityRecord) contracts.ActivityRecord {
+	return func(record *storage.ActivityRecord) contracts.ActivityRecord {
+		contract := storageToContractActivity(record)
+		s.maskActivityPayloads(&contract)
+		return contract
+	}
+}
+
+// contextualMetadataKeys are the top-level metadata keys that survive the
+// `exclude_payloads` projection (contracts/api-deltas.md §1). Everything here is
+// a short string the tray glance shows verbatim; anything unbounded (arguments,
+// responses, toon renderings, detection payloads) is deliberately absent.
+var contextualMetadataKeys = []string{"decision", "reason", "client_name", "client_version"}
+
+// contextualIntentKeys are the keys kept inside `metadata.intent`. The rest of
+// the intent object (scores, raw classifier output) is not rendered anywhere.
+var contextualIntentKeys = []string{"reason", "operation_type"}
+
+// projectContextualMetadata narrows metadata to the contextual whitelist,
+// returning nil when nothing whitelisted is present so an all-dropped record
+// serialises as an absent object rather than an empty one.
+//
+// Only string values are kept. A whitelisted key is not a promise about its
+// value, and nothing stops a producer from putting a structured error under
+// `reason` — copying by key alone would carry that whole nested payload through
+// the one boundary callers are told payloads cannot cross.
+//
+// The result is always a fresh map: the input belongs to the storage layer (the
+// controller may hand back live records) and must not be edited in place.
+func projectContextualMetadata(metadata map[string]interface{}) map[string]interface{} {
+	if len(metadata) == 0 {
+		return nil
+	}
+
+	projected := make(map[string]interface{}, len(contextualMetadataKeys)+1)
+	for _, key := range contextualMetadataKeys {
+		if value, ok := metadata[key].(string); ok {
+			projected[key] = value
+		}
+	}
+
+	if intent, ok := metadata["intent"].(map[string]interface{}); ok {
+		projectedIntent := make(map[string]interface{}, len(contextualIntentKeys))
+		for _, key := range contextualIntentKeys {
+			if value, ok := intent[key].(string); ok {
+				projectedIntent[key] = value
+			}
+		}
+		if len(projectedIntent) > 0 {
+			projected["intent"] = projectedIntent
+		}
+	}
+
+	if len(projected) == 0 {
+		return nil
+	}
+	return projected
 }
 
 // storageToContractActivity converts a storage ActivityRecord to a contracts ActivityRecord.
@@ -237,6 +415,7 @@ func storageToContractActivity(a *storage.ActivityRecord) contracts.ActivityReco
 		SessionID:         a.SessionID,
 		WorkSessionID:     a.WorkSessionID,
 		RequestID:         a.RequestID,
+		ParentID:          a.ParentID,
 		Metadata:          a.Metadata,
 		// Sensitive data detection fields (Spec 026)
 		HasSensitiveData: hasSensitiveData,
@@ -333,7 +512,15 @@ func storageToContractActivityForExport(a *storage.ActivityRecord, includeBodies
 		SessionID:         a.SessionID,
 		WorkSessionID:     a.WorkSessionID,
 		RequestID:         a.RequestID,
+		ParentID:          a.ParentID,
 		Metadata:          a.Metadata,
+		// Pre-truncation byte lengths (Spec 069 A1). Copied unconditionally,
+		// NOT under includeBodies: they are sizes, not content, and the
+		// bodies-off export is exactly the case where they are the only cost
+		// signal left (spec 103). Gating them on the bodies flag would leave the
+		// default export with nothing to account a suppressed payload by.
+		RequestBytes:  a.RequestBytes,
+		ResponseBytes: a.ResponseBytes,
 		// Sensitive data detection fields (Spec 026)
 		HasSensitiveData: hasSensitiveData,
 		DetectionTypes:   detectionTypes,
@@ -362,6 +549,8 @@ func storageToContractActivityForExport(a *storage.ActivityRecord, includeBodies
 // @Param session_id query string false "Filter by MCP transport session ID"
 // @Param work_session_id query string false "Filter by work session (one client, one project, across reconnects)"
 // @Param status query string false "Filter by status"
+// @Param request_id query string false "Filter by HTTP request ID for log correlation (Spec 021)"
+// @Param parent_id query string false "Filter by parent call id — exports the sub-calls one code_execution issued"
 // @Param start_time query string false "Filter activities after this time (RFC3339)"
 // @Param end_time query string false "Filter activities before this time (RFC3339)"
 // @Param limit query int false "Maximum records to export (1-50000, default 10000)"
@@ -374,6 +563,7 @@ func storageToContractActivityForExport(a *storage.ActivityRecord, includeBodies
 // @Router /api/v1/activity/export [get]
 func (s *Server) handleExportActivity(w http.ResponseWriter, r *http.Request) {
 	filter := parseActivityFilters(r)
+	applyActivityScope(r.Context(), &filter)
 
 	// Re-parse limit/offset from query for export — parseActivityFilters caps at 100 via Validate(),
 	// but export supports up to 50000. Re-read raw values and apply export-specific validation.
@@ -422,7 +612,9 @@ func (s *Server) handleExportActivity(w http.ResponseWriter, r *http.Request) {
 
 	// Write CSV header if format is CSV
 	if format == "csv" {
-		csvHeader := "id,type,source,server_name,tool_name,status,error_message,duration_ms,timestamp,session_id,request_id,response_truncated\n"
+		// parent_id is APPENDED, never inserted: existing CSV consumers index by
+		// column position, so a new column has to land after the last one.
+		csvHeader := "id,type,source,server_name,tool_name,status,error_message,duration_ms,timestamp,session_id,request_id,response_truncated,parent_id\n"
 		if _, err := w.Write([]byte(csvHeader)); err != nil {
 			s.logger.Errorw("Failed to write CSV header", "error", err)
 			return
@@ -495,6 +687,7 @@ func activityToCSVRow(a *storage.ActivityRecord) string {
 		escapeCSV(a.SessionID),
 		escapeCSV(a.RequestID),
 		strconv.FormatBool(a.ResponseTruncated),
+		escapeCSV(a.ParentID),
 	}, ",") + "\n"
 }
 
@@ -546,42 +739,85 @@ func (s *Server) handleActivitySummary(w http.ResponseWriter, r *http.Request) {
 	endTime := time.Now().UTC()
 	startTime := endTime.Add(-duration)
 
-	// Build filter for the time range
+	// Build filter for the time range.
+	//
+	// Limit stays 0 and the records are STREAMED rather than listed: this is a
+	// counting query over the whole period, and ListActivities runs
+	// ActivityFilter.Validate(), which coerces limit 0 to 50 and caps it at 100.
+	// The summary therefore used to describe the newest 50 records and label the
+	// answer "24h" — on a busy proxy the totals, the status split and the top
+	// server/tool lists were all computed from a few minutes of traffic.
+	// StreamActivities applies the same Matches() filter but treats limit 0 as
+	// "no limit", so the counters see every record in the window.
 	filter := storage.DefaultActivityFilter()
 	filter.StartTime = startTime
 	filter.EndTime = endTime
-	filter.Limit = 0 // Get all records
-
-	// Get all activities in the time range
-	activities, _, err := s.controller.ListActivities(filter)
-	if err != nil {
-		s.logger.Errorw("Failed to list activities for summary", "error", err)
-		s.writeError(w, r, http.StatusInternalServerError, "Failed to get activity summary")
-		return
-	}
+	filter.Limit = 0
+	applyActivityScope(r.Context(), &filter)
 
 	// Calculate summary statistics
-	var totalCount, successCount, errorCount, blockedCount int
+	var totalCount, successCount, errorCount, blockedCount, rejectedCount, otherCount int
+	var callCount, callErrorCount int
 	serverCounts := make(map[string]int)
 	toolCounts := make(map[string]int)
 
-	for _, a := range activities {
+	// The stream holds a read transaction open until the channel is drained or
+	// closed, so this loop must always run to completion.
+	for a := range s.controller.StreamActivities(filter) {
 		totalCount++
-		switch a.Status {
-		case "success":
-			successCount++
-		case "error":
-			errorCount++
-		case "blocked":
-			blockedCount++
+
+		// "How many rows" (totalCount) and "how many calls" (callCount) are
+		// different questions, and the Activity Log used to print the first
+		// under the second's label while the Usage tab printed the second —
+		// same instance, same window, different numbers (F1, #1046). One shared
+		// definition, in storage, settles it for both surfaces.
+		if counted, isError := storage.CountsAsCall(a); counted {
+			callCount++
+			if isError {
+				callErrorCount++
+			}
 		}
 
-		// Count by server
+		switch a.Status {
+		case storage.ActivityStatusSuccess:
+			successCount++
+		case storage.ActivityStatusError:
+			errorCount++
+		case storage.ActivityStatusBlocked:
+			blockedCount++
+		case storage.ActivityStatusRejected:
+			// Spec 093: shed by a concurrency limit — proxy backpressure, kept
+			// out of the error bucket so a saturated limiter does not read as an
+			// upstream outage.
+			rejectedCount++
+		default:
+			// Not a tool-call outcome at all: a quarantine change stores its
+			// action in Status ("approved"), a policy decision its verdict
+			// ("allow"). Counting them here — rather than letting them fall
+			// silently into the total only — is what makes the five tiles a
+			// partition of the denominator they sit under (F2, #1046).
+			otherCount++
+		}
+
+		// Count by server / by tool — UPSTREAM traffic only.
+		//
+		// Issue #1146 gave the management built-ins a target_server so the
+		// Activity Log could render a Server column and --server could filter
+		// on it. These two lists answer a different question ("which upstreams
+		// is this proxy talking to"), and they used to skip those rows only by
+		// the accident of an empty ServerName. Excluding them explicitly keeps
+		// a burst of config edits from reading as traffic to the server being
+		// configured, and keeps "github:upstream_servers" — a built-in no
+		// upstream owns — out of the top-tools list. The rows stay in
+		// totalCount: they are real activity, just not upstream traffic.
+		if storage.IsManagementBuiltin(a) {
+			continue
+		}
+
 		if a.ServerName != "" {
 			serverCounts[a.ServerName]++
 		}
 
-		// Count by tool (server:tool)
 		if a.ServerName != "" && a.ToolName != "" {
 			key := a.ServerName + ":" + a.ToolName
 			toolCounts[key]++
@@ -595,15 +831,19 @@ func (s *Server) handleActivitySummary(w http.ResponseWriter, r *http.Request) {
 	topTools := buildTopTools(toolCounts, 5)
 
 	response := contracts.ActivitySummaryResponse{
-		Period:       period,
-		TotalCount:   totalCount,
-		SuccessCount: successCount,
-		ErrorCount:   errorCount,
-		BlockedCount: blockedCount,
-		TopServers:   topServers,
-		TopTools:     topTools,
-		StartTime:    startTime.Format(time.RFC3339),
-		EndTime:      endTime.Format(time.RFC3339),
+		Period:         period,
+		TotalCount:     totalCount,
+		SuccessCount:   successCount,
+		ErrorCount:     errorCount,
+		BlockedCount:   blockedCount,
+		RejectedCount:  rejectedCount,
+		OtherCount:     otherCount,
+		CallCount:      callCount,
+		CallErrorCount: callErrorCount,
+		TopServers:     topServers,
+		TopTools:       topTools,
+		StartTime:      startTime.Format(time.RFC3339),
+		EndTime:        endTime.Format(time.RFC3339),
 	}
 
 	s.writeSuccess(w, response)
@@ -697,19 +937,79 @@ const (
 	usageTokenSource   = "bytes" // size-based proxy (FR-006); FR-010 → "estimated_tokens"
 )
 
-// usageParams holds the validated query parameters for the usage endpoint.
+// usageParams holds the validated query parameters for the usage endpoint,
+// plus the caller's server entitlement (#1166 follow-up, G2).
 type usageParams struct {
 	window string // "24h" | "7d" | "all"
 	server string
 	tool   string
-	status string // "" | "success" | "error" | "blocked"
+	status string // "" | "success" | "error" | "blocked" | "rejected"
 	top    int
 	sort   string // "calls" | "resp_bytes" | "error_rate" | "p95"
+
+	// allowed is the scoped caller's server entitlement; scoped says whether
+	// one applies at all. They are separate because a token allowed NO servers
+	// produces an empty-but-non-nil slice that must hide everything, while an
+	// admin (or the no-AuthContext bootstrap passthrough) is unrestricted.
+	allowed []string
+	scoped  bool
+}
+
+// canSee reports whether this caller may see rows attributed to serverName.
+func (p usageParams) canSee(serverName string) bool {
+	if !p.scoped {
+		return true
+	}
+	if serverName == "" {
+		return false
+	}
+	for _, allowed := range p.allowed {
+		if allowed == "*" || allowed == serverName {
+			return true
+		}
+	}
+	return false
 }
 
 // cacheKey is a stable identity for the params, used by the short-TTL cache.
+//
+// The caller's entitlement is PART of that identity. handleActivityUsage caches
+// the built response for usage_cache_ttl in a process-wide map: without the
+// scope term the first agent token to ask would seed the entry the admin Web UI
+// (and every other tenant) then read for the rest of the TTL, and vice versa.
+// Two tokens with the same allowed-server set legitimately share an entry;
+// nothing else does.
+//
+// The encoding is LENGTH-PREFIXED, and that is a correctness property, not a
+// style choice (round 10, P6). Joining the terms with a bare separator is not
+// injective when the separator can appear inside a term: config validation
+// rejects only a colon in a server name, so a single server literally named
+// `a,b` produced the same key as the scope ["a","b"], and a `?server=` filter
+// value containing a pipe collided across fields the same way. A collision here
+// serves one tenant's cached response to another — the disclosure this whole
+// door exists to prevent, arriving through the cache instead of the query.
 func (p usageParams) cacheKey() string {
-	return strings.Join([]string{p.window, p.server, p.tool, p.status, p.sort, strconv.Itoa(p.top)}, "|")
+	var b strings.Builder
+	write := func(part string) {
+		b.WriteString(strconv.Itoa(len(part)))
+		b.WriteByte(':')
+		b.WriteString(part)
+	}
+	for _, part := range []string{p.window, p.server, p.tool, p.status, p.sort, strconv.Itoa(p.top)} {
+		write(part)
+	}
+	if !p.scoped {
+		write("admin")
+		return b.String()
+	}
+	sorted := append([]string(nil), p.allowed...)
+	sort.Strings(sorted)
+	write("scoped")
+	write(strconv.Itoa(len(sorted)))
+	for _, name := range sorted {
+		write(name)
+	}
+	return b.String()
 }
 
 // windowStart returns the lower time bound for the window relative to now, plus
@@ -737,6 +1037,10 @@ func parseUsageParams(r *http.Request) (usageParams, error) {
 		top:    usageDefaultTop,
 		sort:   usageDefaultSort,
 	}
+	// Resolved HERE, not at the call site, so the entitlement cannot be
+	// forgotten by a future caller and — more importantly — so it is inside
+	// cacheKey() by construction.
+	p.allowed, p.scoped = scopeAllowedServers(r.Context())
 
 	if v := q.Get("window"); v != "" {
 		switch v {
@@ -758,9 +1062,12 @@ func parseUsageParams(r *http.Request) (usageParams, error) {
 
 	if p.status != "" {
 		switch p.status {
-		case "success", "error", "blocked":
+		// Spec 093: "rejected" (shed by a concurrency limit) is part of the
+		// activity status vocabulary, so the usage filter must accept it —
+		// usageMatchesStatus already knows how to answer it.
+		case "success", "error", "blocked", "rejected":
 		default:
-			return p, fmt.Errorf("invalid status %q (expected success, error, or blocked)", p.status)
+			return p, fmt.Errorf("invalid status %q (expected success, error, blocked, or rejected)", p.status)
 		}
 	}
 
@@ -784,7 +1091,7 @@ func parseUsageParams(r *http.Request) (usageParams, error) {
 // @Param window query string false "Time window for timeline + tool-list membership" Enums(24h, 7d, all)
 // @Param server query string false "Filter to one server"
 // @Param tool query string false "Filter to one tool"
-// @Param status query string false "Filter to tools with activity of this status" Enums(success, error, blocked)
+// @Param status query string false "Filter to tools with activity of this status" Enums(success, error, blocked, rejected)
 // @Param top query int false "Top-N tools by sort key; remainder folded into 'other' (default 20)"
 // @Param sort query string false "Ranking key for the per-tool list" Enums(calls, resp_bytes, error_rate, p95)
 // @Success 200 {object} contracts.APIResponse{data=contracts.UsageAggregateResponse}
@@ -842,7 +1149,15 @@ func buildUsageResponse(snap *internalRuntime.UsageAggregate, tokens *contracts.
 		Tools:       make([]contracts.UsageToolStat, 0),
 		Timeline:    make([]contracts.UsageTimeBucket, 0),
 	}
-	if tokens != nil {
+	// #1166 follow-up (G3): the tokens-saved headline and the timeline below are
+	// FLEET-WIDE aggregates. Neither can be re-derived per server — the token
+	// metrics are computed across the whole inventory, and snap.Timeline() is a
+	// set of global buckets with no per-server breakdown — so for a scoped
+	// caller they are dropped rather than reported wrongly. Same position
+	// recomputeServerStats already takes on the same struct (it drops
+	// TokenMetrics from GET /api/v1/servers instead of projecting it), so the
+	// three doors that touch contracts.ServerTokenMetrics agree.
+	if tokens != nil && !p.scoped {
 		resp.TokensSaved = tokens.SavedTokens
 		resp.TokensSavedPercentage = tokens.SavedTokensPercentage
 	}
@@ -860,6 +1175,13 @@ func buildUsageResponse(snap *internalRuntime.UsageAggregate, tokens *contracts.
 	// Per-tool rollup: filter by membership, project to contract rows.
 	rows := make([]contracts.UsageToolStat, 0, len(snap.Tools))
 	for _, tu := range snap.Tools {
+		// Entitlement first, so no query parameter below can widen past it.
+		// Each row names a server and a tool: without this a scoped token read
+		// the whole fleet's tool inventory plus its call volumes off a route
+		// with no gate at all.
+		if !p.canSee(tu.Server) {
+			continue
+		}
 		if p.server != "" && tu.Server != p.server {
 			continue
 		}
@@ -877,6 +1199,30 @@ func buildUsageResponse(snap *internalRuntime.UsageAggregate, tokens *contracts.
 
 	sortUsageRows(rows, p.sort)
 
+	// Round 10 (P7): the headline for a scoped caller is summed HERE, over the
+	// rows it may see, before the top-N fold discards the tail.
+	//
+	// The early return below skips the timeline loop, which is where an admin's
+	// TotalCalls / TotalErrors are accumulated — so a scoped caller used to be
+	// served `"total_calls":0` beside per-tool rows whose calls plainly summed
+	// to a non-zero number. The response contradicted itself, and a client with
+	// no way to know why reads a zero as "no traffic".
+	//
+	// The population differs from an admin's, and the field comment on
+	// contracts.UsageAggregateResponse says why it must: the timeline is
+	// window-bucketed and global, this sum is the lifetime-cumulative rollup of
+	// the tools active in the window. A scoped caller cannot be given the
+	// former (there is no per-server timeline to project) so it is given a
+	// number that agrees with the rest of ITS OWN response instead of one that
+	// contradicts it. Nothing new is disclosed: every addend is a row the same
+	// response already carries.
+	if p.scoped {
+		for i := range rows {
+			resp.TotalCalls += rows[i].Calls
+			resp.TotalErrors += rows[i].Errors
+		}
+	}
+
 	// Top-N + 'other' fold.
 	if len(rows) > p.top {
 		other := &contracts.UsageOtherBucket{}
@@ -890,7 +1236,20 @@ func buildUsageResponse(snap *internalRuntime.UsageAggregate, tokens *contracts.
 	}
 	resp.Tools = rows
 
-	// Timeline: global buckets trimmed to the window span.
+	// Timeline: global buckets trimmed to the window span. Its sum is also the
+	// window's headline count — computed here, server-side, from the same bars
+	// the response carries, so the tiles and the histogram beneath them agree
+	// and so the Activity Log can print the same number (F1, #1046).
+	//
+	// GLOBAL is the operative word, and it is why a scoped caller gets none of
+	// it: the buckets aggregate every server's traffic with no per-server
+	// breakdown to project, so emitting them would hand a tenant the whole
+	// deployment's call and error volume over time. Empty timeline, zero totals
+	// — the same "cannot be re-derived, so not reported" rule as the tokens
+	// headline above.
+	if p.scoped {
+		return resp
+	}
 	for _, b := range snap.Timeline() {
 		if bounded && b.Start.Before(start) {
 			continue
@@ -901,6 +1260,8 @@ func buildUsageResponse(snap *internalRuntime.UsageAggregate, tokens *contracts.
 			Errors:         b.Errors,
 			TotalRespBytes: b.RespBytesSum,
 		})
+		resp.TotalCalls += b.Calls
+		resp.TotalErrors += b.Errors
 	}
 
 	return resp
@@ -917,6 +1278,8 @@ func usageMatchesStatus(tu *internalRuntime.ToolUsage, status string) bool {
 		return tu.Errors > 0
 	case "blocked":
 		return tu.Blocked > 0
+	case "rejected":
+		return tu.Rejected > 0
 	case "success":
 		return tu.Calls-tu.Errors > 0
 	default:
@@ -926,6 +1289,8 @@ func usageMatchesStatus(tu *internalRuntime.ToolUsage, status string) bool {
 
 // usageToolStat projects a runtime ToolUsage into the API contract row.
 func usageToolStat(tu *internalRuntime.ToolUsage) contracts.UsageToolStat {
+	p50, p50Exceeds := tu.Percentile(0.50)
+	p95, p95Exceeds := tu.Percentile(0.95)
 	row := contracts.UsageToolStat{
 		Server:         tu.Server,
 		Tool:           tu.Tool,
@@ -933,11 +1298,14 @@ func usageToolStat(tu *internalRuntime.ToolUsage) contracts.UsageToolStat {
 		Errors:         tu.Errors,
 		ErrorRate:      tu.ErrorRate(),
 		Blocked:        tu.Blocked,
+		Rejected:       tu.Rejected,
 		TotalRespBytes: tu.RespBytesSum,
 		TotalReqBytes:  tu.ReqBytesSum,
 		SizedCalls:     tu.SizedRespCalls,
-		P50Ms:          tu.Percentile(0.50),
-		P95Ms:          tu.Percentile(0.95),
+		P50Ms:          p50,
+		P50Exceeds:     p50Exceeds,
+		P95Ms:          p95,
+		P95Exceeds:     p95Exceeds,
 		LastUsed:       tu.LastUsed,
 	}
 	if avg, ok := tu.AvgRespBytes(); ok {
@@ -966,6 +1334,14 @@ func sortUsageRows(rows []contracts.UsageToolStat, key string) {
 		case "p95":
 			if a.P95Ms != b.P95Ms {
 				return a.P95Ms > b.P95Ms
+			}
+			// Both sit on the last histogram bound, but one of them is only
+			// BOUNDED there and the other ran PAST it. "Sort by p95 latency"
+			// exists to surface the slowest tools, and top-N truncation means
+			// losing that tie-break can drop the genuinely slow one off the
+			// chart in favour of a tool that merely touched the ceiling.
+			if a.P95Exceeds != b.P95Exceeds {
+				return a.P95Exceeds
 			}
 		default: // resp_bytes
 			if a.TotalRespBytes != b.TotalRespBytes {

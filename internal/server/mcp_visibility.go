@@ -21,6 +21,22 @@ const (
 	visReasonToolPendingApproval = "tool_pending_approval"
 	visReasonToolChangedApproval = "tool_changed_approval"
 	visReasonToolNotCallable     = "tool_not_callable"
+	// visReasonToolNoApprovalRecord is the Spec 105 FR-009 implicit-pending
+	// case: the tool is in the server's discovery snapshot and the quarantine
+	// gate is active, but NO approval record exists yet (implicitPendingApproval).
+	// It is withheld exactly like a stored pending record, but its remediation
+	// differs — nothing is listed in the review UI to approve, the server's
+	// next discovery pass files the record — so describe_tool answers with
+	// the same no-record body dispatch does (toolPendingApprovalResult).
+	visReasonToolNoApprovalRecord = "tool_no_approval_record"
+	// visReasonToolUnresolved is the Spec 105 FR-009 (research D4) identity
+	// case: the server is known, connected and the authority on its own tool
+	// set, and the raw name has no registration identity on it — discovery
+	// has not completed for the live connection, or its completed result
+	// does not list the name (a stale index document, a kept migration-alias
+	// record). Dispatch refuses such a name for every caller, so describe_tool
+	// withholds its definition with the plain not-found shape (astra r2 C2).
+	visReasonToolUnresolved = "tool_unresolved"
 )
 
 // The two resolvers share one set of step helpers (serverInScope,
@@ -48,6 +64,15 @@ const (
 //	tool approval (pending/changed, Spec 032) → isToolCallable
 //
 // The empty reason means visible.
+//
+// The pair arrives ALREADY SPLIT into server and RAW tool name (describe's
+// splitServerTool, suggestCanonicalToolID's index read) and is consulted
+// exactly from here — never normalized a second time (Spec 105 FR-009): a
+// raw name that begins with the server's own prefix ("a:erase" on "a",
+// canonical id "a:a:erase") would otherwise be gated on the sibling "erase"
+// while the index lookup above already resolved its own document, so a
+// pending "a:erase" rendered its definition on the approved sibling's gate
+// and an approved one was withheld on the pending sibling's.
 func (p *MCPProxyServer) toolVisibleToSession(ctx context.Context, serverName, toolName string) (visible bool, reason string) {
 	if !p.toolIndexed(serverName, toolName) {
 		return false, visReasonNotIndexed
@@ -55,9 +80,24 @@ func (p *MCPProxyServer) toolVisibleToSession(ctx context.Context, serverName, t
 	authCtx := auth.AuthContextFromContext(ctx)
 	_, profileScope := p.resolveActiveProfile(ctx)
 
-	serverName, toolName = normalizeServerTool(serverName, toolName)
 	if !p.serverInScope(authCtx, profileScope, serverName) {
 		return false, visReasonServerNotInScope
+	}
+	// Spec 105 FR-009 (research D4), astra r2 C2: an index document is not a
+	// registration identity. A name the KNOWN, CONNECTED server's completed
+	// discovery does not list — a stale document whose Bleve delete failed,
+	// a kept migration-alias record — or a server whose discovery has not
+	// completed for the live connection is refused by every dispatch path,
+	// so describe_tool must not render its definition (Spec 098 FR-002: a
+	// dispatch refusal never reads as available). Ordered AFTER the scope
+	// gate so scope stays silent, and BEFORE the lock gates so a stale
+	// pending record cannot report a lock for a tool that no longer exists.
+	// Search (indexedToolVisible) deliberately does NOT take this gate: the
+	// retrieve_tools listing stays index-based (Spec 085), and a stale hit
+	// there self-heals through the dispatch body. Adding a gate here keeps
+	// the FR-011 upper bound (describe ⊆ search) by construction.
+	if p.resolveExactToolIdentity(serverName, toolName).Unresolved() {
+		return false, visReasonToolUnresolved
 	}
 	// describe_tool-only strict gates (contract steps 3–4) — ordered BEFORE
 	// callability so a quarantined/pending id reports its real lock, not a
@@ -65,7 +105,7 @@ func (p *MCPProxyServer) toolVisibleToSession(ctx context.Context, serverName, t
 	if gateReason := p.describeGateReason(serverName, toolName); gateReason != "" {
 		return false, gateReason
 	}
-	if !p.isToolCallable(serverName, toolName) {
+	if !p.isExactToolCallable(serverName, toolName) {
 		return false, visReasonToolNotCallable
 	}
 	return true, ""
@@ -80,9 +120,11 @@ func (p *MCPProxyServer) toolVisibleToSession(ctx context.Context, serverName, t
 // merge-base FULL-mode result set did not gate them (FR-006). The quarantine
 // second pass (collectQuarantinedToolMatches + `seen` dedupe) keeps handling
 // quarantined servers exactly where it always did.
+//
+// The pair arrives ALREADY SPLIT (the retrieve loop derives the raw name from
+// the index hit once, config.RawToolName) and is consulted exactly — see
+// toolVisibleToSession for why a second normalization is wrong.
 func (p *MCPProxyServer) indexedToolVisible(authCtx *auth.AuthContext, profileScope *profile.ProfileScope, serverName, toolName string) (visible bool, reason string) {
-	serverName, toolName = normalizeServerTool(serverName, toolName)
-
 	// Profile scope (Spec 057) + agent-token server scope (Spec 028) —
 	// applied BEFORE any classification so an agent never learns a tool
 	// exists on a server it cannot access.
@@ -91,7 +133,7 @@ func (p *MCPProxyServer) indexedToolVisible(authCtx *auth.AuthContext, profileSc
 	}
 
 	// Callability: disabled/blocked tools are non-existent for discovery.
-	if !p.isToolCallable(serverName, toolName) {
+	if !p.isExactToolCallable(serverName, toolName) {
 		return false, visReasonToolNotCallable
 	}
 
@@ -109,22 +151,27 @@ func (p *MCPProxyServer) indexedToolVisible(authCtx *auth.AuthContext, profileSc
 //	    server doesn't skip it.
 //
 // Returns "" when neither gate fires.
+//
+// Spec 098 FR-002: both gates now read from the shared toolGate primitive, so
+// describe_tool, dispatch and the preflight evaluator consult exactly one
+// evaluation of the quarantine/approval state. The gate order (server
+// quarantine, then the tool-level lock) is unchanged.
+//
+// The pair arrives already normalized by toolVisibleToSession, so the gate is
+// read exactly rather than normalized a second time.
 func (p *MCPProxyServer) describeGateReason(serverName, toolName string) string {
-	serverConfig, err := p.storage.GetUpstreamServer(serverName)
-	if err == nil && serverConfig != nil && serverConfig.Quarantined {
+	gate := p.evaluateExactToolGate(serverName, toolName)
+	if gate.serverQuarantined() {
 		return visReasonServerQuarantined
 	}
-
-	if (p.config == nil || p.config.IsQuarantineEnabled()) &&
-		serverConfig != nil && !serverConfig.IsQuarantineSkipped() {
-		if approval, aerr := p.storage.GetToolApproval(serverName, toolName); aerr == nil && approval != nil {
-			switch approval.Status {
-			case storage.ToolApprovalStatusPending:
-				return visReasonToolPendingApproval
-			case storage.ToolApprovalStatusChanged:
-				return visReasonToolChangedApproval
-			}
+	switch gate.lockStatus {
+	case storage.ToolApprovalStatusPending:
+		if isImplicitPendingApproval(gate.approval) {
+			return visReasonToolNoApprovalRecord
 		}
+		return visReasonToolPendingApproval
+	case storage.ToolApprovalStatusChanged:
+		return visReasonToolChangedApproval
 	}
 	return ""
 }
@@ -132,13 +179,20 @@ func (p *MCPProxyServer) describeGateReason(serverName, toolName string) string 
 // normalizeServerTool strips the indexed "server:tool" prefix from toolName
 // (result.Tool.Name keeps the prefix when ServerName is set) — exactly like
 // isToolCallable, so approval/config lookups key consistently.
+//
+// Spec 105 FR-009: only the SERVER's own prefix is an indexing artifact. When
+// serverName is already known and the first ":"-segment is something else,
+// the colon belongs to the raw tool name ("ns:erase" on server "a") and is
+// kept, so every gate keyed on this pair — tier classification, approval,
+// config denial, callability — evaluates the exact identity that is
+// dispatched instead of the suffix tool's.
 func normalizeServerTool(serverName, toolName string) (string, string) {
-	if strings.Contains(toolName, ":") {
-		if parts := strings.SplitN(toolName, ":", 2); len(parts) == 2 {
-			if serverName == "" {
-				serverName = parts[0]
-			}
-			toolName = parts[1]
+	if prefix, rest, ok := strings.Cut(toolName, ":"); ok {
+		switch {
+		case serverName == "":
+			serverName, toolName = prefix, rest
+		case prefix == serverName:
+			toolName = rest
 		}
 	}
 	return serverName, toolName
@@ -162,9 +216,13 @@ func (p *MCPProxyServer) toolIndexed(serverName, toolName string) bool {
 	return p.lookupIndexedTool(serverName, toolName) != nil
 }
 
-// lookupIndexedTool resolves a (server, tool) pair to its indexed metadata —
-// the same corpus retrieve_tools ranks over, so describe_tool definitions and
-// search entries render from identical inputs. nil when absent.
+// lookupIndexedTool resolves a (server, RAW tool) pair to its indexed metadata
+// — the same corpus retrieve_tools ranks over, so describe_tool definitions
+// and search entries render from identical inputs. nil when absent. The
+// indexed Name is the canonical "<server>:<raw>" id and is matched exactly
+// (Spec 105 FR-009): a bare-name alternate could only match when a raw name
+// equals a sibling's canonical id (raw "a:erase" on server "a" → the "erase"
+// doc), rendering one tool's schema under another's id.
 func (p *MCPProxyServer) lookupIndexedTool(serverName, toolName string) *config.ToolMetadata {
 	tools, err := p.index.GetToolsByServer(serverName)
 	if err != nil {
@@ -172,19 +230,67 @@ func (p *MCPProxyServer) lookupIndexedTool(serverName, toolName string) *config.
 	}
 	full := serverName + ":" + toolName
 	for _, tool := range tools {
-		if tool.Name == full || tool.Name == toolName {
+		if tool.Name == full {
 			return tool
 		}
 	}
 	return nil
 }
 
-// splitServerTool splits a "<server>:<tool>" id. ok=false when the id has no
-// server prefix.
+// splitServerTool splits a "<server>:<tool>" id. Whitespace is never
+// significant in a canonical id, so both segments are trimmed. ok=false when
+// the id has no server prefix or either segment is blank.
 func splitServerTool(id string) (serverName, toolName string, ok bool) {
-	parts := strings.SplitN(id, ":", 2)
-	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+	parts := strings.SplitN(strings.TrimSpace(id), ":", 2)
+	if len(parts) != 2 {
 		return "", "", false
 	}
-	return parts[0], parts[1], true
+	serverName, toolName = strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+	if serverName == "" || toolName == "" {
+		return "", "", false
+	}
+	return serverName, toolName, true
+}
+
+// suggestCanonicalToolID resolves an id that differs from an indexed one only
+// by letter case to its canonical form.
+//
+// Spec 102 T056: this stays the INDEX-backed resolver, byte-identical, for the
+// retrieve surfaces. The direct surface has its own — suggestDirectToolID in
+// mcp_describe_direct.go — because it must draw from the catalog and gate on the
+// direct listing's rules (the operation-permission tier and withheld display-
+// name collisions, neither of which exists here). The seam is therefore the
+// call site in resolveDescribeDefinition rather than a branch inside this
+// function: threading a surface flag through here would put direct-only rules
+// inside the predicate three retrieve-path callers share. Case is NOT folded on any resolution
+// path: server and tool names are exact keys in the approval, quarantine,
+// profile and agent-scope stores, so accepting a miscased id would route a
+// call around gates keyed on the exact name. The correction is therefore only
+// ever suggested — and only when the corrected pair is visible to this
+// session, so a suggestion can never confirm that an out-of-scope or
+// quarantined tool exists.
+func (p *MCPProxyServer) suggestCanonicalToolID(ctx context.Context, serverName, toolName string) (string, bool) {
+	servers, err := p.index.GetAllIndexedServerNames()
+	if err != nil {
+		return "", false
+	}
+	for _, server := range servers {
+		if !strings.EqualFold(server, serverName) {
+			continue
+		}
+		tools, terr := p.index.GetToolsByServer(server)
+		if terr != nil {
+			continue
+		}
+		for _, tool := range tools {
+			bare := config.RawToolName(tool)
+			if !strings.EqualFold(bare, toolName) || (server == serverName && bare == toolName) {
+				continue
+			}
+			if visible, _ := p.toolVisibleToSession(ctx, server, bare); visible {
+				return server + ":" + bare, true
+			}
+		}
+	}
+	return "", false
 }

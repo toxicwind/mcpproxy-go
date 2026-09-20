@@ -44,17 +44,32 @@ type Server struct {
 	// would apply when no per-server override is set. Populated on
 	// list/get responses; never consumed on PATCH requests.
 	IsolationDefaults *IsolationDefaults `json:"isolation_defaults,omitempty"`
-	Authenticated     bool               `json:"authenticated"`                  // OAuth authentication status
-	OAuthStatus       string             `json:"oauth_status,omitempty"`         // OAuth status: "authenticated", "expired", "error", "none"
-	TokenExpiresAt    *time.Time         `json:"token_expires_at,omitempty"`     // When the OAuth token expires (ISO 8601)
-	ToolListTokenSize int                `json:"tool_list_token_size,omitempty"` // Token size for this server's tools
-	ShouldRetry       bool               `json:"should_retry,omitempty"`
-	RetryCount        int                `json:"retry_count,omitempty"`
-	LastRetryTime     *time.Time         `json:"last_retry_time,omitempty"`
-	UserLoggedOut     bool               `json:"user_logged_out,omitempty"`  // True if user explicitly logged out (prevents auto-reconnection)
-	Health            *HealthStatus      `json:"health,omitempty"`           // Unified health status calculated by the backend
-	Quarantine        *QuarantineStats   `json:"quarantine,omitempty"`       // Tool quarantine metrics for this server
-	ReconnectOnUse    bool               `json:"reconnect_on_use,omitempty"` // Attempt reconnection when a tool call targets this disconnected server
+	// IsolationEffective exposes the resolved isolation state (and the rule
+	// that decided it) so clients can distinguish "inherits global" from an
+	// explicit per-server choice. Read-only; never consumed on PATCH.
+	IsolationEffective *IsolationEffective `json:"isolation_effective,omitempty"`
+	Authenticated      bool                `json:"authenticated"`                  // OAuth authentication status
+	OAuthStatus        string              `json:"oauth_status,omitempty"`         // OAuth status: "authenticated", "expired", "error", "none"
+	TokenExpiresAt     *time.Time          `json:"token_expires_at,omitempty"`     // When the OAuth token expires (ISO 8601)
+	ToolListTokenSize  int                 `json:"tool_list_token_size,omitempty"` // Token size for this server's tools
+	ShouldRetry        bool                `json:"should_retry,omitempty"`
+	RetryCount         int                 `json:"retry_count,omitempty"`
+	LastRetryTime      *time.Time          `json:"last_retry_time,omitempty"`
+	// RetryStopped reports that automatic reconnection has been given up for
+	// good because the failure is deterministic and unrecoverable — a missing
+	// binary, an image without the interpreter, an unparseable config (GH
+	// #1145). It is NOT ordinary exponential backoff, which keeps retrying;
+	// nothing will happen until the user fixes the config or restarts the
+	// server. RetryStoppedCode is the stable MCPX_* code that proved it and
+	// RetryStoppedReason the catalog message explaining how to fix it. All three
+	// are omitted for servers that are healthy or still retrying.
+	RetryStopped       bool             `json:"retry_stopped,omitempty"`
+	RetryStoppedCode   string           `json:"retry_stopped_code,omitempty"`
+	RetryStoppedReason string           `json:"retry_stopped_reason,omitempty"`
+	UserLoggedOut      bool             `json:"user_logged_out,omitempty"`  // True if user explicitly logged out (prevents auto-reconnection)
+	Health             *HealthStatus    `json:"health,omitempty"`           // Unified health status calculated by the backend
+	Quarantine         *QuarantineStats `json:"quarantine,omitempty"`       // Tool quarantine metrics for this server
+	ReconnectOnUse     bool             `json:"reconnect_on_use,omitempty"` // Attempt reconnection when a tool call targets this disconnected server
 	// AutoApproveToolChanges mirrors config.ServerConfig.AutoApproveToolChanges
 	// (MCP-2930): the per-server intent to auto-approve new/changed tools past
 	// the trust baseline. Tri-state *bool — nil means "never set" (omitted from
@@ -72,8 +87,13 @@ type Server struct {
 	// a duration string (e.g. "120s"); nil/omitted means "inherit the global
 	// default". Surfaced on the GET path so clients can read back a configured
 	// override; PATCH/POST accept it via AddServerRequest.
-	InitTimeout  *config.Duration     `json:"init_timeout,omitempty" swaggertype:"string"`
-	SecurityScan *SecurityScanSummary `json:"security_scan,omitempty"` // Latest security scan results summary
+	InitTimeout *config.Duration `json:"init_timeout,omitempty" swaggertype:"string"`
+	// ExposePrompts mirrors config.ServerConfig.ExposePrompts (F9): the per-server
+	// prompt-aggregation override. Tri-state *bool — nil/omitted means "inherit
+	// default aggregation". Surfaced on GET so a caller that PATCHed the override
+	// can read it back; PATCH/POST accept it via AddServerRequest.
+	ExposePrompts *bool                `json:"expose_prompts,omitempty"`
+	SecurityScan  *SecurityScanSummary `json:"security_scan,omitempty"` // Latest security scan results summary
 	// Spec 044 — structured diagnostic error and stable error code. Both
 	// are populated when the server is in a failed state and the error
 	// has been classified by internal/diagnostics. Healthy servers omit
@@ -89,6 +109,16 @@ type Server struct {
 	// and omitted when empty — clients that pre-date this treat them as absent.
 	SourceRegistryID         string `json:"source_registry_id,omitempty"`
 	SourceRegistryProvenance string `json:"source_registry_provenance,omitempty"`
+	// Spec 093 (GH #955) — per-server concurrency overrides, scope (c) of
+	// FR-020. Each setting is tri-state: nil (omitted) means "inherit
+	// server_concurrency_defaults", 0 disables that setting for this server,
+	// positive overrides it. Surfaced on the GET path so a caller can read back
+	// what it set; PATCH/POST accept them via AddServerRequest. The effective
+	// concurrency for a server is additionally bounded by the global aggregate
+	// limiter, which is NOT an inheritance source for these fields.
+	MaxConcurrentRequests *int             `json:"max_concurrent_requests,omitempty"`
+	QueueSize             *int             `json:"queue_size,omitempty"`
+	QueueTimeout          *config.Duration `json:"queue_timeout,omitempty" swaggertype:"string"`
 }
 
 // Diagnostic is the REST-API representation of a classified server failure.
@@ -192,14 +222,61 @@ type OAuthConfig struct {
 // config.IsolationConfig so the web UI and native tray can both edit
 // these fields without reaching into config-file internals.
 type IsolationConfig struct {
-	Enabled     bool     `json:"enabled"`
-	Image       string   `json:"image,omitempty"`
-	NetworkMode string   `json:"network_mode,omitempty"`
-	ExtraArgs   []string `json:"extra_args,omitempty"`
-	MemoryLimit string   `json:"memory_limit,omitempty"`
-	CPULimit    string   `json:"cpu_limit,omitempty"`
-	WorkingDir  string   `json:"working_dir,omitempty"`
-	Timeout     string   `json:"timeout,omitempty"`
+	// Enabled is the EFFECTIVE isolation state for this server: whether its
+	// process is actually CONFINED, after the global setting, the per-server
+	// override, the structural gates and the host's capabilities. It is NOT the
+	// raw per-server override — read EnabledOverride for that (GH #1142).
+	//
+	// READ-ONLY. The write surfaces reject an `enabled` key precisely because
+	// it is derived: echoing it back would convert "inherits the global
+	// setting" into a permanent explicit override. Write EnabledOverride.
+	//
+	// It stays a non-pointer bool that is always present on the wire: the macOS
+	// tray decodes it as a non-optional Swift Bool, so omitting or nulling the
+	// key would fail Codable for the whole server payload. Older clients that
+	// read this field now simply get a true answer.
+	Enabled bool `json:"enabled"`
+	// EnabledOverride is the RAW per-server `isolation.enabled` override, as
+	// persisted. Absent means "inherit the global setting" — which is a
+	// distinct state from an explicit false, and the distinction the reporting
+	// bug used to destroy.
+	EnabledOverride *bool `json:"enabled_override,omitempty"`
+	// ModeOverride is the RAW per-server `isolation.mode` override
+	// ("docker" | "sandbox" | "none"). Absent means "inherit".
+	ModeOverride string   `json:"mode_override,omitempty"`
+	Image        string   `json:"image,omitempty"`
+	NetworkMode  string   `json:"network_mode,omitempty"`
+	ExtraArgs    []string `json:"extra_args,omitempty"`
+	MemoryLimit  string   `json:"memory_limit,omitempty"`
+	CPULimit     string   `json:"cpu_limit,omitempty"`
+	WorkingDir   string   `json:"working_dir,omitempty"`
+	Timeout      string   `json:"timeout,omitempty"`
+}
+
+// IsolationEffective reports the resolved isolation state of a server together
+// with the rule that produced it, so a UI can say WHY a server is (or is not)
+// isolated instead of rendering a bare toggle whose meaning is ambiguous.
+//
+// Read-only output; clients must not echo it back on PATCH requests.
+type IsolationEffective struct {
+	// Mode is the effective isolation mode: "docker" | "sandbox" | "none" —
+	// exactly what the spawn path branches on.
+	Mode string `json:"mode"`
+	// Isolated reports whether the process is actually CONFINED. It is NOT
+	// simply Mode != "none": "sandbox" on a host that cannot enforce Landlock
+	// (any non-Linux OS, or a kernel without the LSM) runs the server
+	// unconfined, and Source then says "sandbox-unavailable" (GH #1142).
+	Isolated bool `json:"isolated"`
+	// GlobalMode is what "inherit" resolves to right now.
+	GlobalMode string `json:"global_mode,omitempty"`
+	// Inherited is true when the server sets neither `isolation.enabled` nor
+	// `isolation.mode`, so its state tracks the global setting.
+	Inherited bool `json:"inherited"`
+	// Source names the deciding rule: "global", "server-mode",
+	// "server-opt-out", "server-opt-in-ignored", "not-stdio",
+	// "already-docker", "sandbox-unavailable" or "unsupported-mode".
+	// Treat an unrecognized value as "global".
+	Source string `json:"source,omitempty"`
 }
 
 // IsolationDefaults reports the resolved baseline Docker isolation
@@ -281,6 +358,17 @@ type Tool struct {
 	HeldReason  string   `json:"held_reason,omitempty"`
 	HeldVerdict string   `json:"held_verdict,omitempty"`
 	HeldSignals []string `json:"held_signals,omitempty"`
+	// Hash is the tool's current stored hash rendered in the preflight pin
+	// format "sha256/v{N}:{hex}" (Spec 098 FR-011), where N is the approval
+	// record's HashSchemaVersion. It is the authoring surface for
+	// `POST /api/v1/preflight` pins and `mcpproxy tools preflight --pin`:
+	// copy the value straight into a pin.
+	//
+	// Disclosure is OPERATOR TIER ONLY — same rule as the preflight per-tool
+	// result. The field is omitted for agent-token callers and for tools with
+	// no stored hash (no approval record yet, or a record written before
+	// hashes existed).
+	Hash string `json:"hash,omitempty"`
 }
 
 // DisabledToolStatus is the single machine-branchable reason a tool exists but
@@ -373,24 +461,54 @@ type UsageAggregateResponse struct {
 	Tools                 []UsageToolStat   `json:"tools"`
 	Other                 *UsageOtherBucket `json:"other,omitempty"` // present only when the list was truncated to top-N
 	Timeline              []UsageTimeBucket `json:"timeline"`
+	// TotalCalls and TotalErrors are the headline counts for the window: the sum
+	// of the timeline this same response carries, so the tiles and the histogram
+	// under them cannot disagree. They are NOT the sum of Tools — that list is
+	// lifetime-cumulative, upstream-only and truncated to top-N, and summing it
+	// client-side is what made the Usage tab print a third number for the same
+	// 24 hours (audit finding F1, #1046). The population is
+	// storage.CountsAsCall, shared with ActivitySummaryResponse.CallCount.
+	//
+	// Two bounds on how exactly this matches the Activity Log's own count.
+	// Both are bounded and disclosed, unlike the population mismatch they
+	// replace, which was unbounded and silent:
+	//
+	//   - Window granularity is the timeline's: whole hour buckets, so the span
+	//     is the requested window rounded up to a bucket edge.
+	//   - This response is served from a snapshot behind a short read cache
+	//     (observability.usage_cache_ttl, 5s by default) so the endpoint never
+	//     scans the activity log per request, while the summary endpoint counts
+	//     live. Calls that land inside that window appear on the Activity Log
+	//     first. FreshnessMs and GeneratedAt say how old the figures are, and
+	//     the Usage tab prints it ("Updated 3s ago").
+	TotalCalls  int64 `json:"total_calls"`
+	TotalErrors int64 `json:"total_errors"`
 }
 
 // UsageToolStat is the per-(server,tool) rollup row in UsageAggregateResponse.
 type UsageToolStat struct {
-	Server         string    `json:"server"`
-	Tool           string    `json:"tool"`
-	Calls          int64     `json:"calls"`
-	Errors         int64     `json:"errors"`
-	ErrorRate      float64   `json:"error_rate"`
-	Blocked        int64     `json:"blocked"`
-	TotalRespBytes int64     `json:"total_resp_bytes"`
-	AvgRespBytes   *int64    `json:"avg_resp_bytes"` // null when sized_calls == 0 (only legacy 0-byte calls)
-	TotalReqBytes  int64     `json:"total_req_bytes"`
-	AvgReqBytes    *int64    `json:"avg_req_bytes"` // null when no sized request calls
-	SizedCalls     int64     `json:"sized_calls"`   // calls with known response size (basis for avg_resp_bytes)
-	P50Ms          int64     `json:"p50_ms"`
-	P95Ms          int64     `json:"p95_ms"`
-	LastUsed       time.Time `json:"last_used"`
+	Server         string  `json:"server"`
+	Tool           string  `json:"tool"`
+	Calls          int64   `json:"calls"`
+	Errors         int64   `json:"errors"`
+	ErrorRate      float64 `json:"error_rate"`
+	Blocked        int64   `json:"blocked"`
+	Rejected       int64   `json:"rejected"` // spec 093: shed by a concurrency limit; never executed, so excluded from calls/latency
+	TotalRespBytes int64   `json:"total_resp_bytes"`
+	AvgRespBytes   *int64  `json:"avg_resp_bytes"` // null when sized_calls == 0 (only legacy 0-byte calls)
+	TotalReqBytes  int64   `json:"total_req_bytes"`
+	AvgReqBytes    *int64  `json:"avg_req_bytes"` // null when no sized request calls
+	SizedCalls     int64   `json:"sized_calls"`   // calls with known response size (basis for avg_resp_bytes)
+	// P50Ms and P95Ms are read off a fixed latency histogram, so they are BUCKET
+	// BOUNDS, not measured durations: the true percentile is at or below the
+	// value, and a client must render it as a bound ("≤ 5 ms"). P50Exceeds /
+	// P95Exceeds flip that reading for the unbounded overflow bucket, where the
+	// value is the last bound and the truth is above it ("> 10 s").
+	P50Ms      int64     `json:"p50_ms"`
+	P50Exceeds bool      `json:"p50_exceeds"`
+	P95Ms      int64     `json:"p95_ms"`
+	P95Exceeds bool      `json:"p95_exceeds"`
+	LastUsed   time.Time `json:"last_used"`
 }
 
 // UsageOtherBucket folds the tail of the per-tool list beyond top-N (FR: charts
@@ -839,6 +957,19 @@ type ToolCallRecord struct {
 	MCPClientName    string                 `json:"mcp_client_name,omitempty"`               // MCP client name from InitializeRequest
 	MCPClientVersion string                 `json:"mcp_client_version,omitempty"`            // MCP client version
 	Annotations      *ToolAnnotation        `json:"annotations,omitempty"`                   // Tool behavior hints snapshot
+
+	// ResponseTruncated and ResponseBytes describe a STORAGE-side cut (#1176):
+	// the caller received the response whole, and only the persisted copy was
+	// shortened to tool_call_max_response_size. When ResponseTruncated is true
+	// the Response object carries {truncated, original_bytes, preview, note}
+	// instead of the upstream result, and ResponseBytes is its size before the
+	// cut.
+	ResponseTruncated bool  `json:"response_truncated,omitempty"` // Stored copy was shortened
+	ResponseBytes     int64 `json:"response_bytes,omitempty"`     // Marshalled response size before truncation
+	// ArgumentsTruncated marks Arguments as a placeholder rather than the
+	// arguments the tool was called with. Replaying such a record without
+	// supplying arguments explicitly is refused.
+	ArgumentsTruncated bool `json:"arguments_truncated,omitempty"`
 }
 
 // GetToolCallsResponse is the response for GET /api/v1/tool-calls
@@ -1136,7 +1267,7 @@ type HealthStatus struct {
 	// Detail is an optional longer explanation of the status
 	Detail string `json:"detail,omitempty"`
 
-	// Action is the suggested fix action: "login", "restart", "enable", "approve", "view_logs", "set_secret", "configure", or "" (none)
+	// Action is the suggested fix action: "login", "restart", "enable", "approve", "view_logs", "set_secret", "configure", "edit_url", or "" (none)
 	Action string `json:"action,omitempty"`
 }
 
@@ -1151,6 +1282,14 @@ type UpdateInfo struct {
 	InstallChannel   string     `json:"install_channel,omitempty"`   // Detected install channel (homebrew, dmg, deb, rpm, docker, go-install, windows-installer, tarball, unknown) — Spec 079 FR-008
 	UpdateCommand    string     `json:"update_command,omitempty"`    // One-line update command for the channel; only set when an update is available and the channel has one — Spec 079 FR-009
 	NudgesSuppressed bool       `json:"nudges_suppressed,omitempty"` // UI surfaces must stay quiet (CI / non-interactive context); machine-readable fields still report the facts — Spec 079 FR-019
+
+	// Spec 079 FR-002 — how far behind the running build is. All four are
+	// additive (FR-021) and absent when the delta could not be resolved, in
+	// which case every surface renders its pre-delta wording.
+	BehindSummary           string `json:"behind_summary,omitempty"`            // Pre-rendered clause every surface prints verbatim, e.g. "8 releases / ~14 weeks behind" — render this, do not re-derive it
+	ReleasesBehind          *int   `json:"releases_behind,omitempty"`           // Releases on the offered channel between the running and offered versions
+	ReleasesBehindSaturated bool   `json:"releases_behind_saturated,omitempty"` // ReleasesBehind is a lower bound: the running build predates the scanned release window
+	WeeksBehind             *int   `json:"weeks_behind,omitempty"`              // Whole weeks between the two releases' publish dates; 0 is a real value, absent means unknown
 }
 
 // InfoEndpoints represents the available API endpoints
@@ -1166,4 +1305,157 @@ type InfoResponse struct {
 	ListenAddr string        `json:"listen_addr"`      // Listen address (e.g., "127.0.0.1:8080")
 	Endpoints  InfoEndpoints `json:"endpoints"`        // Available API endpoints
 	Update     *UpdateInfo   `json:"update,omitempty"` // Update information (if available)
+	// LaunchedBy is the durable launch provenance of the running core (Spec
+	// 092 FR-001a): "tray" when a tray spawned it, "installer" when the macOS
+	// PKG postinstall did, "" when user-launched or unknown. Always present
+	// (possibly empty) so a tray can distinguish "old core, not mine" from
+	// "old core I may supersede".
+	LaunchedBy string `json:"launched_by"`
+	// PID is the operating-system process id of the running core (Spec 092
+	// FR-002). A tray that merely ATTACHED to a core holds no Process handle
+	// for it, so without this there is no mechanism at all to stop a stale
+	// core — the consent action would have nothing to act on and could only
+	// print instructions. Paired with LaunchedBy it is what lets a newer tray
+	// supersede a core an older tray started.
+	PID int `json:"pid"`
+	// UpdatePolicy is the effective, hot-reloadable update policy (Spec 092
+	// FR-015). Always present: the `update` object above is omitted both when
+	// update checking is disabled AND when no check has produced a result
+	// yet, so its absence cannot tell a client whether it is allowed to run
+	// its own (e.g. Sparkle feed) check. This field states the answer.
+	UpdatePolicy UpdatePolicy `json:"update_policy"`
+}
+
+// UpdatePolicy is the effective update policy reported by GET /api/v1/info
+// (Spec 092 FR-015). Mirrors updatecheck.Policy; duplicated here because the
+// contracts package is the single source the OpenAPI spec and the frontend
+// types are generated from.
+type UpdatePolicy struct {
+	// Enabled is the effective automatic-check kill switch: update_check.enabled
+	// with MCPPROXY_DISABLE_AUTO_UPDATE=true winning over it. A user-initiated
+	// "Check for Updates" stays available regardless.
+	Enabled bool `json:"enabled"`
+	// Channel is the tracked release channel: "stable" or "rc".
+	Channel string `json:"channel"`
+	// NudgesSuppressed asks UI surfaces to stay quiet (CI / non-interactive)
+	// while machine-readable fields keep reporting the facts.
+	NudgesSuppressed bool `json:"nudges_suppressed"`
+}
+
+// ---------------------------------------------------------------------------
+// Required-tools preflight (Spec 098)
+//
+// The wire mirror of internal/preflight. The evaluator package owns the
+// semantics (classes, retryability, precedence); these constants exist so the
+// REST DTOs, the OpenAPI spec and the generated TypeScript all name the same
+// values. An anti-drift unit test in internal/preflight asserts the two sets
+// are identical, so a new code cannot land on one side only.
+// ---------------------------------------------------------------------------
+
+// PreflightStatus is the per-tool outcome. `ready` is a success status, not a
+// failure reason: ready results omit reason/retryable/action/detail/remediation.
+type PreflightStatus = string
+
+const (
+	PreflightStatusReady       PreflightStatus = "ready"
+	PreflightStatusUnavailable PreflightStatus = "unavailable"
+)
+
+// PreflightReason is the closed 15-code failure enum (Spec 098 FR-003).
+// Evolution is additive-only; consumers MUST treat an unknown code as
+// non-retryable. `server_saturated` is reserved and deliberately absent.
+type PreflightReason = string
+
+const (
+	PreflightReasonServerInitializing  PreflightReason = "server_initializing"
+	PreflightReasonServerUnhealthy     PreflightReason = "server_unhealthy"
+	PreflightReasonServerDisabled      PreflightReason = "server_disabled"
+	PreflightReasonServerQuarantined   PreflightReason = "server_quarantined"
+	PreflightReasonToolPendingApproval PreflightReason = "tool_pending_approval"
+	PreflightReasonToolChanged         PreflightReason = "tool_changed"
+	PreflightReasonToolBlockedByUser   PreflightReason = "tool_blocked_by_user"
+	PreflightReasonOAuthRequired       PreflightReason = "oauth_required"
+	PreflightReasonHashMismatch        PreflightReason = "hash_mismatch"
+	PreflightReasonServerNotInScope    PreflightReason = "server_not_in_scope"
+	PreflightReasonToolDeniedByConfig  PreflightReason = "tool_denied_by_config"
+	PreflightReasonMissingAnnotation   PreflightReason = "missing_annotation"
+	PreflightReasonPolicyFiltered      PreflightReason = "policy_filtered"
+	PreflightReasonNotFound            PreflightReason = "not_found"
+	PreflightReasonServerNotConfigured PreflightReason = "server_not_configured"
+)
+
+// PreflightVerdict is the set-level aggregate: the worst class present. It
+// drives the CLI exit code (ready 0 < degraded_retryable 10 < blocked 11 <
+// unknown_ids 12).
+type PreflightVerdict = string
+
+const (
+	PreflightVerdictReady             PreflightVerdict = "ready"
+	PreflightVerdictDegradedRetryable PreflightVerdict = "degraded_retryable"
+	PreflightVerdictBlocked           PreflightVerdict = "blocked"
+	PreflightVerdictUnknownIDs        PreflightVerdict = "unknown_ids"
+)
+
+// PreflightToolRef is one requested tool id, optionally hash-pinned.
+type PreflightToolRef struct {
+	// ID is a canonical "<server>:<tool>" id. A malformed id is answered with a
+	// per-ID not_found carrying a format hint, never a request-level error.
+	ID string `json:"id"`
+	// PinHash is "sha256/v{N}:{hex}" — the schema version is embedded so a
+	// proxy-side hash-algorithm bump is distinguishable from upstream drift.
+	PinHash string `json:"pin_hash,omitempty"`
+}
+
+// PreflightPolicy carries the annotation filters the check evaluates under
+// (spec 094 semantics: read_only_only -> exclude_destructive ->
+// exclude_open_world, first excluding filter owns the omission).
+type PreflightPolicy struct {
+	ReadOnlyOnly       bool `json:"read_only_only,omitempty"`
+	ExcludeDestructive bool `json:"exclude_destructive,omitempty"`
+	ExcludeOpenWorld   bool `json:"exclude_open_world,omitempty"`
+}
+
+// PreflightRequest is the POST /api/v1/preflight body.
+type PreflightRequest struct {
+	// Tools is 1..100 entries BEFORE dedup; duplicates are collapsed, and
+	// duplicate ids carrying different pins are a validation error.
+	Tools []PreflightToolRef `json:"tools"`
+	// Profile evaluates under a named profile's server scope. Unknown: 400.
+	Profile string           `json:"profile,omitempty"`
+	Policy  *PreflightPolicy `json:"policy,omitempty"`
+	// WaitMS polls local state for up to this many milliseconds (cap 10000)
+	// while every failure is retryable-class.
+	WaitMS int `json:"wait_ms,omitempty"`
+}
+
+// PreflightToolResult is one per-tool verdict. Failure fields are present only
+// for `unavailable`; `action` is omitted (not "none") when a reason has no
+// action, matching the health-action vocabulary.
+type PreflightToolResult struct {
+	ID          string          `json:"id"`
+	Status      PreflightStatus `json:"status"`
+	Reason      PreflightReason `json:"reason,omitempty"`
+	Retryable   *bool           `json:"retryable,omitempty"`
+	Action      string          `json:"action,omitempty"`
+	Detail      string          `json:"detail,omitempty"`
+	Remediation string          `json:"remediation,omitempty"`
+	// Hash is the tool's current pin ("sha256/v{N}:{hex}") — operator tier,
+	// ready results only. Never disclosed to an agent token.
+	Hash string `json:"hash,omitempty"`
+	// DidYouMean carries up to 3 nearest caller-visible ids on not_found. It
+	// never crosses a scope boundary and never names a quarantined server's
+	// tools.
+	DidYouMean []string `json:"did_you_mean,omitempty"`
+}
+
+// PreflightResponse is the 200 body: HTTP status reports whether the CHECK
+// executed; the availability verdict lives here.
+type PreflightResponse struct {
+	Verdict   PreflightVerdict `json:"verdict"`
+	CheckedAt time.Time        `json:"checked_at"`
+	// WaitedMS is present when wait_ms was requested (0 when the wait
+	// semaphore was exhausted and the request resolved immediately).
+	WaitedMS *int `json:"waited_ms,omitempty"`
+	// Tools are ordered by first occurrence of each unique id in the request.
+	Tools []PreflightToolResult `json:"tools"`
 }

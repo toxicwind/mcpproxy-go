@@ -38,6 +38,8 @@ import (
 	bbolterrors "go.etcd.io/bbolt/errors"
 	"go.uber.org/zap"
 
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/audit"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/branding"
 	clioutput "github.com/smart-mcp-proxy/mcpproxy-go/internal/cli/output"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/cliclient"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
@@ -53,25 +55,27 @@ import (
 )
 
 var (
-	configFile        string
-	dataDir           string
-	listen            string
-	trayEndpoint      string
-	enableSocket      bool
-	logLevel          string
-	debugSearch       bool
-	toolResponseLimit int
-	toolResponseMode  string
-	logToFile         bool
-	logDir            string
+	configFile             string
+	dataDir                string
+	listen                 string
+	trayEndpoint           string
+	enableSocket           bool
+	logLevel               string
+	debugSearch            bool
+	toolResponseLimit      int
+	toolResponseMode       string
+	directToolResponseMode string
+	logToFile              bool
+	logDir                 string
 
 	// Security flags
-	requireMCPAuth    bool
-	readOnlyMode      bool
-	disableManagement bool
-	allowServerAdd    bool
-	allowServerRemove bool
-	enablePrompts     bool
+	requireMCPAuth           bool
+	readOnlyMode             bool
+	disableManagement        bool
+	allowServerAdd           bool
+	allowServerRemove        bool
+	enablePrompts            bool
+	aggregateUpstreamPrompts bool
 
 	// Output formatting flags (global)
 	globalOutputFormat string
@@ -97,8 +101,15 @@ func main() {
 	config.SetRegistriesInitCallback(registries.SetRegistriesFromConfig)
 
 	rootCmd := &cobra.Command{
-		Use:     "mcpproxy",
-		Short:   "Smart MCP Proxy - Intelligent tool discovery and proxying for Model Context Protocol servers",
+		Use:   "mcpproxy",
+		Short: "Smart MCP Proxy - Intelligent tool discovery and proxying for Model Context Protocol servers",
+		// Long is shown in `mcpproxy --help`. It carries the project links
+		// (discussion #948) so the way back to the homepage/repo/docs is always
+		// one --help away, no matter how the binary was installed.
+		Long: "Smart MCP Proxy - Intelligent tool discovery and proxying for Model Context Protocol servers.\n\n" +
+			"Homepage: " + branding.Homepage + "\n" +
+			"GitHub:   " + branding.Repo + "\n" +
+			"Docs:     " + branding.Docs,
 		Version: version,
 	}
 	rootCmd.SetVersionTemplate(versionLine())
@@ -124,18 +135,20 @@ func main() {
 	}
 
 	// Add server-specific flags
-	serverCmd.Flags().StringVarP(&listen, "listen", "l", "", "Listen address (for HTTP mode, not used in stdio mode)")
+	serverCmd.Flags().StringVarP(&listen, "listen", "l", "", "Listen address for HTTP mode (host:port). Pass \"\" or \":0\" for native stdio transport")
 	serverCmd.Flags().StringVar(&trayEndpoint, "tray-endpoint", "", "Tray endpoint override (unix:///path/socket.sock or npipe:////./pipe/name). Default: auto-detect from data-dir")
 	serverCmd.Flags().BoolVar(&enableSocket, "enable-socket", true, "Enable Unix socket/named pipe for local IPC (default: true)")
 	serverCmd.Flags().BoolVar(&debugSearch, "debug-search", false, "Enable debug search tool for search relevancy debugging")
 	serverCmd.Flags().IntVar(&toolResponseLimit, "tool-response-limit", 0, "Tool response limit in characters (0 = disabled, default: 20000 from config)")
 	serverCmd.Flags().StringVar(&toolResponseMode, "tool-response-mode", "", "retrieve_tools serialization mode: full (default) or compact (Spec 085)")
+	serverCmd.Flags().StringVar(&directToolResponseMode, "direct-tool-response-mode", "", "direct-surface serialization mode: full (default) or deferred (Spec 102)")
 	serverCmd.Flags().BoolVar(&requireMCPAuth, "require-mcp-auth", false, "Require authentication on /mcp endpoint (agent tokens or API key)")
 	serverCmd.Flags().BoolVar(&readOnlyMode, "read-only", false, "Enable read-only mode")
 	serverCmd.Flags().BoolVar(&disableManagement, "disable-management", false, "Disable management features")
 	serverCmd.Flags().BoolVar(&allowServerAdd, "allow-server-add", true, "Allow adding new servers")
 	serverCmd.Flags().BoolVar(&allowServerRemove, "allow-server-remove", true, "Allow removing existing servers")
 	serverCmd.Flags().BoolVar(&enablePrompts, "enable-prompts", true, "Enable prompts for user input")
+	serverCmd.Flags().BoolVar(&aggregateUpstreamPrompts, "aggregate-upstream-prompts", false, "Aggregate upstream servers' MCP prompts into mcpproxy's prompt list (opt-in)")
 
 	// Add search-servers command
 	searchCmd := createSearchServersCommand()
@@ -207,11 +220,13 @@ func main() {
 	rootCmd.AddCommand(statusCmd)
 	rootCmd.AddCommand(tokenCmd)
 	rootCmd.AddCommand(telemetryCmd)
+	rootCmd.AddCommand(dbCmd)
 	rootCmd.AddCommand(feedbackCmd)
 	rootCmd.AddCommand(securityCmd)
 	rootCmd.AddCommand(connectCmd)
 	rootCmd.AddCommand(disconnectCmd)
 	rootCmd.AddCommand(GetVersionCommand())
+	rootCmd.AddCommand(GetUpdateCommand())
 
 	// Server-edition-only commands (e.g. `credential`). No-op in personal edition.
 	registerServerEditionCommands(rootCmd)
@@ -418,67 +433,14 @@ func runServer(cmd *cobra.Command, _ []string) error {
 	// Get flag values from command (handles both global and local flags)
 	cmdLogLevel, _ := cmd.Flags().GetString("log-level")
 	cmdLogToFile, _ := cmd.Flags().GetBool("log-to-file")
-	cmdLogDir, _ := cmd.Flags().GetString("log-dir")
-	cmdDebugSearch, _ := cmd.Flags().GetBool("debug-search")
-	cmdToolResponseLimit, _ := cmd.Flags().GetInt("tool-response-limit")
-	cmdRequireMCPAuth, _ := cmd.Flags().GetBool("require-mcp-auth")
-	cmdReadOnlyMode, _ := cmd.Flags().GetBool("read-only")
-	cmdDisableManagement, _ := cmd.Flags().GetBool("disable-management")
-	cmdAllowServerAdd, _ := cmd.Flags().GetBool("allow-server-add")
-	cmdAllowServerRemove, _ := cmd.Flags().GetBool("allow-server-remove")
-	cmdEnablePrompts, _ := cmd.Flags().GetBool("enable-prompts")
 
 	// Load configuration first to get logging settings
-	cfg, err := loadConfig(cmd)
+	cfg, saver, err := loadConfig(cmd)
 	if err != nil {
 		return fmt.Errorf("failed to load configuration: %w", err)
 	}
 
-	// Override logging settings from command line
-	if cfg.Logging == nil {
-		// Use command-specific default level (INFO for server command)
-		defaultLevel := cmdLogLevel
-		if defaultLevel == "" {
-			defaultLevel = defaultLogLevel // Server command defaults to INFO
-		}
-
-		cfg.Logging = &config.LogConfig{
-			Level:         defaultLevel,
-			EnableFile:    !cmd.Flags().Changed("log-to-file") || cmdLogToFile, // Default true for serve, unless explicitly disabled
-			EnableConsole: true,
-			Filename:      "main.log",
-			MaxSize:       10,
-			MaxBackups:    5,
-			MaxAge:        30,
-			Compress:      true,
-			JSONFormat:    false,
-		}
-	} else {
-		// Override specific fields from command line
-		if cmdLogLevel != "" {
-			cfg.Logging.Level = cmdLogLevel
-		} else if cfg.Logging.Level == "" {
-			cfg.Logging.Level = defaultLogLevel // Server command defaults to INFO
-		}
-
-		// For serve mode: Enable file logging by default, only disable if explicitly set to false
-		if cmd.Flags().Changed("log-to-file") {
-			cfg.Logging.EnableFile = cmdLogToFile
-		} else {
-			cfg.Logging.EnableFile = true // Default to true for serve mode
-		}
-
-		if cfg.Logging.Filename == "" || cfg.Logging.Filename == "mcpproxy.log" {
-			cfg.Logging.Filename = "main.log"
-		}
-	}
-
-	// Resolve the log directory. An explicit --log-dir wins; otherwise a
-	// non-default data dir co-locates logs under <data-dir>/logs so that
-	// tests/e2e/harness `serve` runs do not pollute the shared OS-standard
-	// prod log (root cause of the phantom "core restarts every 10s" in
-	// MCP-2250). The default data dir keeps the OS-standard location.
-	cfg.Logging.LogDir = resolveServeLogDir(cmdLogDir, cfg.Logging.LogDir, cfg.DataDir, defaultDataDirPath())
+	applyServeLoggingFlags(cmd, cfg)
 
 	// Setup logger with new logging system
 	logger, err := logs.SetupLogger(cfg.Logging)
@@ -488,6 +450,11 @@ func runServer(cmd *cobra.Command, _ []string) error {
 	defer func() {
 		_ = logger.Sync()
 	}()
+
+	// Spec 107 FR-035: the loader has no logger, so the removed-key /
+	// deprecated-key findings it recorded are emitted here, once, now that
+	// one exists (server build only; the personal build records none).
+	config.LogLoadDiagnostics(cfg, logger)
 
 	// Log startup information including log directory info
 	logDirInfo, err := logs.GetLogDirInfo()
@@ -525,35 +492,11 @@ func runServer(cmd *cobra.Command, _ []string) error {
 	// Issue #566: registries (e.g. Pulse) require a versioned User-Agent.
 	registries.SetVersion(version)
 
-	// Override other settings from command line
-	cfg.DebugSearch = cmdDebugSearch
-
-	if cmdToolResponseLimit != 0 {
-		cfg.ToolResponseLimit = cmdToolResponseLimit
-	}
-
-	// Apply security settings from command line ONLY if explicitly set
-	if cmd.Flags().Changed("require-mcp-auth") {
-		cfg.RequireMCPAuth = cmdRequireMCPAuth
-	}
-	if cmd.Flags().Changed("read-only") {
-		cfg.ReadOnlyMode = cmdReadOnlyMode
-	}
-	if cmd.Flags().Changed("disable-management") {
-		cfg.DisableManagement = cmdDisableManagement
-	}
-	if cmd.Flags().Changed("allow-server-add") {
-		cfg.AllowServerAdd = cmdAllowServerAdd
-	}
-	if cmd.Flags().Changed("allow-server-remove") {
-		cfg.AllowServerRemove = cmdAllowServerRemove
-	}
-	if cmd.Flags().Changed("enable-prompts") {
-		cfg.EnablePrompts = cmdEnablePrompts
-	}
+	applyServeRuntimeFlags(cmd, cfg)
 
 	logger.Info("Configuration loaded",
 		zap.String("data_dir", cfg.DataDir),
+		zap.Strings("process_overrides", config.ProcessOverrideFields()),
 		zap.Int("servers_count", len(cfg.Servers)),
 		zap.Bool("require_mcp_auth", cfg.RequireMCPAuth),
 		zap.Bool("read_only_mode", cfg.ReadOnlyMode),
@@ -583,14 +526,10 @@ func runServer(cmd *cobra.Command, _ []string) error {
 		logger.Warn(frameMsg)
 
 		// Save the auto-generated key to config file for persistence
-		var configPathToSave string
-		if configFile != "" {
-			configPathToSave = configFile
-		} else {
-			configPathToSave = config.GetConfigPath(cfg.DataDir)
-		}
+		saver.setGeneratedAPIKey(apiKey)
+		configPathToSave := saver.path
 
-		if err := config.SaveConfig(cfg, configPathToSave); err != nil {
+		if err := saver.save(cfg, configPathToSave); err != nil {
 			logger.Warn("Failed to save auto-generated API key to config file",
 				zap.Error(err),
 				zap.String("config_path", configPathToSave))
@@ -608,18 +547,62 @@ func runServer(cmd *cobra.Command, _ []string) error {
 			zap.String("api_key_prefix", maskedKey))
 	}
 
-	// Create server with the actual config path used
-	var actualConfigPath string
-	if configFile != "" {
-		actualConfigPath = configFile
-	} else {
-		// When using default config, still track the actual path used
-		actualConfigPath = config.GetConfigPath(cfg.DataDir)
+	// Create server with the config path that was actually loaded
+	actualConfigPath := saver.path
+	// Spec 107 T109: construct the audit sink before the server so a bad
+	// audit_log configuration fails startup with exit code 4 (classifyError,
+	// below) rather than silently running without attribution. Transport is
+	// derived exactly as internal/server.Server.Start does (Listen empty or
+	// ":0" means the native stdio MCP transport, where stdout carries
+	// JSON-RPC and can never double as a log sink - FR-014).
+	transport := config.TransportHTTP
+	if cfg.Listen == "" || cfg.Listen == ":0" {
+		transport = config.TransportStdio
 	}
-	srv, err := server.NewServerWithConfigPath(cfg, actualConfigPath, logger)
+	resolvedAudit, auditWarning, err := config.EffectiveAuditLog(cfg, transport)
+	if err != nil {
+		recordStartupOutcome(cfg, actualConfigPath, classifyStartupError(err), saver.save)
+		return err
+	}
+	if auditWarning != "" {
+		logger.Warn(auditWarning)
+	}
+
+	var auditSink audit.Sink
+	if resolvedAudit.Enabled {
+		if resolvedAudit.Path != "" {
+			auditSink, err = audit.NewFileSink(
+				resolvedAudit.Path,
+				resolvedAudit.MaxSizeMB,
+				resolvedAudit.MaxBackups,
+				resolvedAudit.MaxAgeDays,
+				resolvedAudit.Compress,
+				audit.WithFailureLogger(func(werr error) {
+					logger.Warn("audit_log write failed", zap.Error(werr))
+				}),
+			)
+			if err != nil {
+				startupErr := config.NewStartupError(config.ExitCodeAuditLogError,
+					fmt.Sprintf("audit_log.path %q cannot be opened for append: %v", resolvedAudit.Path, err))
+				recordStartupOutcome(cfg, actualConfigPath, classifyStartupError(startupErr), saver.save)
+				return startupErr
+			}
+		} else if resolvedAudit.Stdout {
+			auditSink = audit.NewStdoutSink(os.Stdout,
+				audit.WithFailureLogger(func(werr error) {
+					logger.Warn("audit_log write failed", zap.Error(werr))
+				}),
+			)
+		}
+	}
+	if auditSink != nil {
+		defer func() { _ = auditSink.Close() }()
+	}
+
+	srv, err := server.NewServerWithConfigPath(cfg, actualConfigPath, logger, server.WithAuditSink(auditSink))
 	if err != nil {
 		// Spec 042: classify the failure into a startup outcome enum.
-		recordStartupOutcome(cfg, actualConfigPath, classifyStartupError(err))
+		recordStartupOutcome(cfg, actualConfigPath, classifyStartupError(err), saver.save)
 		return fmt.Errorf("failed to create server: %w", err)
 	}
 
@@ -627,7 +610,7 @@ func runServer(cmd *cobra.Command, _ []string) error {
 	// the user has not already seen it). Persist the flag so we never nag
 	// twice.
 	if telemetry.MaybePrintFirstRunNotice(cfg, os.Stderr) {
-		_ = config.SaveConfig(cfg, actualConfigPath)
+		_ = saver.save(cfg, actualConfigPath)
 	}
 
 	// Setup signal handling for graceful shutdown
@@ -674,11 +657,11 @@ func runServer(cmd *cobra.Command, _ []string) error {
 	logger.Info("Starting mcpproxy server")
 	if err := srv.StartServer(ctx); err != nil {
 		// Spec 042: classify the failure into a startup outcome enum.
-		recordStartupOutcome(cfg, actualConfigPath, classifyStartupError(err))
+		recordStartupOutcome(cfg, actualConfigPath, classifyStartupError(err), saver.save)
 		return fmt.Errorf("failed to start server: %w", err)
 	}
 	// Spec 042: clean start.
-	recordStartupOutcome(cfg, actualConfigPath, "success")
+	recordStartupOutcome(cfg, actualConfigPath, "success", saver.save)
 
 	// Wait for context cancellation (signal) or a fatal serve failure
 	select {
@@ -699,7 +682,7 @@ func runServer(cmd *cobra.Command, _ []string) error {
 		// conflicts) and can react via its state machine.
 		logger.Error("Server failed, shutting down", zap.Error(err))
 		// Spec 042: overwrite the optimistic "success" outcome recorded above.
-		recordStartupOutcome(cfg, actualConfigPath, classifyStartupError(err))
+		recordStartupOutcome(cfg, actualConfigPath, classifyStartupError(err), saver.save)
 		srv.SetShutdownInfo("error", "")
 		if shutdownErr := srv.Shutdown(); shutdownErr != nil {
 			logger.Error("Error shutting down server", zap.Error(shutdownErr))
@@ -708,48 +691,145 @@ func runServer(cmd *cobra.Command, _ []string) error {
 	}
 }
 
-func loadConfig(cmd *cobra.Command) (*config.Config, error) {
+// serveConfigSaver persists the config during `serve` without leaking the
+// process-only overrides that loadConfig and runServer layer onto the in-memory
+// config: CLI flags (--listen, --tray-endpoint, --enable-socket,
+// --tool-response-*, --log-level, --read-only, ...) and MCPPROXY_* env values.
+// An override applies to that one process only; persisting it would make the
+// next unflagged start — or the tray-launched core — inherit a one-off choice
+// (`--listen :0` used to write `"listen": ":0"` into the file, after which the
+// core silently booted in stdio mode).
+//
+// The three `serve` saves (auto-generated API key, first-run telemetry notice,
+// startup outcome) own exactly two things: the generated key and the telemetry
+// state. Everything else is written back from the config FILE as it is at save
+// time, so a save that fires late (the fatal-serve-error path can run hours
+// after startup) never resurrects a startup-era server list over changes the
+// runtime persisted in the meantime.
+type serveConfigSaver struct {
+	// path is the config file loadConfig actually read (or created): the
+	// destination of every serve save and the runtime's config path.
+	path string
+	// fileCfg is the file as read at startup (see readConfigFile), the base
+	// only when the file can no longer be read at save time.
+	fileCfg config.Config
+	// generatedAPIKey is set only when serve generated the key itself. It
+	// fills an empty api_key; a key rotated through the API since is kept.
+	generatedAPIKey string
+}
+
+// newServeConfigSaver snapshots the file at path; when it cannot be read
+// (e.g. --config=/dev/null) the loaded cfg — taken before any flag override,
+// Logging copied because runServer mutates it in place — stands in.
+func newServeConfigSaver(cfg *config.Config, path string) *serveConfigSaver {
+	s := &serveConfigSaver{path: path}
+	if fileCfg, err := readConfigFile(path); err == nil {
+		s.fileCfg = *fileCfg
+		return s
+	}
+	s.fileCfg = *cfg
+	if cfg.Logging != nil {
+		logging := *cfg.Logging
+		s.fileCfg.Logging = &logging
+	}
+	return s
+}
+
+// setGeneratedAPIKey marks key as generated by this process so save persists it.
+func (s *serveConfigSaver) setGeneratedAPIKey(key string) {
+	s.generatedAPIKey = key
+}
+
+// save writes the current file contents plus the fields `serve` owns: the
+// API key it generated (only into an empty api_key) and cfg.Telemetry
+// (last_startup_outcome, first-run notice flag).
+func (s *serveConfigSaver) save(cfg *config.Config, path string) error {
+	persisted := s.fileCfg
+	if onDisk, err := readConfigFile(path); err == nil {
+		persisted = *onDisk
+	}
+	if persisted.APIKey == "" {
+		persisted.APIKey = s.generatedAPIKey
+	}
+	persisted.Telemetry = cfg.Telemetry
+	return config.SaveConfig(&persisted, path)
+}
+
+// readConfigFile is the side-effect-free read the saver merges into.
+// config.LoadFromFile is NOT a read: it applies MCPPROXY_* env overrides,
+// copies MCPPROXY_API_KEY into api_key via Validate, creates data_dir and
+// replaces the process-global registry list — none of which a save may do.
+func readConfigFile(path string) (*config.Config, error) {
+	return config.DecodeConfigFile(path)
+}
+
+func loadConfig(cmd *cobra.Command) (*config.Config, *serveConfigSaver, error) {
 	var cfg *config.Config
 	var err error
+	loadedPath := configFile
 
 	// Load configuration - use LoadFromFile if config file specified, otherwise use Load
 	if configFile != "" {
+		// A named config that has never been written is a FIRST RUN, not an
+		// error: the relocated tray instance of GH #936 spawns its core with
+		// --data-dir <root> --config <root>/mcp_config.json against a root
+		// nothing has used before. The implicit path has always created its
+		// default here; the explicit one used to exit with "no such file or
+		// directory" instead, which made that whole flow unusable.
+		if _, ensureErr := config.EnsureConfigFile(configFile, dataDir); ensureErr != nil {
+			return nil, nil, ensureErr
+		}
 		cfg, err = config.LoadFromFile(configFile)
 	} else {
-		cfg, err = config.Load()
+		cfg, loadedPath, err = config.LoadWithPath()
 	}
 
 	if err != nil {
-		return nil, fmt.Errorf("failed to load configuration: %w", err)
+		return nil, nil, fmt.Errorf("failed to load configuration: %w", err)
 	}
 
-	// Override with command line flags ONLY if they were explicitly set
+	// Snapshot the file before any flag override so the saves in runServer
+	// never persist a one-off CLI choice.
+	saver := newServeConfigSaver(cfg, loadedPath)
+
+	// Override with command line flags ONLY if they were explicitly set. Each
+	// one is a process-only override (config.OverrideForProcess): the effective
+	// config carries it, no save path persists it — see process_overrides.go.
 	if dataDir != "" {
-		cfg.DataDir = dataDir
+		config.OverrideForProcess(cfg, config.FieldDataDir, config.OverrideSourceFlag, dataDir)
 	}
 	if cmd.Flags().Changed("listen") {
 		listenFlag, _ := cmd.Flags().GetString("listen")
-		cfg.Listen = listenFlag
+		// An explicit empty --listen asks for native stdio transport, but
+		// cfg.Validate() below resets an empty Listen to the HTTP default (it
+		// cannot tell "no listen key in the file" from "cleared on purpose").
+		// ":0" is the sentinel the server recognises after validation, so map
+		// the empty flag onto it here — the only place the intent is knowable.
+		if listenFlag == "" {
+			listenFlag = ":0"
+		}
+		config.OverrideForProcess(cfg, config.FieldListen, config.OverrideSourceFlag, listenFlag)
 	}
 	if cmd.Flags().Changed("tray-endpoint") {
 		trayEndpointFlag, _ := cmd.Flags().GetString("tray-endpoint")
-		cfg.TrayEndpoint = trayEndpointFlag
+		config.OverrideForProcess(cfg, config.FieldTrayEndpoint, config.OverrideSourceFlag, trayEndpointFlag)
 	}
 	if cmd.Flags().Changed("enable-socket") {
 		enableSocketFlag, _ := cmd.Flags().GetBool("enable-socket")
-		cfg.EnableSocket = enableSocketFlag
+		config.OverrideForProcess(cfg, config.FieldEnableSocket, config.OverrideSourceFlag, enableSocketFlag)
 	}
 	if toolResponseLimit != 0 {
-		cfg.ToolResponseLimit = toolResponseLimit
+		config.OverrideForProcess(cfg, config.FieldToolResponseLimit, config.OverrideSourceFlag, toolResponseLimit)
 	}
 	applyToolResponseModeFlag(cfg, cmd.Flags().Changed("tool-response-mode"), toolResponseMode)
+	applyDirectToolResponseModeFlag(cfg, cmd.Flags().Changed("direct-tool-response-mode"), directToolResponseMode)
 
 	// Validate the configuration
 	if err := cfg.Validate(); err != nil {
-		return nil, fmt.Errorf("invalid configuration: %w", err)
+		return nil, nil, fmt.Errorf("invalid configuration: %w", err)
 	}
 
-	return cfg, nil
+	return cfg, saver, nil
 }
 
 // applyToolResponseModeFlag applies the --tool-response-mode serve flag onto
@@ -759,7 +839,101 @@ func loadConfig(cmd *cobra.Command) (*config.Config, error) {
 // invalid values with a tool_response_mode error.
 func applyToolResponseModeFlag(cfg *config.Config, changed bool, mode string) {
 	if changed {
-		cfg.ToolResponseMode = mode
+		config.OverrideForProcess(cfg, config.FieldToolResponseMode, config.OverrideSourceFlag, mode)
+	}
+}
+
+// applyDirectToolResponseModeFlag applies the --direct-tool-response-mode serve
+// flag onto the loaded config (Spec 102 FR-001). Same contract as its
+// retrieve_tools sibling above: only an explicitly set flag overrides the
+// file/env value, so an unset flag never clobbers
+// MCPPROXY_DIRECT_TOOL_RESPONSE_MODE or the config file, and cfg.Validate()
+// rejects invalid values with a direct_tool_response_mode error.
+func applyDirectToolResponseModeFlag(cfg *config.Config, changed bool, mode string) {
+	if changed {
+		config.OverrideForProcess(cfg, config.FieldDirectToolResponseMode, config.OverrideSourceFlag, mode)
+	}
+}
+
+// applyServeLoggingFlags fills serve's logging defaults and layers the
+// --log-level / --log-to-file / --log-dir flags on top. The flags are
+// process-only overrides (config.OverrideForProcess) so no save path writes
+// them into the file; the serve defaults (INFO, file logging on, main.log)
+// are plain in-memory fills, as they always were.
+func applyServeLoggingFlags(cmd *cobra.Command, cfg *config.Config) {
+	cmdLogLevel, _ := cmd.Flags().GetString("log-level")
+	cmdLogToFile, _ := cmd.Flags().GetBool("log-to-file")
+	cmdLogDir, _ := cmd.Flags().GetString("log-dir")
+
+	if cfg.Logging == nil {
+		cfg.Logging = &config.LogConfig{
+			EnableConsole: true,
+			Filename:      "main.log",
+			MaxSize:       10,
+			MaxBackups:    5,
+			MaxAge:        30,
+			Compress:      true,
+			JSONFormat:    false,
+		}
+	}
+
+	if cmdLogLevel != "" {
+		config.OverrideForProcess(cfg, config.FieldLogLevel, config.OverrideSourceFlag, cmdLogLevel)
+	} else if cfg.Logging.Level == "" {
+		cfg.Logging.Level = defaultLogLevel // Server command defaults to INFO
+	}
+
+	// For serve mode: Enable file logging by default, only disable if explicitly set to false
+	if cmd.Flags().Changed("log-to-file") {
+		config.OverrideForProcess(cfg, config.FieldLogEnableFile, config.OverrideSourceFlag, cmdLogToFile)
+	} else {
+		cfg.Logging.EnableFile = true // Default to true for serve mode
+	}
+
+	if cfg.Logging.Filename == "" || cfg.Logging.Filename == "mcpproxy.log" {
+		cfg.Logging.Filename = "main.log"
+	}
+
+	// Resolve the log directory. An explicit --log-dir wins; otherwise a
+	// non-default data dir co-locates logs under <data-dir>/logs so that
+	// tests/e2e/harness `serve` runs do not pollute the shared OS-standard
+	// prod log (root cause of the phantom "core restarts every 10s" in
+	// MCP-2250). The default data dir keeps the OS-standard location.
+	logDir := resolveServeLogDir(cmdLogDir, cfg.Logging.LogDir, cfg.DataDir, defaultDataDirPath())
+	if cmdLogDir != "" {
+		config.OverrideForProcess(cfg, config.FieldLogDir, config.OverrideSourceFlag, logDir)
+	} else {
+		cfg.Logging.LogDir = logDir
+	}
+}
+
+// applyServeRuntimeFlags layers the remaining serve flags onto the loaded
+// config, each as a process-only override (config.OverrideForProcess).
+func applyServeRuntimeFlags(cmd *cobra.Command, cfg *config.Config) {
+	flags := cmd.Flags()
+
+	// --debug-search has always applied unconditionally (its default is
+	// false), so it is recorded unconditionally too.
+	cmdDebugSearch, _ := flags.GetBool("debug-search")
+	config.OverrideForProcess(cfg, config.FieldDebugSearch, config.OverrideSourceFlag, cmdDebugSearch)
+
+	// Apply security settings from command line ONLY if explicitly set
+	for _, f := range []struct {
+		flag  string
+		field config.Field[bool]
+	}{
+		{"require-mcp-auth", config.FieldRequireMCPAuth},
+		{"read-only", config.FieldReadOnlyMode},
+		{"disable-management", config.FieldDisableManagement},
+		{"allow-server-add", config.FieldAllowServerAdd},
+		{"allow-server-remove", config.FieldAllowServerRemove},
+		{"enable-prompts", config.FieldEnablePrompts},
+		{"aggregate-upstream-prompts", config.FieldAggregateUpstreamPrompts},
+	} {
+		if flags.Changed(f.flag) {
+			v, _ := flags.GetBool(f.flag)
+			config.OverrideForProcess(cfg, f.field, config.OverrideSourceFlag, v)
+		}
 	}
 }
 
@@ -767,6 +941,34 @@ func applyToolResponseModeFlag(cfg *config.Config, changed bool, mode string) {
 func classifyError(err error) int {
 	if err == nil {
 		return ExitCodeSuccess
+	}
+
+	// Spec 098: a preflight verdict is a RESULT, not a failure of mcpproxy, and
+	// it carries its own exit code (10/11/12). It is checked first so the
+	// string-matching heuristics below — "config", "invalid", "denied" all
+	// appear in remediation text — can never reclassify a verdict as a config
+	// or permission error.
+	var preflightErr *preflightVerdictError
+	if errors.As(err, &preflightErr) {
+		return preflightErr.ExitCode()
+	}
+
+	// …and a preflight failure that is NOT a verdict is a plain general error
+	// (FR-009), for the same reason: the heuristics below read the daemon's
+	// message, which a transport or argument failure does not control.
+	var preflightGeneralErr *preflightGeneralError
+	if errors.As(err, &preflightGeneralErr) {
+		return preflightGeneralErr.ExitCode()
+	}
+
+	// Spec 107 FR-014: a typed configuration StartupError (e.g. an unwritable
+	// audit_log.path, or audit_log.stdout refused under the stdio transport)
+	// carries its own exit code, matched here BEFORE the string heuristics
+	// below - a wrapped "permission denied" underneath must classify as exit
+	// 4 (config error), never fall through to exit 5.
+	var startupErr *config.StartupError
+	if errors.As(err, &startupErr) {
+		return startupErr.ExitCode
 	}
 
 	// Check for port conflict errors

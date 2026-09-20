@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,6 +10,7 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -23,25 +25,80 @@ import (
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/connect"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/contracts"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/launch"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/logs"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/management"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/oauth"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/observability"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/preflight"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/registries"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/reqcontext"
 	internalRuntime "github.com/smart-mcp-proxy/mcpproxy-go/internal/runtime"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/secret"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/security"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/storage"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/telemetry"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/transport"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/updatecheck"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/upstream/core"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/upstream/limiter"
 )
 
 const (
 	asyncToggleTimeout = 5 * time.Second
 	secretTypeKeyring  = "keyring"
+
+	// defaultAPIRequestTimeout bounds an ordinary /api/v1 request.
+	defaultAPIRequestTimeout = 60 * time.Second
+
+	// codeExecPath is the one REST route that runs caller-supplied code.
+	codeExecPath = "/api/v1/code/exec"
+
+	// codeExecRequestTimeout is the parent deadline for POST /api/v1/code/exec.
+	// The handler derives the precise budget from the caller's timeout_ms, but
+	// a context only ever shrinks against its parent, so the parent has to
+	// cover the longest execution the code_execution tool accepts (600000ms)
+	// plus slack for request and response IO. Under the blanket 60s deadline
+	// every longer execution was cancelled at 60s regardless of what the
+	// caller asked for.
+	codeExecRequestTimeout = 630 * time.Second
 )
+
+// sseHeartbeatInterval is how often /events sends a keep-alive "ping" frame.
+// A var, not a const, so tests can shrink it and observe a session-principal
+// refresh landing on a heartbeat tick specifically (Spec 107 FR-005 — the
+// refresher runs "before each frame", heartbeats included) without waiting
+// out the real interval.
+var sseHeartbeatInterval = 30 * time.Second
+
+// longRunningAPIBudgets lists the /api/v1 paths that need more than
+// defaultAPIRequestTimeout, keyed by request path.
+func longRunningAPIBudgets() map[string]time.Duration {
+	return map[string]time.Duration{
+		codeExecPath: codeExecRequestTimeout,
+	}
+}
+
+// apiRequestTimeout builds the /api/v1 request-deadline middleware. Paths
+// listed in budgets get their own deadline; everything else gets
+// defaultBudget. Each budget's handler chain is built once at setup rather
+// than per request.
+func apiRequestTimeout(defaultBudget time.Duration, budgets map[string]time.Duration) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		fallback := middleware.Timeout(defaultBudget)(next)
+		wrapped := make(map[string]http.Handler, len(budgets))
+		for path, budget := range budgets {
+			wrapped[path] = middleware.Timeout(budget)(next)
+		}
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if handler, ok := wrapped[r.URL.Path]; ok {
+				handler.ServeHTTP(w, r)
+				return
+			}
+			fallback.ServeHTTP(w, r)
+		})
+	}
+}
 
 // ServerController defines the interface for core server functionality
 type ServerController interface {
@@ -67,6 +124,15 @@ type ServerController interface {
 	UpdateServer(ctx context.Context, serverName string, updates *config.ServerConfig) error
 	EnableServer(serverName string, enabled bool) error
 	GetToolApprovalStatus(serverName, toolName string) (string, error)
+	// RunPreflight evaluates a required-tools preflight against local state
+	// only (Spec 098). The core owns the index/storage/stateview wiring; this
+	// interface is the only way the REST layer reaches it — same precedent as
+	// GetToolApprovalStatus above.
+	RunPreflight(ctx context.Context, params preflight.Params) (preflight.Outcome, error)
+	// RecordPreflight persists one preflight run synchronously and returns the
+	// write error, so the handler can answer 503 when the durable record
+	// required by FR-014 could not be written.
+	RecordPreflight(rec internalRuntime.PreflightActivity) error
 	RestartServer(serverName string) error
 	ForceReconnectAllServers(reason string) error
 	GetDockerRecoveryStatus() *storage.DockerRecoveryState
@@ -83,6 +149,10 @@ type ServerController interface {
 	// Tools and search
 	GetServerTools(serverName string) ([]map[string]interface{}, error)
 	SearchTools(query string, limit int) ([]map[string]interface{}, error)
+	// SearchToolsScoped is SearchTools filtered to servers inScope admits
+	// BEFORE the ranked cut (Spec 107 T075a): the top-`limit` of an exhaustive
+	// search filtered to the caller's entitlement, with unfiltered scores.
+	SearchToolsScoped(query string, limit int, inScope func(serverName string) bool) ([]map[string]interface{}, error)
 
 	// Logs
 	GetServerLogs(serverName string, tail int) ([]contracts.LogEntry, error)
@@ -98,15 +168,20 @@ type ServerController interface {
 	GetCurrentConfig() interface{}
 	NotifySecretsChanged(ctx context.Context, operation, secretName string) error
 
-	// Tool call history
-	GetToolCalls(limit, offset int) ([]*contracts.ToolCallRecord, int, error)
+	// Tool call history. The ToolCallScope argument is the caller's server
+	// entitlement (nil = unrestricted, #1166 follow-up); it is passed DOWN
+	// rather than applied to the result because these reads also report a
+	// `total`, and a post-filter would leave the total counting records the
+	// page no longer contains.
+	GetToolCalls(limit, offset int, scope storage.ToolCallScope) ([]*contracts.ToolCallRecord, int, error)
 	GetToolCallByID(id string) (*contracts.ToolCallRecord, error)
 	GetServerToolCalls(serverName string, limit int) ([]*contracts.ToolCallRecord, error)
-	ReplayToolCall(id string, arguments map[string]interface{}) (*contracts.ToolCallRecord, error)
-	GetToolCallsBySession(sessionID string, limit, offset int) ([]*contracts.ToolCallRecord, int, error)
+	ReplayToolCall(ctx context.Context, id string, arguments map[string]interface{}) (*contracts.ToolCallRecord, error)
+	GetToolCallsBySession(sessionID string, limit, offset int, scope storage.ToolCallScope) ([]*contracts.ToolCallRecord, int, error)
 
-	// Session management
-	GetRecentSessions(limit int) ([]*contracts.MCPSession, int, error)
+	// Session management. status filters on session status ("active" /
+	// "closed"); an empty string means no filter.
+	GetRecentSessions(limit int, status string) ([]*contracts.MCPSession, int, error)
 	GetSessionByID(sessionID string) (*contracts.MCPSession, error)
 
 	// Configuration management
@@ -156,6 +231,19 @@ type ServerController interface {
 	// Version and updates
 	GetVersionInfo() *updatecheck.VersionInfo
 	RefreshVersionInfo() *updatecheck.VersionInfo
+	// RecordUpdateFailure records one desktop auto-update failure occurrence
+	// (Spec 095) as the diagnostics code matching stage. It evaluates the
+	// telemetry gate and performs the durable increment behind ONE call so the
+	// handler cannot observe a gate/record race. recorded=false means the gate
+	// was closed at event time (config opt-out, env opt-out, CI, dev build) and
+	// nothing was persisted — a deliberate no-op, not a failure.
+	RecordUpdateFailure(stage string) (recorded bool, err error)
+	// UpdatePolicy reports the effective update policy (Spec 092 FR-015).
+	// Separate from GetVersionInfo because that one returns nil BOTH when
+	// checking is disabled and when no result exists yet — the tray must be
+	// able to tell those apart before deciding whether it may run its own
+	// feed check.
+	UpdatePolicy() updatecheck.Policy
 
 	// Activity logging (RFC-003)
 	ListActivities(filter storage.ActivityFilter) ([]*storage.ActivityRecord, int, error)
@@ -203,6 +291,23 @@ type Server struct {
 	connectService     *connect.Service   // Client connect/disconnect operations
 	securityController SecurityController // Security scanner operations (Spec 039)
 
+	// sensitiveMasker masks detected secrets out of payloads before they are
+	// serialised (see maskActivityPayloads, maskEventPayload,
+	// maskToolCallRecord). Installed whatever the detection config says —
+	// records flagged while detection was on must stay masked after it is
+	// turned off. nil only in tests and in embeddings that never call
+	// SetSensitiveMasker, where every path degrades to serving what it was
+	// given.
+	sensitiveMasker *security.Detector
+
+	// patchConfigMu serializes PATCH /api/v1/config's read-merge-apply
+	// sequence. The handler reads the live config, deep-merges the client's
+	// keys, then applies the FULL merged snapshot — two concurrent PATCHes
+	// (say, deep scan from the Security page and a toggle from Settings in
+	// another tab) would otherwise both merge from the same snapshot and the
+	// later apply would silently drop the earlier one's change.
+	patchConfigMu sync.Mutex
+
 	// telemetryRegistry is the Tier 2 counter aggregator (Spec 042). May be
 	// nil before SetTelemetryRegistry is called; middlewares use the nil-safe
 	// telemetry helpers so the call sites do not need to nil-check.
@@ -227,19 +332,42 @@ type Server struct {
 	// override a live MCP session's set_profile selection.
 	activeProfileMu sync.RWMutex
 	activeProfile   string
+
+	// preflightWaitSem is the dedicated wait budget for POST /api/v1/preflight
+	// (Spec 098 FR-012): a buffered channel used as a non-blocking semaphore, so
+	// a flood of waiting preflights degrades to immediate answers instead of
+	// queueing. nil (a Server not built by NewServer) reads as "exhausted",
+	// which is the safe direction.
+	preflightWaitSem chan struct{}
+	// preflightPollOverride lowers the 250 ms poll floor. Tests set it; nothing
+	// in production does.
+	preflightPollOverride time.Duration
+
+	// sessionPrincipalResolver resolves a session cookie or bearer JWT to an
+	// AuthContext (Spec 107 US4). nil in the personal build; installed by the
+	// server edition via SetSessionPrincipalResolver. See session_principal.go.
+	sessionPrincipalResolver SessionPrincipalResolver
 }
 
-// usageCacheEntry is one cached usage response with its expiry.
+// usageCacheEntry is one cached usage response with the time it was stored.
+//
+// It records when the entry was WRITTEN rather than when it expires, because
+// usage_cache_ttl is hot-reloadable and the TTL is the documented bound on how
+// far the Usage figures may lag the Activity Log (F1, #1046). An absolute
+// expiry banked from the old TTL would outlive a lowered one — the operator
+// would tighten the bound and the served answer would ignore it.
 type usageCacheEntry struct {
-	resp    *contracts.UsageAggregateResponse
-	expires time.Time
+	resp   *contracts.UsageAggregateResponse
+	stored time.Time
 }
 
 // usageCacheMaxEntries bounds the usage cache; on overflow it is cleared
 // wholesale (entries are short-lived and the working set is tiny in practice).
 const usageCacheMaxEntries = 64
 
-// getUsageCache returns a non-expired cached response for key, or nil.
+// getUsageCache returns a cached response for key that is still within ttl, or
+// nil. Freshness is judged against the ttl passed in — the one in force NOW —
+// so a hot-reloaded usage_cache_ttl takes effect on the entries already held.
 func (s *Server) getUsageCache(key string, ttl time.Duration) *contracts.UsageAggregateResponse {
 	if ttl <= 0 {
 		return nil
@@ -247,13 +375,14 @@ func (s *Server) getUsageCache(key string, ttl time.Duration) *contracts.UsageAg
 	s.usageCacheMu.Lock()
 	defer s.usageCacheMu.Unlock()
 	entry, ok := s.usageCache[key]
-	if !ok || time.Now().After(entry.expires) {
+	if !ok || time.Since(entry.stored) >= ttl {
 		return nil
 	}
 	return entry.resp
 }
 
-// putUsageCache stores resp under key for ttl.
+// putUsageCache stores resp under key. ttl only gates whether caching happens
+// at all; how long the entry stays fresh is decided at read time.
 func (s *Server) putUsageCache(key string, resp *contracts.UsageAggregateResponse, ttl time.Duration) {
 	if ttl <= 0 {
 		return
@@ -263,7 +392,7 @@ func (s *Server) putUsageCache(key string, resp *contracts.UsageAggregateRespons
 	if s.usageCache == nil || len(s.usageCache) >= usageCacheMaxEntries {
 		s.usageCache = make(map[string]usageCacheEntry)
 	}
-	s.usageCache[key] = usageCacheEntry{resp: resp, expires: time.Now().Add(ttl)}
+	s.usageCache[key] = usageCacheEntry{resp: resp, stored: time.Now()}
 }
 
 // SetTelemetryRegistry attaches the Tier 2 counter registry. Spec 042. Must
@@ -290,11 +419,12 @@ func NewServer(controller ServerController, logger *zap.SugaredLogger, obs *obse
 	}
 
 	s := &Server{
-		controller:    controller,
-		logger:        logger,
-		httpLogger:    httpLogger,
-		router:        chi.NewRouter(),
-		observability: obs,
+		controller:       controller,
+		logger:           logger,
+		httpLogger:       httpLogger,
+		router:           chi.NewRouter(),
+		observability:    obs,
+		preflightWaitSem: make(chan struct{}, preflightWaitSlots),
 	}
 
 	s.setupRoutes()
@@ -319,6 +449,14 @@ func (s *Server) SetConnectService(svc *connect.Service) {
 	s.connectService = svc
 }
 
+// SetSensitiveMasker configures the detector used to mask secrets out of
+// payloads on their way to a client. Its per-category switches decide what
+// counts as a secret; its `enabled` flag does not gate masking (see
+// Detector.MaskText). Never calling this leaves payloads unmasked.
+func (s *Server) SetSensitiveMasker(detector *security.Detector) {
+	s.sensitiveMasker = detector
+}
+
 // Router returns the underlying chi.Mux for external route registration.
 // This is used by the server edition to mount OAuth routes outside
 // the default API key authentication group.
@@ -336,7 +474,7 @@ func (s *Server) apiKeyAuthMiddleware() func(http.Handler) http.Handler {
 			// These connections are authenticated via OS-level permissions (UID/SID matching)
 			source := transport.GetConnectionSource(r.Context())
 			if source == transport.ConnectionSourceTray {
-				s.logger.Debug("Tray connection - skipping API key validation",
+				s.logger.Debugw("Tray connection - skipping API key validation",
 					zap.String("path", r.URL.Path),
 					zap.String("remote_addr", r.RemoteAddr),
 					zap.String("source", string(source)))
@@ -364,52 +502,117 @@ func (s *Server) apiKeyAuthMiddleware() func(http.Handler) http.Handler {
 			// SECURITY: API key is REQUIRED for all TCP connections to REST API
 			// Empty API key is not allowed - this prevents accidental exposure
 			if cfg.APIKey == "" {
-				s.logger.Warn("TCP connection rejected - API key not configured",
+				s.logger.Warnw("TCP connection rejected - API key not configured",
 					zap.String("path", r.URL.Path),
 					zap.String("remote_addr", r.RemoteAddr))
 				s.writeError(w, r, http.StatusUnauthorized, "API key authentication required but not configured. Please set MCPPROXY_API_KEY or configure api_key in config file.")
 				return
 			}
 
-			// Extract token from request
-			token := ExtractToken(r)
-			if token == "" {
-				s.logger.Warn("TCP connection with missing API key",
-					zap.String("path", r.URL.Path),
-					zap.String("remote_addr", r.RemoteAddr))
-				s.writeError(w, r, http.StatusUnauthorized, "Invalid or missing API key")
-				return
-			}
-
-			// Check if this is an agent token (mcp_agt_ prefix)
-			if strings.HasPrefix(token, auth.TokenPrefixStr) {
-				s.handleAgentTokenAuth(w, r, next, token)
-				return
-			}
-
-			// Check if the token matches the global API key (admin)
-			if token == cfg.APIKey {
-				s.logger.Debug("TCP connection with valid API key",
-					zap.String("path", r.URL.Path),
-					zap.String("remote_addr", r.RemoteAddr))
-				ctx := auth.WithAuthContext(r.Context(), auth.AdminContext())
-				next.ServeHTTP(w, r.WithContext(ctx))
-				return
-			}
-
-			// Token doesn't match anything
-			s.logger.Warn("TCP connection with invalid API key",
-				zap.String("path", r.URL.Path),
-				zap.String("remote_addr", r.RemoteAddr))
-			s.writeError(w, r, http.StatusUnauthorized, "Invalid or missing API key")
+			s.authenticateWithPrecedence(w, r, next, cfg)
 		})
 	}
+}
+
+// authenticateWithPrecedence implements the FR-001 credential precedence
+// (Spec 107, contracts/rest-endpoints.md §8): exactly one credential source
+// is evaluated. Presence of a source is header/query MEMBERSHIP
+// (r.Header.Values, r.URL.Query().Has), not a non-empty value, so a present
+// but WRONG (or empty) X-API-Key, Authorization: Bearer or ?apikey= is a
+// terminal 401 and never falls through to a cookie sitting on the same
+// request. The mcpproxy_session cookie is consulted only when none of the
+// three is present at all.
+func (s *Server) authenticateWithPrecedence(w http.ResponseWriter, r *http.Request, next http.Handler, cfg *config.Config) {
+	// 1. X-API-Key header (membership, not non-empty value).
+	if values := r.Header.Values("X-API-Key"); len(values) > 0 {
+		s.authenticateExplicitToken(w, r, next, cfg, values[0])
+		return
+	}
+
+	// 2. Authorization: Bearer header (membership).
+	if values := r.Header.Values("Authorization"); len(values) > 0 {
+		s.authenticateBearer(w, r, next, cfg, values[0])
+		return
+	}
+
+	// 3. ?apikey= query parameter (membership).
+	if r.URL.Query().Has("apikey") {
+		s.authenticateExplicitToken(w, r, next, cfg, r.URL.Query().Get("apikey"))
+		return
+	}
+
+	// 4. mcpproxy_session cookie — only reached when none of the above is present.
+	if cookie, err := r.Cookie(httpSessionCookieName); err == nil {
+		if s.tryInstallSessionPrincipal(w, r, next, auth.CredentialKindCookie, cookie.Value) {
+			return
+		}
+	}
+
+	s.logger.Warnw("TCP connection with missing API key",
+		zap.String("path", r.URL.Path),
+		zap.String("remote_addr", r.RemoteAddr))
+	s.writeError(w, r, http.StatusUnauthorized, "Invalid or missing API key")
+}
+
+// authenticateExplicitToken handles a token presented via X-API-Key or
+// ?apikey=: an agent token, the global admin key, or nothing else — these two
+// sources never resolve a session principal (only Authorization: Bearer and
+// the cookie do).
+func (s *Server) authenticateExplicitToken(w http.ResponseWriter, r *http.Request, next http.Handler, cfg *config.Config, token string) {
+	if token != "" && strings.HasPrefix(token, auth.TokenPrefixStr) {
+		s.handleAgentTokenAuth(w, r, next, token)
+		return
+	}
+	if token != "" && token == cfg.APIKey {
+		s.logger.Debugw("TCP connection with valid API key",
+			zap.String("path", r.URL.Path),
+			zap.String("remote_addr", r.RemoteAddr))
+		ctx := auth.WithAuthContext(r.Context(), auth.AdminContext())
+		next.ServeHTTP(w, r.WithContext(ctx))
+		return
+	}
+	s.logger.Warnw("TCP connection with invalid API key",
+		zap.String("path", r.URL.Path),
+		zap.String("remote_addr", r.RemoteAddr))
+	s.writeError(w, r, http.StatusUnauthorized, "Invalid or missing API key")
+}
+
+// authenticateBearer handles Authorization: Bearer — an agent token, the
+// global admin key, or a user JWT resolved as a session principal
+// (kind=bearer_jwt) through the edition hook.
+func (s *Server) authenticateBearer(w http.ResponseWriter, r *http.Request, next http.Handler, cfg *config.Config, authHeader string) {
+	var token string
+	if strings.HasPrefix(authHeader, "Bearer ") {
+		token = strings.TrimPrefix(authHeader, "Bearer ")
+	}
+
+	if token != "" && strings.HasPrefix(token, auth.TokenPrefixStr) {
+		s.handleAgentTokenAuth(w, r, next, token)
+		return
+	}
+	if token != "" && token == cfg.APIKey {
+		s.logger.Debugw("TCP connection with valid API key",
+			zap.String("path", r.URL.Path),
+			zap.String("remote_addr", r.RemoteAddr))
+		ctx := auth.WithAuthContext(r.Context(), auth.AdminContext())
+		next.ServeHTTP(w, r.WithContext(ctx))
+		return
+	}
+
+	if s.tryInstallSessionPrincipal(w, r, next, auth.CredentialKindBearerJWT, token) {
+		return
+	}
+
+	s.logger.Warnw("TCP connection with invalid API key",
+		zap.String("path", r.URL.Path),
+		zap.String("remote_addr", r.RemoteAddr))
+	s.writeError(w, r, http.StatusUnauthorized, "Invalid or missing API key")
 }
 
 // handleAgentTokenAuth validates an agent token and sets the appropriate AuthContext.
 func (s *Server) handleAgentTokenAuth(w http.ResponseWriter, r *http.Request, next http.Handler, token string) {
 	if s.tokenStore == nil || s.dataDir == "" {
-		s.logger.Warn("Agent token presented but token store not configured",
+		s.logger.Warnw("Agent token presented but token store not configured",
 			zap.String("path", r.URL.Path),
 			zap.String("remote_addr", r.RemoteAddr))
 		s.writeError(w, r, http.StatusUnauthorized, "Agent tokens are not configured on this server")
@@ -418,14 +621,14 @@ func (s *Server) handleAgentTokenAuth(w http.ResponseWriter, r *http.Request, ne
 
 	hmacKey, err := auth.GetOrCreateHMACKey(s.dataDir)
 	if err != nil {
-		s.logger.Error("Failed to get HMAC key for agent token validation", zap.Error(err))
+		s.logger.Errorw("Failed to get HMAC key for agent token validation", zap.Error(err))
 		s.writeError(w, r, http.StatusInternalServerError, "Internal server error")
 		return
 	}
 
 	agentToken, err := s.tokenStore.ValidateAgentToken(token, hmacKey)
 	if err != nil {
-		s.logger.Warn("Agent token validation failed",
+		s.logger.Warnw("Agent token validation failed",
 			zap.String("path", r.URL.Path),
 			zap.String("remote_addr", r.RemoteAddr),
 			zap.String("error", err.Error()))
@@ -435,23 +638,31 @@ func (s *Server) handleAgentTokenAuth(w http.ResponseWriter, r *http.Request, ne
 
 	// Update last-used timestamp in background
 	go func() {
-		if updateErr := s.tokenStore.UpdateAgentTokenLastUsed(agentToken.Name); updateErr != nil {
-			s.logger.Warn("Failed to update agent token last-used timestamp",
+		if updateErr := s.tokenStore.UpdateAgentTokenLastUsedByHash(agentToken.TokenHash); updateErr != nil {
+			s.logger.Warnw("Failed to update agent token last-used timestamp",
 				zap.String("name", agentToken.Name),
 				zap.Error(updateErr))
 		}
 	}()
 
-	authCtx := &auth.AuthContext{
-		Type:           auth.AuthTypeAgent,
-		AgentName:      agentToken.Name,
-		TokenPrefix:    agentToken.TokenPrefix,
-		AllowedServers: agentToken.AllowedServers,
-		Permissions:    agentToken.Permissions,
-	}
+	// Built through the shared constructor so every field the MCP path carries
+	// reaches the REST path too — notably ProfilePin, which this path dropped
+	// before Spec 098. PREFLIGHT's evaluation scope is token scope ∩ token pin ∩
+	// requested profile (preflight.ResolveScope), so a dropped pin silently
+	// widened what a pinned token could resolve there.
+	//
+	// That intersection is preflight's, not this package's ENUMERATION
+	// boundary. Every read door under /api/v1 answers from
+	// auth.CanEnumerateServer — token scope alone. The profile terms are
+	// ergonomic filters and one of them (the requested profile) is
+	// caller-selectable, so folding them into the enumeration boundary would
+	// let a caller change what it is authorized to see by switching profiles.
+	// The three notions of scope, and why only one of them is a boundary, are
+	// laid out at the top of scope_subtree.go.
+	authCtx := agentToken.AuthContext()
 	ctx := auth.WithAuthContext(r.Context(), authCtx)
 
-	s.logger.Debug("Agent token authenticated",
+	s.logger.Debugw("Agent token authenticated",
 		zap.String("agent_name", agentToken.Name),
 		zap.String("token_prefix", agentToken.TokenPrefix),
 		zap.String("path", r.URL.Path),
@@ -533,6 +744,20 @@ func (s *Server) requireServerOp(op string, next http.HandlerFunc) http.HandlerF
 			return
 		}
 		next(w, r)
+	}
+}
+
+// trustedProxiesProvider yields the LIVE trusted_proxies list through the
+// controller's config (Spec 107 FR-027), evaluated per request.
+func (s *Server) trustedProxiesProvider() config.TrustedProxiesProvider {
+	return func() []string {
+		if s.controller == nil {
+			return nil
+		}
+		if cfg, err := s.controller.GetConfig(); err == nil && cfg != nil {
+			return cfg.TrustedProxies
+		}
+		return nil
 	}
 }
 
@@ -619,8 +844,13 @@ func (s *Server) setupRoutes() {
 
 	// API v1 routes with timeout and authentication middleware
 	s.router.Route("/api/v1", func(r chi.Router) {
-		// Apply timeout and API key authentication middleware to API routes only
-		r.Use(middleware.Timeout(60 * time.Second))
+		// Apply timeout and API key authentication middleware to API routes only.
+		// The deadline is per-route: the long-running routes carry their own
+		// budget, everything else gets defaultAPIRequestTimeout.
+		r.Use(apiRequestTimeout(defaultAPIRequestTimeout, longRunningAPIBudgets()))
+		// Spec 107 T050: {ClientIP, Mount: api} for the audit line, with the
+		// forwarded IP believed only from a trusted proxy (live list).
+		r.Use(TagRequestMeta(reqcontext.MountAPI, s.trustedProxiesProvider()))
 		r.Use(s.apiKeyAuthMiddleware())
 		// Spec 042: Tier 2 telemetry middlewares. Both fetch the registry via
 		// a closure so the registry can be installed after route setup.
@@ -639,7 +869,12 @@ func (s *Server) setupRoutes() {
 		// Profiles (Profiles v2 T2) — list + default active get/set for UI surfaces
 		r.Get("/profiles", s.handleListProfiles)
 		r.Get("/profiles/active", s.handleGetActiveProfile)
-		r.Put("/profiles/active", s.handleSetActiveProfile)
+		// #1166 round 11: the ONLY mutating route in this group, and it was
+		// ungated. The active profile is server-level shared state — it decides
+		// which servers the Web UI and the tray render — so a READ-scoped agent
+		// token could reshape the operator's view. Same gate as every other
+		// config-level write.
+		r.Put("/profiles/active", s.requireServerOp(auth.ServerOpConfigWrite, s.handleSetActiveProfile))
 
 		// Server management
 		r.Get("/servers", s.handleGetServers)
@@ -666,6 +901,12 @@ func (s *Server) setupRoutes() {
 			// MCP-1056). Centralising the decode also prevents new sub-resource
 			// routes from silently reintroducing the gap.
 			r.Use(decodeServerIDParam)
+			// #1166 follow-up: ONE scope gate for the whole subtree, so a new
+			// sub-resource inherits it instead of shipping open. Registered
+			// after decodeServerIDParam so it sees the decoded name. For a
+			// scoped caller an unentitled server and an absent one are the same
+			// 404; admins are unaffected. See scopedServerSubtree.
+			r.Use(s.scopedServerSubtree)
 			// Mutating per-server routes carry the shared agent-token gate
 			// (issues #877/#878).
 			r.Patch("/", s.requireServerOp(auth.ServerOpPatch, s.handlePatchServer))                                   // Partial update server config
@@ -748,6 +989,11 @@ func (s *Server) setupRoutes() {
 		// payload with runtime stats attached. No network call is made.
 		r.Get("/telemetry/payload", s.handleGetTelemetryPayload)
 
+		// Update-failure recording (Spec 095) — the tray posts one closed-enum
+		// stage per terminal update-session failure. Strictly validated; the
+		// telemetry gate is evaluated by the controller at event time.
+		r.Post("/telemetry/update-failure", s.handleRecordUpdateFailure)
+
 		// Token statistics
 		r.Get("/stats/tokens", s.handleGetTokenStats)
 
@@ -763,8 +1009,18 @@ func (s *Server) setupRoutes() {
 		// Tool execution
 		r.Post("/tools/call", s.handleCallTool)
 
+		// Required-tools preflight (Spec 098). POST because the check takes a
+		// body, but it is strictly read-only — zero upstream I/O, zero runtime
+		// mutation — so it carries no requireServerOp gate and agent tokens may
+		// call it (they get the scope-silenced disclosure tier).
+		r.Post("/preflight", s.handlePreflight)
+
 		// Code execution endpoint (for CLI client mode)
 		r.Post("/code/exec", NewCodeExecHandler(s.controller, s.logger).ServeHTTP)
+
+		// Stored scripts (Spec 097). Read-only by design: scripts are authored
+		// in the filesystem, never through the API.
+		r.Get("/code/scripts", s.handleListScripts)
 
 		// Configuration management. Applying/patching config can add, remove,
 		// enable, disable or quarantine upstream servers (mcpServers), so these
@@ -856,13 +1112,14 @@ func (s *Server) setupRoutes() {
 	})
 
 	// SSE events (protected by API key) - support both GET and HEAD
-	s.router.With(s.apiKeyAuthMiddleware()).Method("GET", "/events", http.HandlerFunc(s.handleSSEEvents))
-	s.router.With(s.apiKeyAuthMiddleware()).Method("HEAD", "/events", http.HandlerFunc(s.handleSSEEvents))
+	tagEvents := TagRequestMeta(reqcontext.MountAPI, s.trustedProxiesProvider())
+	s.router.With(tagEvents, s.apiKeyAuthMiddleware()).Method("GET", "/events", http.HandlerFunc(s.handleSSEEvents))
+	s.router.With(tagEvents, s.apiKeyAuthMiddleware()).Method("HEAD", "/events", http.HandlerFunc(s.handleSSEEvents))
 
 	// Note: Swagger UI is mounted directly on the main mux (not via HTTP API server)
 	// See internal/server/server.go for swagger handler registration
 
-	s.logger.Debug("HTTP API routes setup completed",
+	s.logger.Debugw("HTTP API routes setup completed",
 		"api_routes", "/api/v1/*",
 		"sse_route", "/events",
 		"health_routes", "/healthz,/readyz,/livez,/ready")
@@ -945,7 +1202,7 @@ func (s *Server) writeJSON(w http.ResponseWriter, status int, data interface{}) 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(data); err != nil {
-		s.logger.Error("Failed to encode JSON response", "error", err)
+		s.logger.Errorw("Failed to encode JSON response", "error", err)
 	}
 }
 
@@ -984,21 +1241,45 @@ func (s *Server) writeSuccess(w http.ResponseWriter, data interface{}) {
 // @Success 200 {object} contracts.SuccessResponse "Server status information"
 // @Failure 500 {object} contracts.ErrorResponse "Internal server error"
 // @Router /api/v1/status [get]
-func (s *Server) handleGetStatus(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleGetStatus(w http.ResponseWriter, r *http.Request) {
 	// Get routing mode from config
 	routingMode := config.RoutingModeRetrieveTools
-	if cfg, err := s.controller.GetConfig(); err == nil && cfg != nil && cfg.RoutingMode != "" {
-		routingMode = cfg.RoutingMode
+	// …and the data directory, which is where the tray's autostart sidecar
+	// lives. It is not always ~/.mcpproxy — MCPPROXY_HOME relocates the whole
+	// instance root, tray and core together (GH #936).
+	autostartDataDir := ""
+	if cfg, err := s.controller.GetConfig(); err == nil && cfg != nil {
+		if cfg.RoutingMode != "" {
+			routingMode = cfg.RoutingMode
+		}
+		autostartDataDir = cfg.DataDir
 	}
+	// Same source of truth as /api/v1/routing: what /mcp actually bound, not
+	// what the config now says. Two surfaces reporting "the routing mode" must
+	// not be able to disagree.
+	routingMode = s.servedRoutingMode(routingMode)
+
+	// One traversal, used for both the top-level field and the nested snapshot,
+	// so the two cannot disagree and the O(servers) walk happens once (#1084).
+	//
+	// #1166: `upstream_stats.servers` is keyed by every server name, so this
+	// route was a complete inventory enumeration on the single most-polled
+	// door. Scope it once, here, and BOTH the top-level field and the nested
+	// snapshot narrow together — the #1084 single-traversal property is what
+	// makes one filter enough.
+	liveUpstreamStats := filterUpstreamStatsServers(r.Context(), s.controller.GetUpstreamStats())
 
 	response := map[string]interface{}{
 		"running":        s.controller.IsRunning(),
 		"edition":        editionValue,
 		"listen_addr":    s.controller.GetListenAddress(),
-		"upstream_stats": s.controller.GetUpstreamStats(),
-		"status":         s.controller.GetStatus(),
+		"upstream_stats": liveUpstreamStats,
+		"status":         withLiveUpstreamStats(r.Context(), s.controller.GetStatus(), liveUpstreamStats),
 		"routing_mode":   routingMode,
 		"timestamp":      time.Now().Unix(),
+		// Unix seconds at which this core process started, so a UI can render a
+		// real uptime instead of guessing from when its own page loaded (F36).
+		"started_at": processStart.Unix(),
 		// MCP-2176: built-in default MCP instructions. The Web UI renders this
 		// as the instructions textarea placeholder so the displayed default
 		// never drifts from the backend's resolveInstructions("") value. Always
@@ -1017,7 +1298,18 @@ func (s *Server) handleGetStatus(w http.ResponseWriter, _ *http.Request) {
 	// env_kind. Read-only — mutation happens on MCP/connect events, never
 	// through this endpoint. nil when the telemetry service (or activation
 	// store) is not wired (e.g. very early startup).
-	if s.telemetryPayloadProvider != nil {
+	//
+	// #1166 round 11: OMITTED for a scoped caller. /status stays open to an
+	// agent token because it is a liveness surface agents legitimately poll —
+	// but this block is pure operator plane and has no per-server part to
+	// project. mcp_clients_seen_ever is the operator's entire MCP-client
+	// inventory, the same class /sessions and /onboarding/state answer 403 for;
+	// retrieve_tools_calls_24h and configured_ide_count are exact
+	// deployment-wide counters, the count-oracle shape this very route already
+	// removed from upstream_stats.total_servers. Withholding the key rather
+	// than denying the route is safe for clients: `activation` is already
+	// absent whenever telemetry is unwired, so every consumer tolerates it.
+	if !auth.IsScopedCaller(r.Context()) && s.telemetryPayloadProvider != nil {
 		if svc := s.telemetryPayloadProvider(); svc != nil {
 			if store := svc.ActivationStore(); store != nil {
 				if db := svc.ActivationDB(); db != nil {
@@ -1034,14 +1326,17 @@ func (s *Server) handleGetStatus(w http.ResponseWriter, _ *http.Request) {
 	// — this endpoint is read-only). autostart_enabled reads the tray-owned
 	// sidecar with its 1h TTL; nil on Linux / tray not running / malformed.
 	response["launch_source"] = string(telemetry.DetectLaunchSourceOnce())
-	response["autostart_enabled"] = telemetry.DefaultAutostartReader().Read()
+	response["autostart_enabled"] = telemetry.AutostartReaderForDataDir(autostartDataDir).Read()
 
 	s.writeSuccess(w, response)
 }
 
 // handleGetRouting godoc
 // @Summary Get routing mode information
-// @Description Get the current routing mode and available MCP endpoints
+// @Description Get the current routing mode and available MCP endpoints.
+// @Description routing_mode is what /mcp is actually serving; pending_routing_mode carries a
+// @Description restart-pending value persisted on disk (empty when there is none).
+// @Description tool_response_mode and direct_tool_response_mode report the two serialization axes, resolved.
 // @Tags status
 // @Produce json
 // @Security ApiKeyAuth
@@ -1053,6 +1348,7 @@ func (s *Server) handleGetRouting(w http.ResponseWriter, _ *http.Request) {
 	if cfg, err := s.controller.GetConfig(); err == nil && cfg != nil && cfg.RoutingMode != "" {
 		routingMode = cfg.RoutingMode
 	}
+	routingMode = s.servedRoutingMode(routingMode)
 
 	// Build mode description
 	var description string
@@ -1064,6 +1360,36 @@ func (s *Server) handleGetRouting(w http.ResponseWriter, _ *http.Request) {
 	default:
 		description = "BM25 search via retrieve_tools + call_tool variants (default)"
 	}
+
+	// Serialization axes (Spec 085 / Spec 102). Reported RESOLVED, never raw:
+	// the Web UI header switcher renders one selected option per axis, and an
+	// unset value must show as "Full" rather than as nothing selected. Both are
+	// hot-reloadable, unlike routing_mode below.
+	toolResponseMode := config.ToolResponseModeFull
+	directToolResponseMode := config.DirectToolResponseModeFull
+	// Code execution is off by default and its surface has NO other tool-calling
+	// path (buildCodeExecModeTools omits call_tool_*), so picking that routing
+	// mode with the flag off produces a surface that can discover tools and call
+	// none of them. The switcher has to be able to warn before the operator
+	// commits to a restart.
+	codeExecutionEnabled := false
+	if cfg, err := s.controller.GetConfig(); err == nil && cfg != nil {
+		if cfg.ToolResponseMode != "" {
+			toolResponseMode = cfg.ToolResponseMode
+		}
+		if cfg.DirectToolResponseMode != "" {
+			directToolResponseMode = cfg.DirectToolResponseMode
+		}
+		codeExecutionEnabled = cfg.EnableCodeExecution
+	}
+
+	// routing_mode above is what /mcp is ACTUALLY serving: a routing-mode change
+	// is written to disk but deliberately not adopted in memory (ApplyConfig's
+	// restart-required contract), because /mcp binds its mode to an http.ServeMux
+	// pattern at startup. Reporting only the served value leaves the operator
+	// with a switcher that appears to do nothing; reporting only the configured
+	// one is the drift DetectConfigChanges was fixed to stop. So report both.
+	pendingRoutingMode, restartRequired := s.pendingRoutingMode(routingMode)
 
 	response := map[string]interface{}{
 		"routing_mode": routingMode,
@@ -1079,16 +1405,82 @@ func (s *Server) handleGetRouting(w http.ResponseWriter, _ *http.Request) {
 			config.RoutingModeDirect,
 			config.RoutingModeCodeExecution,
 		},
+		"code_execution_enabled":    codeExecutionEnabled,
+		"tool_response_mode":        toolResponseMode,
+		"direct_tool_response_mode": directToolResponseMode,
+		"pending_routing_mode":      pendingRoutingMode,
+		"restart_required":          restartRequired,
 	}
 
 	s.writeSuccess(w, response)
 }
 
+// servedRoutingMode returns the routing mode /mcp ACTUALLY bound at startup,
+// falling back to the configured value passed in.
+//
+// The config can move underneath a running process — a restart-pending API
+// change, or a hand-edited file the watcher hot-reloads — while /mcp stays
+// bound to the mcp-go server instance it registered on the ServeMux. Reporting
+// the config there names a surface /mcp is not serving, and the Web UI renders
+// it as "serving now". The fallback covers a controller that records nothing
+// (stdio transport, tests).
+func (s *Server) servedRoutingMode(configured string) string {
+	if served, ok := s.controller.(interface{ ServedRoutingMode() string }); ok {
+		if mode := served.ServedRoutingMode(); mode != "" {
+			return mode
+		}
+	}
+	return configured
+}
+
+// pendingRoutingMode reports the routing mode the next start would adopt, when
+// that differs from the one this process is serving.
+//
+// Sourced from the runtime's DESIRED config (what is on disk) rather than by
+// reading the file here: the runtime already tracks it, so a Web-UI poll costs
+// no disk I/O and cannot race a config commit half-way through a rename. Any
+// controller that does not expose it reports nothing pending — a status
+// endpoint must never invent a restart prompt it cannot substantiate.
+func (s *Server) pendingRoutingMode(servedMode string) (pending string, restartRequired bool) {
+	desiredCtrl, ok := s.controller.(interface {
+		GetDesiredConfig() (*config.Config, error)
+	})
+	if !ok {
+		return "", false
+	}
+	desired, err := desiredCtrl.GetDesiredConfig()
+	if err != nil || desired == nil {
+		return "", false
+	}
+	desiredMode := config.ResolveRoutingMode(desired.RoutingMode)
+	if desiredMode == config.ResolveRoutingMode(servedMode) {
+		return "", false
+	}
+	return desiredMode, true
+}
+
+// desiredConfigForPatch returns the merge base for a read-modify-write of the
+// configuration: the desired (on-disk) config when the controller exposes it,
+// otherwise the running one.
+func (s *Server) desiredConfigForPatch() (*config.Config, error) {
+	if desiredCtrl, ok := s.controller.(interface {
+		GetDesiredConfig() (*config.Config, error)
+	}); ok {
+		cfg, err := desiredCtrl.GetDesiredConfig()
+		if err == nil && cfg != nil {
+			return cfg, nil
+		}
+	}
+	return s.controller.GetConfig()
+}
+
 // handleGetInfo godoc
 // @Summary Get server information
 // @Description Get essential server metadata including version, web UI URL, endpoint addresses, and update availability
+// @Description web_ui_url carries the ?apikey= credential ONLY for an authenticated admin; a scoped agent token receives the bare URL
 // @Description This endpoint is designed for tray-core communication and version checking
 // @Description Use refresh=true query parameter to force an immediate update check against GitHub
+// @Description The launched_by field reports durable launch provenance ("tray", "installer", or "" for user-launched/unknown)
 // @Tags status
 // @Produce json
 // @Param refresh query boolean false "Force immediate update check against GitHub"
@@ -1131,6 +1523,23 @@ func (s *Server) handleGetInfo(w http.ResponseWriter, r *http.Request) {
 			"http":   listenAddr,
 			"socket": getSocketPath(), // Returns socket path if enabled, empty otherwise
 		},
+		// Spec 092 FR-001a: durable launch provenance. A tray that attaches to
+		// an already-running core (possibly started by an *earlier* tray that
+		// no longer exists) reads this to decide whether it owns the process
+		// and may supersede it, instead of relying on in-memory ownership that
+		// dies with the launching tray. "" means user/unknown → consent
+		// required (FR-002).
+		"launched_by": launchedByFn(),
+		// Spec 092 FR-002: the core's own PID. An attached tray has no Process
+		// handle and the core exposes no shutdown endpoint, so this is the only
+		// stop mechanism available to it — and the difference between a consent
+		// action that works and one that can only print instructions.
+		"pid": pidFn(),
+		// Spec 092 FR-015: the effective update policy, ALWAYS present. The
+		// `update` object below is absent both when checking is disabled and
+		// when no check has produced a result yet, so it cannot be used to
+		// infer permission; this field states it.
+		"update_policy": s.controller.UpdatePolicy(),
 	}
 	if versionInfo != nil {
 		response["update"] = versionInfo.ToAPIResponse()
@@ -1160,17 +1569,56 @@ func buildWebUIURL(listenAddr string, r *http.Request) string {
 	return fmt.Sprintf("%s://%s/ui/", protocol, listenAddr)
 }
 
-// buildWebUIURLWithAPIKey constructs the web UI URL with API key included if configured
+// buildWebUIURLWithAPIKey constructs the web UI URL, appending the GLOBAL ADMIN
+// API key as a `?apikey=` query ONLY for a caller entitled to hold it.
+//
+// #1166 round 10, PRIVILEGE ESCALATION. GET /api/v1/info was registered with no
+// gate at all and handed this string to anybody who could reach the route —
+// including a read-only agent token scoped to one server, which received
+//
+//	"web_ui_url":"http://127.0.0.1:8080/ui/?apikey=<the admin key>"
+//
+// and could then re-authenticate as an admin. That made every scope control on
+// this mux moot: a scoped caller simply read the key out of /info and stopped
+// being scoped. The defect predates this branch; it must not survive it.
+//
+// The route is NOT denied, and the field is NOT dropped. /info is version,
+// endpoint, pid, provenance and update-policy metadata that agents and the CLI
+// legitimately poll, and the base URL discloses nothing the same payload's
+// `listen_addr` does not. Exactly one thing in it is privileged — the
+// credential in the query string — so exactly that is what is withheld. A
+// scoped caller gets `http://127.0.0.1:8080/ui/` and no way in.
+//
+// The predicate is CanRevealSecrets, not IsAdmin: it is the same test the other
+// raw-credential doors answer from (#1148/#1167), it fails CLOSED on a nil
+// AuthContext, and it refuses the unauthenticated /mcp back-compat admin
+// context, which has proved no identity. Absence is treated as unprivileged
+// HERE, unlike auth.CanEnumerateServer, because the two questions differ: not
+// knowing who is calling is a reason to withhold a credential and not a reason
+// to hide a server's name. Every real operator path carries an explicit admin
+// context — the API key over TCP, the Unix socket, the Windows named pipe — so
+// nothing first-party changes.
 func (s *Server) buildWebUIURLWithAPIKey(listenAddr string, r *http.Request) string {
 	baseURL := buildWebUIURL(listenAddr, r)
 	if baseURL == "" {
 		return ""
 	}
 
+	if !auth.AuthContextFromContext(r.Context()).CanRevealSecrets() {
+		return baseURL
+	}
+
 	// Add API key if configured
 	cfg, err := s.controller.GetConfig()
-	if err == nil && cfg.APIKey != "" {
-		return baseURL + "?apikey=" + cfg.APIKey
+	if err == nil && cfg != nil && cfg.APIKey != "" {
+		parsed, parseErr := url.Parse(baseURL)
+		if parseErr != nil {
+			return ""
+		}
+		query := parsed.Query()
+		query.Set("apikey", cfg.APIKey)
+		parsed.RawQuery = query.Encode()
+		return parsed.String()
 	}
 
 	return baseURL
@@ -1179,8 +1627,27 @@ func (s *Server) buildWebUIURLWithAPIKey(listenAddr string, r *http.Request) str
 // buildVersion is set during build using -ldflags
 var buildVersion = "development"
 
+// launchedByFn resolves this process's launch provenance for /api/v1/info
+// (Spec 092 FR-001a). Indirected through a variable so handler tests can
+// exercise every provenance value without mutating the process-wide capture
+// in internal/launch.
+var launchedByFn = launch.LaunchedBy
+
+// pidFn reports this core process's OS pid for /api/v1/info (Spec 092 FR-002).
+// Indirected for the same reason as launchedByFn: a handler test must be able
+// to assert the wiring without depending on the test binary's own pid.
+var pidFn = os.Getpid
+
 // editionValue identifies the MCPProxy edition (personal or server).
 var editionValue = "personal"
+
+// processStart is captured at package initialization — i.e. when the core
+// process starts — and served as `started_at` on /api/v1/status.
+//
+// Audit F36: the Dashboard used to derive uptime from the first moment the PAGE
+// saw the core running, so it read "just started" on every reload no matter how
+// long the core had actually been up. Uptime is the server's fact to report.
+var processStart = time.Now()
 
 // GetBuildVersion returns the build version from build-time variables.
 // This should be set during build using -ldflags.
@@ -1224,7 +1691,7 @@ func (s *Server) handleGetServers(w http.ResponseWriter, r *http.Request) {
 		}).ListServers(r.Context())
 
 		if err != nil {
-			s.logger.Error("Failed to list servers via management service", "error", err)
+			s.logger.Errorw("Failed to list servers via management service", "error", err)
 			s.writeError(w, r, http.StatusInternalServerError, "Failed to get servers")
 			return
 		}
@@ -1253,13 +1720,19 @@ func (s *Server) handleGetServers(w http.ResponseWriter, r *http.Request) {
 		// so they send only the diff — redacted-but-unchanged values
 		// stay out of the patch and the backend keeps the real string.
 		// See PR #425 for the original threat model.
-		s.redactServerSecrets(serverValues)
+		s.redactServerSecrets(r.Context(), serverValues)
 
 		// Dereference stats pointer
 		var statsValue contracts.ServerStats
 		if stats != nil {
 			statsValue = *stats
 		}
+
+		// #1166: enumeration is scoped LAST, so a reviewer sees one obvious
+		// final gate. The stats must narrow with the array or total_servers
+		// stays an exact count oracle for what the filter just hid.
+		serverValues = visibleServers(r.Context(), serverValues)
+		statsValue = recomputeServerStats(r.Context(), serverValues, statsValue)
 
 		response := contracts.GetServersResponse{
 			Servers: serverValues,
@@ -1272,7 +1745,7 @@ func (s *Server) handleGetServers(w http.ResponseWriter, r *http.Request) {
 	// Fallback to legacy path if management service not available
 	genericServers, err := s.controller.GetAllServers()
 	if err != nil {
-		s.logger.Error("Failed to get servers", "error", err)
+		s.logger.Errorw("Failed to get servers", "error", err)
 		s.writeError(w, r, http.StatusInternalServerError, "Failed to get servers")
 		return
 	}
@@ -1284,9 +1757,16 @@ func (s *Server) handleGetServers(w http.ResponseWriter, r *http.Request) {
 	s.enrichServersWithQuarantineStats(servers)
 
 	// See note above the management-service path for redaction rationale.
-	s.redactServerSecrets(servers)
+	s.redactServerSecrets(r.Context(), servers)
 
-	stats := contracts.ConvertUpstreamStatsToServerStats(s.controller.GetUpstreamStats())
+	// #1166, legacy branch. This branch is invisible to a test suite whose
+	// default mock returns a non-nil management service, which is exactly how
+	// a one-branch fix ships looking complete.
+	servers = visibleServers(r.Context(), servers)
+	// Filtering the upstream-stats map BEFORE the conversion is free
+	// correctness: ConvertUpstreamStatsToServerStats derives every counter by
+	// walking stats["servers"], so the counts narrow with it.
+	stats := contracts.ConvertUpstreamStatsToServerStats(filterUpstreamStatsServers(r.Context(), s.controller.GetUpstreamStats()))
 
 	response := contracts.GetServersResponse{
 		Servers: servers,
@@ -1319,18 +1799,22 @@ func flattenNullableMap(m map[string]*string) map[string]string {
 // …), env-var secrets, URL query credentials, and any URL secrets echoed into
 // the last_error / health.detail strings. Sensitive values render as the
 // masked-display format `••••<last2> (<N> chars)` (references pass through);
-// error strings use the `***REDACTED***` sentinel. Skips redaction entirely
-// when `reveal_secret_headers: true` is set in the loaded config, matching the
-// behaviour of the `upstream_servers` MCP tool and the SSE event stream.
+// error strings use the `***REDACTED***` sentinel. Skips redaction only when
+// `reveal_secret_headers: true` is set in the loaded config AND the caller is
+// an authenticated admin, matching the `upstream_servers` MCP tool exactly
+// (issue #1167).
 //
 // The UI edit-and-save flow works without seeing the real values because
 // PATCH /api/v1/servers/{id} deep-merges (omitted keys preserved), so the
 // client computes a diff and only sends the keys that actually changed.
 // Redacted-but-unchanged values never round-trip — the backend keeps the
 // real string on disk.
-func (s *Server) redactServerSecrets(servers []contracts.Server) {
-	cfg, err := s.controller.GetConfig()
-	if err == nil && cfg != nil && cfg.RevealSecretHeaders {
+func (s *Server) redactServerSecrets(ctx context.Context, servers []contracts.Server) {
+	// #1167: this used to read the flag alone, with no ctx parameter at all —
+	// identity was not merely unchecked, it was unreachable at this frame.
+	// Both callers hold the *http.Request, so the caller is threaded in and
+	// the answer comes from the shared predicate.
+	if s.revealSecrets(ctx) {
 		return
 	}
 	for i := range servers {
@@ -1339,31 +1823,21 @@ func (s *Server) redactServerSecrets(servers []contracts.Server) {
 }
 
 // redactServerSecretFields masks the secret-bearing fields of a single server
-// in place. Shared by the REST list/get path and the SSE event stream so both
-// sit behind the same trust boundary (parity is load-bearing: the Web UI's
-// mergeServers would flicker masked-vs-plaintext otherwise).
+// in place.
+//
+// The field list AND the rules live in oauth.RedactServerSecretFields because
+// THREE doors serve this struct — the REST list/get path here, the `/events`
+// SSE stream in internal/runtime, and the clients reading either — and each
+// used to carry its own copy. That is how `args` and `oauth.extra_params`
+// ended up masked on the MCP surface and published in the clear on both of
+// these (issue #1148, round 4 finding 3), and how a credential under a benign
+// env/header name stayed in the clear here after the field list was shared but
+// the value-shaped detector was not (round 6 finding 2). Parity is load-bearing
+// beyond the leak: the Web UI's mergeServers treats each payload as
+// authoritative, so a masked-vs-plaintext mismatch would flicker on every
+// delivery.
 func redactServerSecretFields(server *contracts.Server) {
-	if len(server.Headers) > 0 {
-		server.Headers = oauth.RedactStringHeaders(server.Headers)
-	}
-	if len(server.Env) > 0 {
-		server.Env = oauth.RedactEnvValues(server.Env)
-	}
-	if server.URL != "" {
-		server.URL = oauth.RedactURLQueryParams(server.URL)
-	}
-	if server.LastError != "" {
-		server.LastError = oauth.RedactSensitiveData(server.LastError)
-	}
-	if server.Health != nil && server.Health.Detail != "" {
-		server.Health.Detail = oauth.RedactSensitiveData(server.Health.Detail)
-	}
-	// Spec 044 diagnostic — its Cause echoes the raw connect error, which
-	// carries the full upstream URL (query secrets and all); scrub it in
-	// parity with LastError / Health.Detail.
-	if server.Diagnostic != nil && server.Diagnostic.Cause != "" {
-		server.Diagnostic.Cause = oauth.RedactSensitiveData(server.Diagnostic.Cause)
-	}
+	oauth.RedactServerSecretFields(server)
 }
 
 // enrichServersWithQuarantineStats adds quarantine metrics (pending/changed tool counts)
@@ -1443,6 +1917,12 @@ type AddServerRequest struct {
 	// semantics — do NOT collapse to a plain bool, or an omitted field would
 	// silently reset a previously-set value.
 	AutoApproveToolChanges *bool `json:"auto_approve_tool_changes,omitempty"`
+	// ExposePrompts is the per-server override for prompt aggregation (F9):
+	// whether this server's advertised MCP prompts are merged into mcpproxy's
+	// prompts/list. Tri-state *bool mirroring config.ServerConfig.ExposePrompts —
+	// a nil pointer means "leave unchanged" on PATCH (and "inherit the default
+	// aggregate behavior" on create); a present value (including false) is applied.
+	ExposePrompts *bool `json:"expose_prompts,omitempty"`
 	// TrustMode is the per-server trust tier (spec 086): "auto", "scan", or
 	// "manual". Empty means "leave unchanged" on PATCH (and inherit the migrated
 	// default on create). A non-empty value is applied to ServerConfig.TrustMode
@@ -1455,10 +1935,22 @@ type AddServerRequest struct {
 	// pointer means "leave unchanged" on PATCH; a present value is applied.
 	// Mirrors config.ServerConfig.InitTimeout's *Duration tri-state.
 	InitTimeout *config.Duration `json:"init_timeout,omitempty" swaggertype:"string"`
-	// Isolation carries per-server Docker isolation overrides (image,
-	// network_mode, extra_args, working_dir, enabled). A nil pointer
-	// means "do not touch isolation config"; an empty-but-present
-	// object on PATCH intentionally clears the overrides.
+	// MaxConcurrentRequests / QueueSize / QueueTimeout are the per-server
+	// concurrency overrides (spec 093 / GH #955, FR-020 scope (c)). Each is
+	// tri-state: a nil pointer means "leave unchanged" on PATCH and "inherit
+	// server_concurrency_defaults" on create; an explicit 0 disables that
+	// setting for this server; a positive value overrides it. Do NOT collapse
+	// them to plain values — an omitted field would then silently reset a
+	// configured limit.
+	MaxConcurrentRequests *int             `json:"max_concurrent_requests,omitempty"`
+	QueueSize             *int             `json:"queue_size,omitempty"`
+	QueueTimeout          *config.Duration `json:"queue_timeout,omitempty" swaggertype:"string"`
+	// Isolation carries per-server Docker isolation overrides (enabled,
+	// mode_override, image, network_mode, extra_args, working_dir). A nil
+	// pointer means "do not touch isolation config". A present object is
+	// applied field-by-field ON TOP of the persisted overrides, so omitting a
+	// field leaves it alone; clear an individual override by sending it
+	// explicitly (`"enabled": null`, `"image": ""`).
 	Isolation *IsolationRequest `json:"isolation,omitempty"`
 }
 
@@ -1466,25 +1958,165 @@ type AddServerRequest struct {
 // config.IsolationConfig, using pointer fields for PATCH semantics:
 // a nil pointer means "leave this field alone", a present value
 // (including empty string or empty slice) means "set it".
+//
+// Read and write use DISJOINT key names for the isolation flag, deliberately:
+// on a read, `isolation.enabled` is the EFFECTIVE state (see
+// contracts.IsolationConfig), so a client that GETs a server and PATCHes the
+// isolation object back would otherwise convert "inherits the global setting"
+// into a permanent explicit override — the original bug arriving from the other
+// direction (GH #1142). `enabled` is therefore refused on writes, loudly,
+// rather than being silently applied or silently dropped; the writable key is
+// `enabled_override`, which is also the key reads emit the raw value under.
 type IsolationRequest struct {
-	Enabled     *bool     `json:"enabled,omitempty"`
-	Image       *string   `json:"image,omitempty"`
-	NetworkMode *string   `json:"network_mode,omitempty"`
-	ExtraArgs   *[]string `json:"extra_args,omitempty"`
-	WorkingDir  *string   `json:"working_dir,omitempty"`
+	// EnabledOverride is the tri-state per-server override — the RAW value, the
+	// same one reads return as `enabled_override`. It has THREE meaningful wire
+	// states, and collapsing them is what silently un-isolated servers
+	// (GH #1142):
+	//   - absent          → leave the persisted override untouched
+	//   - null            → clear the override, back to inheriting the global
+	//   - true / false    → set an explicit opt-in / opt-out
+	EnabledOverride NullableBool `json:"enabled_override,omitempty" swaggertype:"boolean"`
+	// Enabled exists ONLY to detect and reject an echoed-back read. It is the
+	// effective state on the read surface and is never writable; see validate().
+	Enabled NullableBool `json:"enabled,omitempty" swaggertype:"boolean"`
+	// ModeOverride sets `isolation.mode` ("docker" | "sandbox" | "none").
+	// nil leaves the persisted value alone; an empty string clears it. An
+	// unrecognized value is rejected with a 400 rather than persisted.
+	ModeOverride *string   `json:"mode_override,omitempty"`
+	Image        *string   `json:"image,omitempty"`
+	NetworkMode  *string   `json:"network_mode,omitempty"`
+	ExtraArgs    *[]string `json:"extra_args,omitempty"`
+	WorkingDir   *string   `json:"working_dir,omitempty"`
 }
 
-// toConfig materializes the request into a config.IsolationConfig.
-// Fields left nil on the request do not appear on the resulting struct
-// so UpdateServer's merge logic (in Controller) can distinguish them
-// from explicit clears.
-func (r *IsolationRequest) toConfig() *config.IsolationConfig {
+// isolationEnabledReadOnlyMessage is the operator-facing 400 body for a write
+// that carries the read-only `isolation.enabled`. Like invalidTrustModeMessage
+// it names the field to use instead, so the mistake is self-diagnosing from the
+// response alone.
+const isolationEnabledReadOnlyMessage = "isolation.enabled is read-only: on reads it reports the EFFECTIVE isolation state " +
+	"(global setting + per-server override + structural gates), so echoing it back would turn a server that merely " +
+	"inherits the global setting into an explicit override. Use isolation.enabled_override instead: " +
+	"true = always isolate, false = never isolate, null = clear the override and inherit the global setting; " +
+	"omit the key to leave it unchanged"
+
+// validate rejects the write-time errors that would otherwise be persisted:
+// an echoed-back read-only field, and an isolation mode the spawn path does not
+// implement (which would be written to BBolt and the config file, then fail the
+// NEXT daemon start's config validation).
+func (r *IsolationRequest) validate() error {
 	if r == nil {
 		return nil
 	}
-	out := &config.IsolationConfig{}
-	if r.Enabled != nil {
-		out.Enabled = config.BoolPtr(*r.Enabled)
+	if r.Enabled.Set {
+		return errors.New(isolationEnabledReadOnlyMessage)
+	}
+	if r.ModeOverride != nil {
+		mode := config.IsolationMode(*r.ModeOverride)
+		if err := config.ValidateIsolationModeOverride(&mode); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// NullableBool distinguishes an absent JSON key from an explicit `null` and
+// from a real boolean, which a plain *bool cannot do. Used for tri-state PATCH
+// fields where "clear this back to the default" has to be expressible.
+type NullableBool struct {
+	// Set is true when the key was present in the request body at all.
+	Set bool
+	// Value is the decoded boolean, or nil when the key was present as `null`.
+	Value *bool
+}
+
+// UnmarshalJSON records that the key was present, and decodes its value unless
+// it was the literal `null`.
+func (n *NullableBool) UnmarshalJSON(data []byte) error {
+	n.Set = true
+	if string(data) == "null" {
+		n.Value = nil
+		return nil
+	}
+	var b bool
+	if err := json.Unmarshal(data, &b); err != nil {
+		return err
+	}
+	n.Value = &b
+	return nil
+}
+
+// MarshalJSON encodes the decoded value; an unset or explicitly-null field
+// encodes as `null`. NOTE that `null` is the CLEAR-the-override shape on the
+// way in, so an unset field must not survive a re-marshal — that is what
+// IsolationRequest.MarshalJSON deletes.
+func (n NullableBool) MarshalJSON() ([]byte, error) {
+	if !n.Set || n.Value == nil {
+		return []byte("null"), nil
+	}
+	return json.Marshal(*n.Value)
+}
+
+// MarshalJSON drops the tri-state fields the request never set.
+//
+// NullableBool's own "unset" encoding is `null`, and `null` on the way IN is
+// the clear-the-override shape — so encoding an untouched request with the
+// default marshaller would produce a body that wipes the persisted override
+// (and one that trips the read-only `enabled` check). Deleting the keys keeps
+// "absent" absent, which is the whole point of the tri-state.
+//
+// It re-encodes through the struct rather than listing the fields again, so a
+// new field cannot silently miss this treatment.
+func (r IsolationRequest) MarshalJSON() ([]byte, error) {
+	type plain IsolationRequest // shed the method set to avoid recursion
+	raw, err := json.Marshal(plain(r))
+	if err != nil {
+		return nil, err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return nil, err
+	}
+	if !r.EnabledOverride.Set {
+		delete(fields, "enabled_override")
+	}
+	if !r.Enabled.Set {
+		delete(fields, "enabled")
+	}
+	return json.Marshal(fields)
+}
+
+// resolve materializes the request into a complete config.IsolationConfig,
+// starting from the server's PERSISTED overrides and applying only the fields
+// the request actually carried.
+//
+// Resolving here (rather than in the controller's field-by-field merge) is what
+// makes three things work at once: an omitted `enabled` cannot become an
+// explicit opt-out, an explicit null CAN clear the override, and the fields this
+// request type does not expose (mode, log driver/size/files) survive untouched
+// — which in turn lets UpdateServer replace the block wholesale.
+func (r *IsolationRequest) resolve(existing *config.IsolationConfig) *config.IsolationConfig {
+	if r == nil {
+		return nil
+	}
+	out := config.CopyIsolationConfig(existing)
+	if out == nil {
+		out = &config.IsolationConfig{}
+	}
+
+	if r.EnabledOverride.Set {
+		if r.EnabledOverride.Value == nil {
+			out.Enabled = nil // back to "inherit global"
+		} else {
+			out.Enabled = config.BoolPtr(*r.EnabledOverride.Value)
+		}
+	}
+	if r.ModeOverride != nil {
+		if *r.ModeOverride == "" {
+			out.Mode = nil
+		} else {
+			mode := config.IsolationMode(*r.ModeOverride)
+			out.Mode = &mode
+		}
 	}
 	if r.Image != nil {
 		out.Image = *r.Image
@@ -1503,7 +2135,7 @@ func (r *IsolationRequest) toConfig() *config.IsolationConfig {
 
 // handleAddServer godoc
 // @Summary Add a new upstream server
-// @Description Add a new MCP upstream server to the configuration. New servers are quarantined by default for security.
+// @Description Add a new MCP upstream server to the configuration. New servers are quarantined by default for security. Isolation: `isolation.enabled` is READ-ONLY (it reports the effective state on reads) and is rejected with 400; set the per-server override via `isolation.enabled_override` (true | false | null to clear, omit to leave unchanged). An unrecognized `isolation.mode_override` is rejected with 400.
 // @Tags servers
 // @Accept json
 // @Produce json
@@ -1516,6 +2148,14 @@ func (r *IsolationRequest) toConfig() *config.IsolationConfig {
 // @Failure 500 {object} contracts.ErrorResponse "Internal server error"
 // @Failure 403 {object} contracts.ErrorResponse "Forbidden (agent tokens cannot mutate servers)"
 // @Router /api/v1/servers [post]
+// invalidTrustModeMessage renders the operator-facing 400 body for a rejected
+// trust_mode (GH #938). It always names the offending value AND the accepted
+// vocabulary so a typo is self-diagnosing from the response alone.
+func invalidTrustModeMessage(mode string) string {
+	return fmt.Sprintf("invalid trust_mode %q: must be one of: %s (values are case-sensitive; omit the field to leave it unchanged)",
+		mode, strings.Join(config.ValidTrustModes(), ", "))
+}
+
 func (s *Server) handleAddServer(w http.ResponseWriter, r *http.Request) {
 	var req AddServerRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -1532,6 +2172,30 @@ func (s *Server) handleAddServer(w http.ResponseWriter, r *http.Request) {
 	// Must have either URL or command
 	if req.URL == "" && req.Command == "" {
 		s.writeError(w, r, http.StatusBadRequest, "Either 'url' or 'command' is required")
+		return
+	}
+
+	// GH #938: reject an unrecognized trust_mode instead of persisting it.
+	// EffectiveTrustMode() fails closed to manual on a bogus value, so accepting
+	// "Scan" would leave the operator's typo echoed back by every read surface
+	// while the runtime silently behaved as manual.
+	if !config.IsValidTrustMode(req.TrustMode) {
+		s.writeError(w, r, http.StatusBadRequest, invalidTrustModeMessage(req.TrustMode))
+		return
+	}
+
+	// #1148 round 4: refuse an argv mask on create too. There is no stored
+	// vector to bind one to here, so a mask can only be a placeholder copied
+	// out of another server's read payload — never a value worth persisting.
+	if err := oauth.CheckArgvMaskEcho("args", req.Args, nil); err != nil {
+		s.writeError(w, r, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// GH #1142: refuse a read-only `isolation.enabled` and an unrecognized
+	// isolation mode BEFORE anything is persisted.
+	if err := req.Isolation.validate(); err != nil {
+		s.writeError(w, r, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -1600,6 +2264,12 @@ func (s *Server) handleAddServer(w http.ResponseWriter, r *http.Request) {
 	if req.AutoApproveToolChanges != nil {
 		serverConfig.AutoApproveToolChanges = req.AutoApproveToolChanges
 	}
+	// F9: carry the per-server prompt-aggregation override through on create.
+	// Pointer-assign (config field is *bool) so an omitted field stays nil =
+	// "inherit default aggregation".
+	if req.ExposePrompts != nil {
+		serverConfig.ExposePrompts = req.ExposePrompts
+	}
 	// Spec 086: carry the per-server trust_mode through on create. Empty means
 	// "not specified" — leave it for the loader's legacy-flag migration to
 	// populate; a present value wins.
@@ -1610,16 +2280,39 @@ func (s *Server) handleAddServer(w http.ResponseWriter, r *http.Request) {
 	if req.InitTimeout != nil {
 		serverConfig.InitTimeout = req.InitTimeout
 	}
+	// Spec 093: carry the per-server concurrency overrides through on create.
+	// Tri-state pointers — only set when the caller actually provided them, so
+	// an omitted field still inherits server_concurrency_defaults.
+	if req.MaxConcurrentRequests != nil {
+		serverConfig.MaxConcurrentRequests = req.MaxConcurrentRequests
+	}
+	if req.QueueSize != nil {
+		serverConfig.QueueSize = req.QueueSize
+	}
+	if req.QueueTimeout != nil {
+		serverConfig.QueueTimeout = req.QueueTimeout
+	}
 	// Carry the per-server Docker isolation override through on create. The
 	// AddServerRequest has always declared (and documented) an Isolation
 	// field, but only the PATCH/update path mapped it — on create it was
 	// silently dropped, so a caller could not, for example, opt a host-run
 	// stdio server OUT of isolation when global docker_isolation.enabled=true
 	// (the server would be forced into a container and fail to start). Mirror
-	// the update path's toConfig() mapping so the field means the same thing
-	// on both verbs.
+	// the update path's mapping so the field means the same thing on both
+	// verbs. There is nothing persisted yet, so the patch resolves against nil.
 	if req.Isolation != nil {
-		serverConfig.Isolation = req.Isolation.toConfig()
+		serverConfig.Isolation = req.Isolation.resolve(nil)
+	}
+
+	// #1148 round 6: on CREATE there is no stored value to bind a mask back to,
+	// so ANY mask this proxy rendered can only be a placeholder copied out of
+	// another server's read payload — never a value worth persisting. Refusing
+	// beats persisting literal text like `••••ab (12 chars)` as a credential,
+	// which produces a server that fails to connect for a non-obvious reason.
+	// The MCP `upstream_servers add` door runs the same check.
+	if err := oauth.CheckServerWriteMasks("server.", serverConfig); err != nil {
+		s.writeError(w, r, http.StatusBadRequest, err.Error())
+		return
 	}
 
 	// Add server via controller
@@ -1630,12 +2323,12 @@ func (s *Server) handleAddServer(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, r, http.StatusConflict, err.Error())
 			return
 		}
-		logger.Error("Failed to add server", "server", req.Name, "error", err)
+		logger.Errorw("Failed to add server", "server", req.Name, "error", err)
 		s.writeError(w, r, http.StatusInternalServerError, fmt.Sprintf("Failed to add server: %v", err))
 		return
 	}
 
-	logger.Info("Server added successfully", "server", req.Name, "quarantined", quarantined)
+	logger.Infow("Server added successfully", "server", req.Name, "quarantined", quarantined)
 	s.writeSuccess(w, contracts.ServerActionResponse{
 		Server:  req.Name,
 		Action:  "add",
@@ -1673,12 +2366,12 @@ func (s *Server) handleRemoveServer(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, r, http.StatusNotFound, err.Error())
 			return
 		}
-		logger.Error("Failed to remove server", "server", serverID, "error", err)
+		logger.Errorw("Failed to remove server", "server", serverID, "error", err)
 		s.writeError(w, r, http.StatusInternalServerError, fmt.Sprintf("Failed to remove server: %v", err))
 		return
 	}
 
-	logger.Info("Server removed successfully", "server", serverID)
+	logger.Infow("Server removed successfully", "server", serverID)
 	s.writeSuccess(w, contracts.ServerActionResponse{
 		Server:  serverID,
 		Action:  "remove",
@@ -1688,7 +2381,7 @@ func (s *Server) handleRemoveServer(w http.ResponseWriter, r *http.Request) {
 
 // handlePatchServer godoc
 // @Summary Partially update an upstream server
-// @Description Update specific fields of an existing upstream MCP server configuration.
+// @Description Update specific fields of an existing upstream MCP server configuration. Isolation: `isolation.enabled` is READ-ONLY (it reports the effective state on reads) and is rejected with 400; set the per-server override via `isolation.enabled_override` (true | false | null to clear, omit to leave unchanged). An unrecognized `isolation.mode_override` is rejected with 400.
 // @Tags servers
 // @Accept json
 // @Produce json
@@ -1715,6 +2408,21 @@ func (s *Server) handlePatchServer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// GH #938: reject an unrecognized trust_mode before anything is persisted.
+	// A PATCH that omits trust_mode sends "" and is unaffected ("" = leave
+	// unchanged); only a present-but-bogus value is refused.
+	if !config.IsValidTrustMode(req.TrustMode) {
+		s.writeError(w, r, http.StatusBadRequest, invalidTrustModeMessage(req.TrustMode))
+		return
+	}
+
+	// GH #1142: refuse a read-only `isolation.enabled` and an unrecognized
+	// isolation mode BEFORE anything is persisted.
+	if err := req.Isolation.validate(); err != nil {
+		s.writeError(w, r, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	// Pre-fetch existing server so we can preserve bool fields the request
 	// did not explicitly set. `config.ServerConfig` uses non-pointer bools
 	// whose zero value cannot be distinguished from "not set" by the time
@@ -1736,16 +2444,29 @@ func (s *Server) handlePatchServer(w http.ResponseWriter, r *http.Request) {
 
 	if req.URL != "" {
 		// #872: the read path masks secrets in the URL query string / userinfo
-		// (redactServerSecrets → oauth.RedactURLQueryParams), but url is a single
-		// string field with no field-level diff. If a client edits a non-secret
-		// part and echoes the masked url back, restore the stored real secrets so
-		// the mask is never persisted over them. Protects ALL clients, not just
-		// the tray.
+		// (redactServerSecrets → oauth.RedactServerSecretFields), but url is a
+		// single string field with no field-level diff. If a client edits a
+		// non-secret part and echoes the masked url back, restore the stored
+		// real secrets so the mask is never persisted over them. Protects ALL
+		// clients, not just the tray.
+		//
+		// #1148 round 6: this is oauth.UnmaskLiveURL, the SAME function the MCP
+		// patch door calls — the whole-URL echo, then the sensitive-param and
+		// per-parameter reverts, then a refusal for any mask left unbound. The
+		// plain oauth.UnmaskURL used here before knew only the params it had
+		// masked itself, so once the REST read door started masking a
+		// credential under an unrecognised parameter name the mask was written
+		// through as the credential.
+		var storedURL string
 		if existingSrv != nil {
-			updates.URL = oauth.UnmaskURL(req.URL, existingSrv.URL)
-		} else {
-			updates.URL = req.URL
+			storedURL = existingSrv.URL
 		}
+		unmaskedURL, err := oauth.UnmaskLiveURL(req.URL, storedURL)
+		if err != nil {
+			s.writeError(w, r, http.StatusBadRequest, err.Error())
+			return
+		}
+		updates.URL = unmaskedURL
 		hasUpdates = true
 	}
 	if req.Command != "" {
@@ -1753,6 +2474,19 @@ func (s *Server) handlePatchServer(w http.ResponseWriter, r *http.Request) {
 		hasUpdates = true
 	}
 	if req.Args != nil {
+		// #1148 round 4: `args` REPLACES the vector, and the read path masks
+		// credential-shaped argv tokens. Unlike env/headers/url there is no
+		// unmask contract for argv — an argv slot has no key to bind a stored
+		// secret to, and the caller supplies the whole vector *and* `command`
+		// in the same request — so an echoed mask is refused, not reverted.
+		var storedArgs []string
+		if existingSrv != nil {
+			storedArgs = existingSrv.Args
+		}
+		if err := oauth.CheckArgvMaskEcho("args", req.Args, storedArgs); err != nil {
+			s.writeError(w, r, http.StatusBadRequest, err.Error())
+			return
+		}
 		updates.Args = req.Args
 		hasUpdates = true
 	}
@@ -1779,8 +2513,14 @@ func (s *Server) handlePatchServer(w http.ResponseWriter, r *http.Request) {
 		// #872: a client could echo a masked env value back (the tray diffs, but
 		// other clients may send the full map). Revert any value that is exactly
 		// the masked rendering of the stored one.
+		//
+		// #1148 round 6: UnmaskLiveEnvValues first, because the LIVE read door
+		// masks a vendor-shaped credential under a benign variable name — a
+		// rendering UnmaskEnvValues (which compares against oauth's own name
+		// rule) cannot recognise. Both bind by KEY, so a value is only ever
+		// restored to the variable it was read from.
 		if existingSrv != nil {
-			merged = oauth.UnmaskEnvValues(merged, existingSrv.Env)
+			merged = oauth.UnmaskEnvValues(oauth.UnmaskLiveEnvValues(merged, existingSrv.Env), existingSrv.Env)
 		}
 		updates.Env = merged
 		hasUpdates = true
@@ -1799,9 +2539,10 @@ func (s *Server) handlePatchServer(w http.ResponseWriter, r *http.Request) {
 				merged[k] = *vp
 			}
 		}
-		// #872: revert any masked header value echoed back (see env note above).
+		// #872 / #1148 round 6: revert any masked header value echoed back (see
+		// the env note above — same two-step, same key binding).
 		if existingSrv != nil {
-			merged = oauth.UnmaskHeaders(merged, existingSrv.Headers)
+			merged = oauth.UnmaskHeaders(oauth.UnmaskLiveHeaders(merged, existingSrv.Headers), existingSrv.Headers)
 		}
 		updates.Headers = merged
 		hasUpdates = true
@@ -1843,6 +2584,15 @@ func (s *Server) handlePatchServer(w http.ResponseWriter, r *http.Request) {
 	} else if existingSrv != nil {
 		updates.AutoApproveToolChanges = existingSrv.AutoApproveToolChanges
 	}
+	// F9: expose_prompts is a tri-state *bool — preserve the EXISTING POINTER
+	// (which may be nil = "never set") when the request omits the field, so a
+	// bare PATCH of an unrelated field does not wipe a configured override.
+	if req.ExposePrompts != nil {
+		updates.ExposePrompts = req.ExposePrompts
+		hasUpdates = true
+	} else if existingSrv != nil {
+		updates.ExposePrompts = existingSrv.ExposePrompts
+	}
 	// Spec 086: trust_mode is a plain string — empty means "leave unchanged", so
 	// preserve the existing value when the request omits it (a bare PATCH of an
 	// unrelated field must not reset the trust tier).
@@ -1861,13 +2611,55 @@ func (s *Server) handlePatchServer(w http.ResponseWriter, r *http.Request) {
 	} else if existingSrv != nil {
 		updates.InitTimeout = existingSrv.InitTimeout
 	}
+	// Spec 093: the per-server concurrency overrides are tri-state pointers —
+	// preserve the existing values when the request omits them so an unrelated
+	// PATCH cannot wipe a configured limit.
+	if req.MaxConcurrentRequests != nil {
+		updates.MaxConcurrentRequests = req.MaxConcurrentRequests
+		hasUpdates = true
+	} else if existingSrv != nil {
+		updates.MaxConcurrentRequests = existingSrv.MaxConcurrentRequests
+	}
+	if req.QueueSize != nil {
+		updates.QueueSize = req.QueueSize
+		hasUpdates = true
+	} else if existingSrv != nil {
+		updates.QueueSize = existingSrv.QueueSize
+	}
+	if req.QueueTimeout != nil {
+		updates.QueueTimeout = req.QueueTimeout
+		hasUpdates = true
+	} else if existingSrv != nil {
+		updates.QueueTimeout = existingSrv.QueueTimeout
+	}
+	// Isolation is resolved against the PERSISTED overrides, so an omitted
+	// `enabled` cannot become an explicit opt-out and the fields the request
+	// does not expose (mode, log driver) survive (GH #1142). The controller
+	// then replaces the block wholesale.
 	if req.Isolation != nil {
-		updates.Isolation = req.Isolation.toConfig()
+		var existingIso *config.IsolationConfig
+		if existingSrv != nil {
+			existingIso = existingSrv.Isolation
+		}
+		updates.Isolation = req.Isolation.resolve(existingIso)
 		hasUpdates = true
 	}
 
 	if !hasUpdates {
 		s.writeError(w, r, http.StatusBadRequest, "No fields to update")
+		return
+	}
+
+	// #1148 round 6: the fail-closed net. The key-bound reverts above restored
+	// every mask this proxy can bind back to the value it was read from;
+	// anything still carrying one is refused rather than persisted over a live
+	// credential. This is what covers the fields with no revert (args,
+	// oauth.scopes, isolation.extra_args) AND every field added to
+	// config.ServerConfig later — a new field fails CLOSED instead of silently
+	// round-tripping its own mask into the config. See
+	// oauth.ServerFieldMaskDecisions.
+	if err := oauth.CheckServerWriteMasks("server.", updates); err != nil {
+		s.writeError(w, r, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -1878,12 +2670,12 @@ func (s *Server) handlePatchServer(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, r, http.StatusNotFound, err.Error())
 			return
 		}
-		logger.Error("Failed to update server", "server", serverName, "error", err)
+		logger.Errorw("Failed to update server", "server", serverName, "error", err)
 		s.writeError(w, r, http.StatusInternalServerError, fmt.Sprintf("Failed to update server: %v", err))
 		return
 	}
 
-	logger.Info("Server updated successfully", "server", serverName)
+	logger.Infow("Server updated successfully", "server", serverName)
 	s.writeSuccess(w, map[string]interface{}{
 		"message":          fmt.Sprintf("Server '%s' updated successfully", serverName),
 		"restart_required": true,
@@ -2000,7 +2792,7 @@ func (s *Server) handleConvertConfigToSecret(w http.ResponseWriter, r *http.Requ
 	// state so it's traceable.
 	ref := secret.Ref{Type: secretTypeKeyring, Name: req.SecretName}
 	if err := resolver.Store(ctx, ref, value); err != nil {
-		s.logger.Error("config-to-secret: keyring store failed",
+		s.logger.Errorw("config-to-secret: keyring store failed",
 			"server", serverName, "scope", req.Scope, "key", req.Key, "error", err)
 		s.writeError(w, r, http.StatusInternalServerError, fmt.Sprintf("failed to store secret: %v", err))
 		return
@@ -2032,7 +2824,7 @@ func (s *Server) handleConvertConfigToSecret(w http.ResponseWriter, r *http.Requ
 	updates.ReconnectOnUse = sc.ReconnectOnUse
 
 	if err := s.controller.UpdateServer(ctx, serverName, updates); err != nil {
-		s.logger.Error("config-to-secret: keyring write succeeded but config update failed; secret is stored but not referenced",
+		s.logger.Errorw("config-to-secret: keyring write succeeded but config update failed; secret is stored but not referenced",
 			"server", serverName, "scope", req.Scope, "key", req.Key, "secret_name", req.SecretName, "error", err)
 		s.writeError(w, r, http.StatusInternalServerError, fmt.Sprintf("secret stored as %q but config update failed: %v", req.SecretName, err))
 		return
@@ -2040,7 +2832,7 @@ func (s *Server) handleConvertConfigToSecret(w http.ResponseWriter, r *http.Requ
 
 	// Wake any servers that depend on the new secret. Best-effort.
 	if err := s.controller.NotifySecretsChanged(ctx, "store", req.SecretName); err != nil {
-		s.logger.Warn("config-to-secret: failed to notify runtime of secret change",
+		s.logger.Warnw("config-to-secret: failed to notify runtime of secret change",
 			"name", req.SecretName, "error", err)
 	}
 
@@ -2078,7 +2870,7 @@ func (s *Server) handleEnableServer(w http.ResponseWriter, r *http.Request) {
 		}).EnableServer(r.Context(), serverID, true)
 
 		if err != nil {
-			s.logger.Error("Failed to enable server via management service", "server", serverID, "error", err)
+			s.logger.Errorw("Failed to enable server via management service", "server", serverID, "error", err)
 			s.writeError(w, r, http.StatusInternalServerError, fmt.Sprintf("Failed to enable server: %v", err))
 			return
 		}
@@ -2096,15 +2888,15 @@ func (s *Server) handleEnableServer(w http.ResponseWriter, r *http.Request) {
 	// Fallback to legacy async path
 	async, err := s.toggleServerAsync(serverID, true)
 	if err != nil {
-		s.logger.Error("Failed to enable server", "server", serverID, "error", err)
+		s.logger.Errorw("Failed to enable server", "server", serverID, "error", err)
 		s.writeError(w, r, http.StatusInternalServerError, fmt.Sprintf("Failed to enable server: %v", err))
 		return
 	}
 
 	if async {
-		s.logger.Debug("Server enable dispatched asynchronously", "server", serverID)
+		s.logger.Debugw("Server enable dispatched asynchronously", "server", serverID)
 	} else {
-		s.logger.Debug("Server enable completed synchronously", "server", serverID)
+		s.logger.Debugw("Server enable completed synchronously", "server", serverID)
 	}
 
 	response := contracts.ServerActionResponse{
@@ -2145,7 +2937,7 @@ func (s *Server) handleDisableServer(w http.ResponseWriter, r *http.Request) {
 		}).EnableServer(r.Context(), serverID, false)
 
 		if err != nil {
-			s.logger.Error("Failed to disable server via management service", "server", serverID, "error", err)
+			s.logger.Errorw("Failed to disable server via management service", "server", serverID, "error", err)
 			s.writeError(w, r, http.StatusInternalServerError, fmt.Sprintf("Failed to disable server: %v", err))
 			return
 		}
@@ -2163,15 +2955,15 @@ func (s *Server) handleDisableServer(w http.ResponseWriter, r *http.Request) {
 	// Fallback to legacy async path
 	async, err := s.toggleServerAsync(serverID, false)
 	if err != nil {
-		s.logger.Error("Failed to disable server", "server", serverID, "error", err)
+		s.logger.Errorw("Failed to disable server", "server", serverID, "error", err)
 		s.writeError(w, r, http.StatusInternalServerError, fmt.Sprintf("Failed to disable server: %v", err))
 		return
 	}
 
 	if async {
-		s.logger.Debug("Server disable dispatched asynchronously", "server", serverID)
+		s.logger.Debugw("Server disable dispatched asynchronously", "server", serverID)
 	} else {
-		s.logger.Debug("Server disable completed synchronously", "server", serverID)
+		s.logger.Debugw("Server disable completed synchronously", "server", serverID)
 	}
 
 	response := contracts.ServerActionResponse{
@@ -2200,7 +2992,7 @@ func (s *Server) handleForceReconnectServers(w http.ResponseWriter, r *http.Requ
 	reason := r.URL.Query().Get("reason")
 
 	if err := s.controller.ForceReconnectAllServers(reason); err != nil {
-		s.logger.Error("Failed to trigger force reconnect for servers",
+		s.logger.Errorw("Failed to trigger force reconnect for servers",
 			"reason", reason,
 			"error", err)
 		s.writeError(w, r, http.StatusInternalServerError, fmt.Sprintf("Failed to reconnect servers: %v", err))
@@ -2240,7 +3032,7 @@ func (s *Server) handleRestartAll(w http.ResponseWriter, r *http.Request) {
 
 	result, err := mgmtSvc.RestartAll(r.Context())
 	if err != nil {
-		s.logger.Error("RestartAll operation failed", "error", err)
+		s.logger.Errorw("RestartAll operation failed", "error", err)
 		s.writeError(w, r, http.StatusInternalServerError, fmt.Sprintf("Failed to restart all servers: %v", err))
 		return
 	}
@@ -2272,7 +3064,7 @@ func (s *Server) handleEnableAll(w http.ResponseWriter, r *http.Request) {
 
 	result, err := mgmtSvc.EnableAll(r.Context())
 	if err != nil {
-		s.logger.Error("EnableAll operation failed", "error", err)
+		s.logger.Errorw("EnableAll operation failed", "error", err)
 		s.writeError(w, r, http.StatusInternalServerError, fmt.Sprintf("Failed to enable all servers: %v", err))
 		return
 	}
@@ -2304,7 +3096,7 @@ func (s *Server) handleDisableAll(w http.ResponseWriter, r *http.Request) {
 
 	result, err := mgmtSvc.DisableAll(r.Context())
 	if err != nil {
-		s.logger.Error("DisableAll operation failed", "error", err)
+		s.logger.Errorw("DisableAll operation failed", "error", err)
 		s.writeError(w, r, http.StatusInternalServerError, fmt.Sprintf("Failed to disable all servers: %v", err))
 		return
 	}
@@ -2349,7 +3141,7 @@ func (s *Server) handleRestartServer(w http.ResponseWriter, r *http.Request) {
 
 			if isOAuthError {
 				// OAuth required is not a failure - restart succeeded but OAuth is needed
-				s.logger.Info("Server restart completed, OAuth login required",
+				s.logger.Infow("Server restart completed, OAuth login required",
 					"server", serverID,
 					"error", errStr)
 
@@ -2364,7 +3156,7 @@ func (s *Server) handleRestartServer(w http.ResponseWriter, r *http.Request) {
 			}
 
 			// Non-OAuth error - treat as failure
-			s.logger.Error("Failed to restart server via management service", "server", serverID, "error", err)
+			s.logger.Errorw("Failed to restart server via management service", "server", serverID, "error", err)
 			s.writeError(w, r, http.StatusInternalServerError, fmt.Sprintf("Failed to restart server: %v", err))
 			return
 		}
@@ -2398,7 +3190,7 @@ func (s *Server) handleRestartServer(w http.ResponseWriter, r *http.Request) {
 
 			if isOAuthError {
 				// OAuth required is not a failure - restart succeeded but OAuth is needed
-				s.logger.Info("Server restart completed, OAuth login required",
+				s.logger.Infow("Server restart completed, OAuth login required",
 					"server", serverID,
 					"error", errStr)
 
@@ -2413,17 +3205,17 @@ func (s *Server) handleRestartServer(w http.ResponseWriter, r *http.Request) {
 			}
 
 			// Non-OAuth error - treat as failure
-			s.logger.Error("Failed to restart server", "server", serverID, "error", err)
+			s.logger.Errorw("Failed to restart server", "server", serverID, "error", err)
 			s.writeError(w, r, http.StatusInternalServerError, fmt.Sprintf("Failed to restart server: %v", err))
 			return
 		}
-		s.logger.Debug("Server restart completed synchronously", "server", serverID)
+		s.logger.Debugw("Server restart completed synchronously", "server", serverID)
 	case <-time.After(35 * time.Second):
 		// Longer timeout for restart (30s connect timeout + 5s buffer)
-		s.logger.Debug("Server restart executing asynchronously", "server", serverID)
+		s.logger.Debugw("Server restart executing asynchronously", "server", serverID)
 		go func() {
 			if err := <-done; err != nil {
-				s.logger.Error("Asynchronous server restart failed", "server", serverID, "error", err)
+				s.logger.Errorw("Asynchronous server restart failed", "server", serverID, "error", err)
 			}
 		}()
 	}
@@ -2464,10 +3256,10 @@ func (s *Server) handleDiscoverServerTools(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	s.logger.Info("Manual tool discovery triggered via API", "server", serverID)
+	s.logger.Infow("Manual tool discovery triggered via API", "server", serverID)
 
 	if err := s.controller.DiscoverServerTools(r.Context(), serverID); err != nil {
-		s.logger.Error("Failed to discover tools for server", "server", serverID, "error", err)
+		s.logger.Errorw("Failed to discover tools for server", "server", serverID, "error", err)
 
 		if strings.Contains(err.Error(), "not found") {
 			s.writeError(w, r, http.StatusNotFound, fmt.Sprintf("Server not found: %s", serverID))
@@ -2511,10 +3303,10 @@ func (s *Server) handleRefreshServer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.logger.Info("Manual tool refresh triggered via API", "server", serverID)
+	s.logger.Infow("Manual tool refresh triggered via API", "server", serverID)
 
 	if err := s.controller.DiscoverServerTools(r.Context(), serverID); err != nil {
-		s.logger.Error("Failed to refresh tools for server", "server", serverID, "error", err)
+		s.logger.Errorw("Failed to refresh tools for server", "server", serverID, "error", err)
 
 		if strings.Contains(err.Error(), "not found") {
 			s.writeError(w, r, http.StatusNotFound, fmt.Sprintf("Server not found: %s", serverID))
@@ -2546,7 +3338,7 @@ func (s *Server) toggleServerAsync(serverID string, enabled bool) (bool, error) 
 	case <-time.After(asyncToggleTimeout):
 		go func() {
 			if err := <-errCh; err != nil {
-				s.logger.Error("Asynchronous server toggle failed", "server", serverID, "enabled", enabled, "error", err)
+				s.logger.Errorw("Asynchronous server toggle failed", "server", serverID, "enabled", enabled, "error", err)
 			}
 		}()
 		return true, nil
@@ -2586,7 +3378,7 @@ func (s *Server) handleServerLogin(w http.ResponseWriter, r *http.Request) {
 
 	result, err := mgmtSvc.TriggerOAuthLoginQuick(r.Context(), serverID)
 	if err != nil {
-		s.logger.Error("Failed to trigger OAuth login", "server", serverID, "error", err)
+		s.logger.Errorw("Failed to trigger OAuth login", "server", serverID, "error", err)
 
 		// Spec 020: Check for structured OAuth errors and return them directly
 		var oauthFlowErr *contracts.OAuthFlowError
@@ -2596,7 +3388,7 @@ func (s *Server) handleServerLogin(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadRequest)
 			if encErr := json.NewEncoder(w).Encode(oauthFlowErr); encErr != nil {
-				s.logger.Error("Failed to encode OAuth flow error response", "error", encErr)
+				s.logger.Errorw("Failed to encode OAuth flow error response", "error", encErr)
 			}
 			return
 		}
@@ -2606,7 +3398,7 @@ func (s *Server) handleServerLogin(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadRequest)
 			if encErr := json.NewEncoder(w).Encode(oauthValidationErr); encErr != nil {
-				s.logger.Error("Failed to encode OAuth validation error response", "error", encErr)
+				s.logger.Errorw("Failed to encode OAuth validation error response", "error", encErr)
 			}
 			return
 		}
@@ -2690,7 +3482,7 @@ func (s *Server) handleServerLogout(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := mgmtSvc.TriggerOAuthLogout(r.Context(), serverID); err != nil {
-		s.logger.Error("Failed to trigger OAuth logout", "server", serverID, "error", err)
+		s.logger.Errorw("Failed to trigger OAuth logout", "server", serverID, "error", err)
 
 		// Map errors to HTTP status codes
 		if strings.Contains(err.Error(), "management disabled") || strings.Contains(err.Error(), "read-only") {
@@ -2736,7 +3528,7 @@ func (s *Server) handleQuarantineServer(w http.ResponseWriter, r *http.Request) 
 	}
 
 	if err := s.controller.QuarantineServer(serverID, true); err != nil {
-		s.logger.Error("Failed to quarantine server", "server", serverID, "error", err)
+		s.logger.Errorw("Failed to quarantine server", "server", serverID, "error", err)
 		s.writeError(w, r, http.StatusInternalServerError, fmt.Sprintf("Failed to quarantine server: %v", err))
 		return
 	}
@@ -2772,7 +3564,7 @@ func (s *Server) handleUnquarantineServer(w http.ResponseWriter, r *http.Request
 	}
 
 	if err := s.controller.QuarantineServer(serverID, false); err != nil {
-		s.logger.Error("Failed to unquarantine server", "server", serverID, "error", err)
+		s.logger.Errorw("Failed to unquarantine server", "server", serverID, "error", err)
 		s.writeError(w, r, http.StatusInternalServerError, fmt.Sprintf("Failed to unquarantine server: %v", err))
 		return
 	}
@@ -2818,7 +3610,7 @@ func (s *Server) handleGetServerTools(w http.ResponseWriter, r *http.Request) {
 
 	tools, err := mgmtSvc.GetServerTools(r.Context(), serverID)
 	if err != nil {
-		s.logger.Error("Failed to get server tools", "server", serverID, "error", err)
+		s.logger.Errorw("Failed to get server tools", "server", serverID, "error", err)
 
 		// Map errors to HTTP status codes (T018)
 		if strings.Contains(err.Error(), "not found") {
@@ -2830,7 +3622,9 @@ func (s *Server) handleGetServerTools(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Convert + enrich (shared with the global tools endpoint, spec 050).
-	typedTools := s.enrichServerTools(serverID, tools)
+	// Hash pins are operator-tier only (Spec 098 T020).
+	tier, _ := disclosureTier(r)
+	typedTools := s.enrichServerTools(serverID, tools, tier == preflight.TierOperator)
 
 	// Sort: pending/changed tools first, then approved
 	sort.SliceStable(typedTools, func(i, j int) bool {
@@ -2851,7 +3645,12 @@ func (s *Server) handleGetServerTools(w http.ResponseWriter, r *http.Request) {
 // Shared by the per-server tools endpoint and the global tools endpoint
 // (spec 050). ServerName is forced to serverID so the global merge can attribute
 // every tool to its server even if the upstream payload omits server_name.
-func (s *Server) enrichServerTools(serverID string, tools []map[string]interface{}) []contracts.Tool {
+//
+// discloseHash (Spec 098 T020) additionally publishes the approval record's
+// current hash as a preflight pin. Callers derive it from the request's
+// disclosure tier — never pass true unconditionally: the agent-token tier must
+// not receive hashes (FR-013).
+func (s *Server) enrichServerTools(serverID string, tools []map[string]interface{}, discloseHash bool) []contracts.Tool {
 	typedTools := contracts.ConvertGenericToolsToTyped(tools)
 
 	type configDeniedChecker interface {
@@ -2872,6 +3671,13 @@ func (s *Server) enrichServerTools(serverID string, tools []map[string]interface
 			typedTools[i].HeldReason = record.HeldReason
 			typedTools[i].HeldVerdict = record.HeldVerdict
 			typedTools[i].HeldSignals = record.HeldSignals
+			// Hash-pin authoring surface (Spec 098 FR-011). Same guard as the
+			// preflight evaluator: operator tier only, and only when a hash is
+			// actually stored — otherwise the field stays absent instead of
+			// rendering a "sha256/v0:" placeholder.
+			if discloseHash && record.CurrentHash != "" {
+				typedTools[i].Hash = preflight.FormatPin(record.HashSchemaVersion, record.CurrentHash)
+			}
 			enrichedCount++
 		} else if i == 0 {
 			firstErr = err
@@ -2881,7 +3687,7 @@ func (s *Server) enrichServerTools(serverID string, tools []map[string]interface
 		}
 	}
 	if firstErr != nil {
-		s.logger.Debug("Tool approval enrichment partial", "server", serverID, "enriched", enrichedCount, "total", len(typedTools), "error", firstErr)
+		s.logger.Debugw("Tool approval enrichment partial", "server", serverID, "enriched", enrichedCount, "total", len(typedTools), "error", firstErr)
 	}
 	return typedTools
 }
@@ -2911,16 +3717,19 @@ func (s *Server) handleGetGlobalTools(w http.ResponseWriter, r *http.Request) {
 	// here must not fail the whole page — usage columns just stay zero.
 	usage, usageErr := s.controller.AggregateToolUsage(time.Now().Add(-globalToolsUsageWindow))
 	if usageErr != nil {
-		s.logger.Warn("Global tools: usage aggregation failed, continuing without usage", "error", usageErr)
+		s.logger.Warnw("Global tools: usage aggregation failed, continuing without usage", "error", usageErr)
 		usage = map[string]storage.ToolUsageStat{}
 	}
 
 	// Use the same management-service path as the per-server tools endpoint so
-	// behaviour is consistent: a disabled / not-connected server returns an
-	// empty tool set (NOT an error), so it contributes zero tools without
-	// being mislabelled as a failed server. Fall back to the controller path
-	// when the management service is unavailable (keeps unit tests + minimal
-	// deployments working).
+	// behaviour is consistent. A disabled / not-connected server reaches us as
+	// an empty tool set (NOT an error) because disabling disconnects it, so it
+	// contributes zero tools without being mislabelled as a failed server.
+	// Quarantine is neither of those things -- a quarantined server stays
+	// dialed for security inspection and status stays ready -- so it needs the
+	// explicit guard in the loop below (#1064). Fall back to the controller
+	// path when the management service is unavailable (keeps unit tests +
+	// minimal deployments working).
 	mgmtSvc, hasMgmt := s.controller.GetManagementService().(interface {
 		GetServerTools(ctx context.Context, name string) ([]map[string]interface{}, error)
 	})
@@ -2935,9 +3744,30 @@ func (s *Server) handleGetGlobalTools(w http.ResponseWriter, r *http.Request) {
 		Tools: make([]contracts.Tool, 0, 256),
 	}
 
+	// Hash pins are operator-tier only (Spec 098 T020).
+	tier, _ := disclosureTier(r)
+	discloseHash := tier == preflight.TierOperator
+
 	for _, srv := range allServers {
 		name, _ := srv["name"].(string)
 		if name == "" {
+			continue
+		}
+		// #1166: without this, a token scoped to one server was denied the
+		// inventory on GET /api/v1/servers and then handed a STRICTLY LARGER
+		// one here — every server_name plus every tool name, description and
+		// schema. Skipping is not a fetch failure, so it must not set
+		// Partial / FailedServers.
+		if !canSeeServer(r.Context(), name) {
+			continue
+		}
+		// #1064: a quarantined server contributes nothing here -- its tools are
+		// unreachable (SECURITY BLOCK at dispatch) and its descriptions are the
+		// TPA payload #1061 removed from the index. Skipping is not a failure,
+		// so it must not set Partial / FailedServers. Disabled servers still
+		// appear, per the GlobalToolsResponse contract; the review surface
+		// GET /api/v1/servers/{id}/tools is likewise untouched.
+		if quarantined, _ := srv["quarantined"].(bool); quarantined {
 			continue
 		}
 
@@ -2947,11 +3777,11 @@ func (s *Server) handleGetGlobalTools(w http.ResponseWriter, r *http.Request) {
 			// we could gather, flag the rest as partial.
 			resp.Partial = true
 			resp.FailedServers = append(resp.FailedServers, name)
-			s.logger.Debug("Global tools: server tools fetch failed", "server", name, "error", terr)
+			s.logger.Debugw("Global tools: server tools fetch failed", "server", name, "error", terr)
 			continue
 		}
 
-		typed := s.enrichServerTools(name, generic)
+		typed := s.enrichServerTools(name, generic, discloseHash)
 		for i := range typed {
 			if st, ok := usage[name+"\x00"+typed[i].Name]; ok {
 				typed[i].Usage = st.Count
@@ -3014,7 +3844,7 @@ func (s *Server) handleGetServerLogs(w http.ResponseWriter, r *http.Request) {
 
 	logEntries, err := s.controller.GetServerLogs(serverID, tail)
 	if err != nil {
-		s.logger.Error("Failed to get server logs", "server", serverID, "error", err)
+		s.logger.Errorw("Failed to get server logs", "server", serverID, "error", err)
 		s.writeError(w, r, http.StatusInternalServerError, fmt.Sprintf("Failed to get logs: %v", err))
 		return
 	}
@@ -3056,9 +3886,30 @@ func (s *Server) handleSearchTools(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	results, err := s.controller.SearchTools(query, limit)
+	var results []map[string]interface{}
+	var err error
+	if auth.IsScopedCaller(r.Context()) {
+		// #1166 / Spec 107 T075a: the MCP twin of this discovery surface
+		// filters through serverInScope (internal/server/mcp_visibility.go);
+		// this one used to post-filter a GLOBAL top-K, so a hidden server
+		// that outranked an entitled one displaced it — and the caller's
+		// response differed with whether the hidden server existed at all.
+		// The scoped search filters BEFORE the ranked cut, exhaustively, so
+		// the window is the top-`limit` of what the caller may see. An
+		// entitlement that admits nothing fails closed without a search.
+		ctx := r.Context()
+		if ac := auth.AuthContextFromContext(ctx); ac != nil && len(ac.AllowedServers) == 0 {
+			results = []map[string]interface{}{}
+		} else {
+			results, err = s.controller.SearchToolsScoped(query, limit, func(serverName string) bool {
+				return canSeeServer(ctx, serverName)
+			})
+		}
+	} else {
+		results, err = s.controller.SearchTools(query, limit)
+	}
 	if err != nil {
-		s.logger.Error("Failed to search tools", "query", query, "error", err)
+		s.logger.Errorw("Failed to search tools", "query", query, "error", err)
 		s.writeError(w, r, http.StatusInternalServerError, fmt.Sprintf("Search failed: %v", err))
 		return
 	}
@@ -3098,6 +3949,7 @@ func stripServerPrefix(serverName, name string) string {
 }
 
 func (s *Server) handleSSEEvents(w http.ResponseWriter, r *http.Request) {
+	refreshCallerContext := s.newSSECallerContextRefresher(r)
 	// Set SSE headers first
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -3141,26 +3993,36 @@ func (s *Server) handleSSEEvents(w http.ResponseWriter, r *http.Request) {
 		defer s.controller.UnsubscribeEvents(eventsCh)
 	}
 
-	s.logger.Debug("SSE connection established",
+	s.logger.Debugw("SSE connection established",
 		"status_channel_nil", statusCh == nil,
 		"events_channel_nil", eventsCh == nil)
 
 	// Create heartbeat ticker to keep connection alive
-	heartbeat := time.NewTicker(30 * time.Second)
+	heartbeat := time.NewTicker(sseHeartbeatInterval)
 	defer heartbeat.Stop()
 
 	// Send initial status
+	// #1166: /events sits behind the same apiKeyAuthMiddleware as /servers, so
+	// a scoped agent token can subscribe. Scoping /servers while leaving this
+	// stream unfiltered closes the front door and leaves the window open.
+	callerCtx, err := refreshCallerContext()
+	if err != nil {
+		s.logger.Warnw("Closing SSE stream after caller revalidation failed", "error", err)
+		return
+	}
+	initialLiveStats := filterUpstreamStatsServers(callerCtx, s.controller.GetUpstreamStats())
 	initialStatus := map[string]interface{}{
 		"running":        s.controller.IsRunning(),
 		"listen_addr":    s.controller.GetListenAddress(),
-		"upstream_stats": s.controller.GetUpstreamStats(),
-		"status":         s.controller.GetStatus(),
+		"upstream_stats": initialLiveStats,
+		"status":         withLiveUpstreamStats(callerCtx, s.controller.GetStatus(), initialLiveStats),
 		"timestamp":      time.Now().Unix(),
+		"started_at":     processStart.Unix(),
 	}
 
-	s.logger.Debug("Sending initial SSE status event", "data", initialStatus)
+	s.logger.Debugw("Sending initial SSE status event", "data", initialStatus)
 	if err := s.writeSSEEvent(w, flusher, canFlush, "status", initialStatus); err != nil {
-		s.logger.Error("Failed to write initial SSE event", "error", err)
+		s.logger.Errorw("Failed to write initial SSE event", "error", err)
 		return
 	}
 	s.logger.Debug("Initial SSE status event sent successfully")
@@ -3171,29 +4033,51 @@ func (s *Server) handleSSEEvents(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 		case <-heartbeat.C:
+			// FR-005: the heartbeat is a frame like any other. On an
+			// otherwise-idle connection (no status update, no runtime event)
+			// it is the ONLY frame the server sends, so it must re-resolve
+			// the caller context too — otherwise a disabled tenant's stream
+			// never closes as long as nothing else happens to trigger a
+			// refresh (cross-review round 2, chunk 3 P2). The ping payload
+			// itself carries no identity data, so nothing here needs the
+			// resolved context beyond the failure check.
+			if _, err := refreshCallerContext(); err != nil {
+				s.logger.Warnw("Closing SSE stream after caller revalidation failed", "error", err)
+				return
+			}
 			// Send heartbeat ping to keep connection alive
 			pingData := map[string]interface{}{
 				"timestamp": time.Now().Unix(),
 			}
 			if err := s.writeSSEEvent(w, flusher, canFlush, "ping", pingData); err != nil {
-				s.logger.Error("Failed to write SSE heartbeat", "error", err)
+				s.logger.Errorw("Failed to write SSE heartbeat", "error", err)
 				return
 			}
 		case status, ok := <-statusCh:
 			if !ok {
 				return
 			}
+			callerCtx, err := refreshCallerContext()
+			if err != nil {
+				s.logger.Warnw("Closing SSE stream after caller revalidation failed", "error", err)
+				return
+			}
 
+			// The channel snapshot is a point-in-time capture that never
+			// passes through GetStatus(), so without this the stream's nested
+			// stats stay stale for the life of the connection (#1084).
+			eventLiveStats := filterUpstreamStatsServers(callerCtx, s.controller.GetUpstreamStats())
 			response := map[string]interface{}{
 				"running":        s.controller.IsRunning(),
 				"listen_addr":    s.controller.GetListenAddress(),
-				"upstream_stats": s.controller.GetUpstreamStats(),
-				"status":         status,
+				"upstream_stats": eventLiveStats,
+				"status":         withLiveUpstreamStats(callerCtx, status, eventLiveStats),
 				"timestamp":      time.Now().Unix(),
+				"started_at":     processStart.Unix(),
 			}
 
 			if err := s.writeSSEEvent(w, flusher, canFlush, "status", response); err != nil {
-				s.logger.Error("Failed to write SSE event", "error", err)
+				s.logger.Errorw("Failed to write SSE event", "error", err)
 				return
 			}
 		case evt, ok := <-eventsCh:
@@ -3201,18 +4085,173 @@ func (s *Server) handleSSEEvents(w http.ResponseWriter, r *http.Request) {
 				eventsCh = nil
 				continue
 			}
+			callerCtx, err := refreshCallerContext()
+			if err != nil {
+				s.logger.Warnw("Closing SSE stream after caller revalidation failed", "error", err)
+				return
+			}
+
+			// #1166 — most event types name a server in a scalar field
+			// rather than in the servers.changed embed, so a scoped caller
+			// learned about servers it cannot see through activity, oauth and
+			// security frames. Decided per subscriber, before rendering:
+			// nothing is written back to the shared event.
+			if !eventVisibleToCaller(callerCtx, evt) {
+				continue
+			}
 
 			eventPayload := map[string]interface{}{
-				"payload":   evt.Payload,
+				"payload":   s.maskEventPayload(s.renderEventPayloadForCaller(callerCtx, evt)),
 				"timestamp": evt.Timestamp.Unix(),
 			}
 
 			if err := s.writeSSEEvent(w, flusher, canFlush, string(evt.Type), eventPayload); err != nil {
-				s.logger.Error("Failed to write runtime SSE event", "error", err)
+				s.logger.Errorw("Failed to write runtime SSE event", "error", err)
 				return
 			}
 		}
 	}
+}
+
+// renderEventPayloadForCaller renders a runtime event for ONE SSE subscriber.
+//
+// The rule this function exists to obey: the payload map, and the
+// []contracts.Server inside it, are built ONCE in
+// runtime.buildServersChangedPayload and fanned out BY POINTER to every
+// subscriber (internal/runtime/event_bus.go publishEvent). Other SSE
+// goroutines - the admin Web UI, the Swift tray - are concurrently inside
+// json.Marshal on that same map. So a per-connection view is RENDERED into a
+// fresh map and a fresh slice; nothing here ever writes into evt.Payload.
+// Editing it in place would (a) empty the admin's server list, because the Web
+// UI's mergeServers treats each payload as authoritative and deletes absent
+// fields, and (b) be an unsynchronised concurrent map write, which Go turns
+// into a fatal error that takes the whole core down for every client.
+//
+// Three narrowings, all only for servers.changed — every OTHER event type that
+// names a server is dropped for a scoped caller before it reaches this
+// function, by eventVisibleToCaller (sse_scope.go), which also explains why
+// this one type is rendered instead of dropped:
+//
+//   - #1166 - the coalescer extras that NAME a server ("server": "beta") are
+//     removed when the caller may not enumerate it. That extra survived the
+//     original embed filter, and on the notify-only path it was the entire
+//     payload.
+//   - #1166 - a scoped caller gets only the servers it may enumerate, with
+//     `stats` recomputed so total_servers is not a count oracle for the rest.
+//   - #1167 - a caller who MAY see raw values gets the embed dropped entirely
+//     (notify-only). The bus masks this payload unconditionally now, because a
+//     payload produced once for a mixed-privilege audience has no caller to
+//     gate against and must be masked for the least-privileged member of that
+//     audience. Handing an admin the masked embed while GET /api/v1/servers
+//     hands them the real one would make the UI's authoritative merge flicker
+//     between the two, so the embed is degraded to the notify-only shape
+//     buildServersChangedPayload already documents as its fallback, and the
+//     client re-fetches through the gated REST door. Costs one extra GET per
+//     coalescing window, and only when reveal_secret_headers is on.
+func (s *Server) renderEventPayloadForCaller(ctx context.Context, evt internalRuntime.Event) map[string]interface{} {
+	payload := evt.Payload
+	if evt.Type != internalRuntime.EventTypeServersChanged || len(payload) == 0 {
+		return payload
+	}
+
+	if s.revealSecrets(ctx) {
+		out := make(map[string]interface{}, len(payload))
+		for k, v := range payload {
+			if k == "servers" || k == "stats" {
+				continue
+			}
+			out[k] = v
+		}
+		return out
+	}
+
+	if !auth.IsScopedCaller(ctx) {
+		return payload
+	}
+
+	// The coalescer's extras name the server whose change won the window
+	// ("server": "beta"), so narrowing the embed alone left the name on the
+	// wire beside it — and on the notify-only path (ListServers failed
+	// upstream, so there is no embed) that extra was the WHOLE payload. The
+	// copy is unconditional now for that reason: there is always something to
+	// scope, embed or not.
+	out := make(map[string]interface{}, len(payload))
+	for k, v := range payload {
+		if isOutOfScopeIdentityField(ctx, k, v) {
+			continue
+		}
+		out[k] = v
+	}
+
+	servers, ok := payload["servers"].([]contracts.Server)
+	if !ok {
+		// Notify-only payload (ListServers failed upstream) - no embed to
+		// narrow, but the extras above still were.
+		return out
+	}
+	scoped := visibleServers(ctx, servers)
+	out["servers"] = scoped
+	if stats, ok := payload["stats"].(*contracts.ServerStats); ok && stats != nil {
+		recomputed := recomputeServerStats(ctx, scoped, *stats)
+		out["stats"] = &recomputed
+	}
+	return out
+}
+
+// eventPayloadTextFields are the runtime-event payload keys whose PRESENCE
+// marks an event as carrying a tool call's own text. They are the trigger for
+// masking, not its scope: once an event qualifies, every string in it is
+// masked, because the payload shape keeps growing (`detection_text` is the raw
+// pre-encoding response, `intent` is agent-authored prose, `response` is
+// `any` on the internal-call and prompt paths) and a key-name allowlist would
+// leak each new field until someone remembered to add it.
+var eventPayloadTextFields = []string{"arguments", "response", "error", "error_message", "detection_text", "intent", "result"}
+
+// maskEventPayload sanitises a runtime event before it is streamed to an SSE
+// subscriber.
+//
+// Activity events carry the call's arguments and response verbatim, and they
+// are emitted at completion time — BEFORE the asynchronous detector has a
+// verdict — so the flag-gated masking the activity API uses has nothing to key
+// on here. Masking runs unconditionally instead: the alternative is that every
+// SSE consumer (Web UI, tray, `mcpproxy activity watch`) receives the same
+// credential the activity drawer was fixed for (audit F13).
+//
+// Nothing is dropped: an identifier the UI renders (server, tool, status,
+// duration) is not a secret and survives the sweep unchanged, and an event with
+// none of the trigger fields is returned exactly as it came in — so a status or
+// config event costs one map lookup.
+//
+// The input map belongs to the event bus and is shared with every other
+// subscriber, so it is never edited in place.
+func (s *Server) maskEventPayload(payload map[string]interface{}) map[string]interface{} {
+	if s.sensitiveMasker == nil || len(payload) == 0 {
+		return payload
+	}
+
+	relevant := false
+	for _, field := range eventPayloadTextFields {
+		if _, ok := payload[field]; ok {
+			relevant = true
+			break
+		}
+	}
+	if !relevant {
+		return payload
+	}
+
+	// Strip MCPProxy's own injected identity before the sweep; masking would
+	// leave `_auth_user_email` readable (it is not secret-shaped) and it does
+	// not belong in a payload view either.
+	stripped := make(map[string]interface{}, len(payload))
+	for key, value := range payload {
+		stripped[key] = value
+	}
+	if args, ok := stripped["arguments"].(map[string]interface{}); ok {
+		stripped["arguments"] = security.StripInternalArgs(args)
+	}
+
+	return s.sensitiveMasker.MaskArguments(stripped)
 }
 
 func (s *Server) writeSSEEvent(w http.ResponseWriter, flusher http.Flusher, canFlush bool, event string, data interface{}) error {
@@ -3238,6 +4277,16 @@ func (s *Server) writeSSEEvent(w http.ResponseWriter, flusher http.Flusher, canF
 // Secrets management handlers
 
 func (s *Server) handleGetSecretRefs(w http.ResponseWriter, r *http.Request) {
+	// #1166 round 10 (P5): DENIED to a non-admin caller. Values are masked, so
+	// this enumerates rather than discloses — but it enumerates every keyring
+	// and env secret reference in the whole configuration, including the ones
+	// belonging to servers the caller may not know exist, and the reference
+	// text names them. It is a strictly narrower view of the document
+	// GET /api/v1/config already answers 403 for.
+	if !s.requireAdminRead(w, r, secretsInventoryDenialMessage) {
+		return
+	}
+
 	resolver := s.controller.GetSecretResolver()
 	if resolver == nil {
 		s.writeError(w, r, http.StatusInternalServerError, "Secret resolver not available")
@@ -3250,7 +4299,7 @@ func (s *Server) handleGetSecretRefs(w http.ResponseWriter, r *http.Request) {
 	// Get all secret references from available providers
 	refs, err := resolver.ListAll(ctx)
 	if err != nil {
-		s.logger.Error("Failed to list secret references", "error", err)
+		s.logger.Errorw("Failed to list secret references", "error", err)
 		s.writeError(w, r, http.StatusInternalServerError, "Failed to list secret references")
 		return
 	}
@@ -3310,6 +4359,12 @@ func (s *Server) handleMigrateSecrets(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetConfigSecrets(w http.ResponseWriter, r *http.Request) {
+	// Same document as /secrets/refs, projected through the config instead of
+	// the providers, and denied for the same reason (P5).
+	if !s.requireAdminRead(w, r, secretsInventoryDenialMessage) {
+		return
+	}
+
 	resolver := s.controller.GetSecretResolver()
 	if resolver == nil {
 		s.writeError(w, r, http.StatusInternalServerError, "Secret resolver not available")
@@ -3329,7 +4384,7 @@ func (s *Server) handleGetConfigSecrets(w http.ResponseWriter, r *http.Request) 
 	// Extract config-referenced secrets and environment variables
 	configSecrets, err := resolver.ExtractConfigSecrets(ctx, cfg)
 	if err != nil {
-		s.logger.Error("Failed to extract config secrets", "error", err)
+		s.logger.Errorw("Failed to extract config secrets", "error", err)
 		s.writeError(w, r, http.StatusInternalServerError, "Failed to extract config secrets")
 		return
 	}
@@ -3405,7 +4460,7 @@ func (s *Server) handleSetSecret(w http.ResponseWriter, r *http.Request) {
 
 	err := resolver.Store(ctx, ref, request.Value)
 	if err != nil {
-		s.logger.Error("Failed to store secret", "name", request.Name, "error", err)
+		s.logger.Errorw("Failed to store secret", "name", request.Name, "error", err)
 		s.writeError(w, r, http.StatusInternalServerError, fmt.Sprintf("Failed to store secret: %v", err))
 		return
 	}
@@ -3413,7 +4468,7 @@ func (s *Server) handleSetSecret(w http.ResponseWriter, r *http.Request) {
 	// Notify runtime that secrets changed (this will restart affected servers)
 	if runtime := s.controller; runtime != nil {
 		if err := runtime.NotifySecretsChanged(ctx, "store", request.Name); err != nil {
-			s.logger.Warn("Failed to notify runtime of secret change",
+			s.logger.Warnw("Failed to notify runtime of secret change",
 				"name", request.Name,
 				"error", err)
 		}
@@ -3482,7 +4537,7 @@ func (s *Server) handleDeleteSecret(w http.ResponseWriter, r *http.Request) {
 
 	err := resolver.Delete(ctx, ref)
 	if err != nil {
-		s.logger.Error("Failed to delete secret", "name", name, "error", err)
+		s.logger.Errorw("Failed to delete secret", "name", name, "error", err)
 		s.writeError(w, r, http.StatusInternalServerError, fmt.Sprintf("Failed to delete secret: %v", err))
 		return
 	}
@@ -3490,7 +4545,7 @@ func (s *Server) handleDeleteSecret(w http.ResponseWriter, r *http.Request) {
 	// Notify runtime that secrets changed (this will restart affected servers)
 	if runtime := s.controller; runtime != nil {
 		if err := runtime.NotifySecretsChanged(ctx, "delete", name); err != nil {
-			s.logger.Warn("Failed to notify runtime of secret deletion",
+			s.logger.Warnw("Failed to notify runtime of secret deletion",
 				"name", name,
 				"error", err)
 		}
@@ -3529,7 +4584,7 @@ func (s *Server) handleGetDiagnostics(w http.ResponseWriter, r *http.Request) {
 		}).Doctor(r.Context())
 
 		if err != nil {
-			s.logger.Error("Failed to get diagnostics via management service", "error", err)
+			s.logger.Errorw("Failed to get diagnostics via management service", "error", err)
 			s.writeError(w, r, http.StatusInternalServerError, "Failed to get diagnostics")
 			return
 		}
@@ -3544,7 +4599,7 @@ func (s *Server) handleGetDiagnostics(w http.ResponseWriter, r *http.Request) {
 	// Fallback to legacy path if management service not available
 	genericServers, err := s.controller.GetAllServers()
 	if err != nil {
-		s.logger.Error("Failed to get servers for diagnostics", "error", err)
+		s.logger.Errorw("Failed to get servers for diagnostics", "error", err)
 		s.writeError(w, r, http.StatusInternalServerError, "Failed to get servers")
 		return
 	}
@@ -3552,13 +4607,16 @@ func (s *Server) handleGetDiagnostics(w http.ResponseWriter, r *http.Request) {
 	// Convert to typed servers
 	servers := contracts.ConvertGenericServersToTyped(genericServers)
 
+	// #1166: scope the inventory before anything is derived from it, so the
+	// per-server error/oauth/secret detail below cannot describe a server the
+	// caller may not know exists.
+	servers = visibleServers(r.Context(), servers)
+
 	// Issue #872: last_error can echo the full upstream URL, including query
 	// credentials. Scrub it before surfacing on the doctor route unless the
-	// operator opted out via reveal_secret_headers.
-	reveal := false
-	if cfg, cfgErr := s.controller.GetConfig(); cfgErr == nil && cfg != nil {
-		reveal = cfg.RevealSecretHeaders
-	}
+	// operator opted out via reveal_secret_headers AND the caller is an
+	// authenticated admin (#1167 — this read the flag alone with `r` in scope).
+	reveal := s.revealSecrets(r.Context())
 
 	// Collect diagnostics (legacy format)
 	var upstreamErrors []contracts.DiagnosticIssue
@@ -3573,7 +4631,8 @@ func (s *Server) handleGetDiagnostics(w http.ResponseWriter, r *http.Request) {
 		if server.LastError != "" {
 			errMsg := server.LastError
 			if !reveal {
-				errMsg = oauth.RedactSensitiveData(errMsg)
+				// Round 8 finding 2: the ONE shared free-text rule.
+				errMsg = oauth.ScrubUpstreamText(errMsg)
 			}
 			upstreamErrors = append(upstreamErrors, contracts.DiagnosticIssue{
 				Type:      "error",
@@ -3621,11 +4680,21 @@ func (s *Server) handleGetDiagnostics(w http.ResponseWriter, r *http.Request) {
 // @Security ApiKeyAuth
 // @Security ApiKeyQuery
 // @Success 200 {object} contracts.SuccessResponse "Telemetry heartbeat payload"
+// @Failure 403 {object} contracts.ErrorResponse "Agent tokens cannot read the deployment telemetry payload"
 // @Failure 503 {object} contracts.ErrorResponse "Telemetry service unavailable"
 // @Router /api/v1/telemetry/payload [get]
 func (s *Server) handleGetTelemetryPayload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		s.writeError(w, r, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	// #1166 round 10 (P4): DENIED to a non-admin caller. The heartbeat is a
+	// fleet-wide census — server_count, connected_server_count, tool_count,
+	// server_docker_isolated_count — computed over the whole inventory with no
+	// per-server breakdown to project. It is the exact count oracle this branch
+	// removed from GET /api/v1/status, reachable through a preview route.
+	if !s.requireAdminRead(w, r, telemetryPayloadDenialMessage) {
 		return
 	}
 
@@ -3652,6 +4721,7 @@ func (s *Server) handleGetTelemetryPayload(w http.ResponseWriter, r *http.Reques
 // @Security ApiKeyAuth
 // @Security ApiKeyQuery
 // @Success 200 {object} contracts.SuccessResponse "Token statistics"
+// @Failure 403 {object} contracts.ErrorResponse "Agent tokens cannot read deployment-wide token statistics"
 // @Failure 500 {object} contracts.ErrorResponse "Internal server error"
 // @Router /api/v1/stats/tokens [get]
 func (s *Server) handleGetTokenStats(w http.ResponseWriter, r *http.Request) {
@@ -3660,9 +4730,26 @@ func (s *Server) handleGetTokenStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// #1166 follow-up (G3): DENIED to a non-admin caller, not filtered.
+	//
+	// contracts.ServerTokenMetrics.PerServerToolListSizes is a map keyed by
+	// EVERY configured server name — a complete inventory enumeration, which is
+	// the exact thing GET /api/v1/servers now withholds. Projecting the map
+	// through canSeeServer would not be enough: the scalars beside it
+	// (SavedTokens, SavedTokensPercentage, the baseline sizes) are computed over
+	// the whole fleet and cannot be re-derived per server, so a scoped caller
+	// would still hold a cross-tenant oracle in numbers that merely LOOKED
+	// filtered. recomputeServerStats already takes the same position on the same
+	// struct — it DROPS TokenMetrics from GET /api/v1/servers rather than report
+	// it wrongly — and this route is nothing but that struct, so the consistent
+	// answer for the whole document is the one /api/v1/config gets: 403.
+	if !s.requireAdminRead(w, r, "Agent tokens cannot read deployment-wide token statistics") {
+		return
+	}
+
 	tokenStats, err := s.controller.GetTokenSavings()
 	if err != nil {
-		s.logger.Error("Failed to calculate token savings", "error", err)
+		s.logger.Errorw("Failed to calculate token savings", "error", err)
 		s.writeError(w, r, http.StatusInternalServerError, fmt.Sprintf("Failed to calculate token savings: %v", err))
 		return
 	}
@@ -3792,21 +4879,32 @@ func (s *Server) handleGetToolCalls(w http.ResponseWriter, r *http.Request) {
 	var total int
 	var err error
 
+	// #1166 follow-up (G2): the caller's entitlement goes DOWN into the read,
+	// not over its result. These records carry the arguments and responses of
+	// every tool call on every server; a scoped token had no gate here at all.
+	// Filtering the returned page instead would leave `total` counting the
+	// records the page no longer contains — a broken pager, and a count oracle
+	// for exactly what was hidden.
+	var scope storage.ToolCallScope
+	if allowed, scoped := scopeAllowedServers(r.Context()); scoped {
+		scope = allowed
+	}
+
 	// Get tool calls - either filtered by session or all
 	if sessionID != "" {
-		toolCalls, total, err = s.controller.GetToolCallsBySession(sessionID, limit, offset)
+		toolCalls, total, err = s.controller.GetToolCallsBySession(sessionID, limit, offset, scope)
 	} else {
-		toolCalls, total, err = s.controller.GetToolCalls(limit, offset)
+		toolCalls, total, err = s.controller.GetToolCalls(limit, offset, scope)
 	}
 
 	if err != nil {
-		s.logger.Error("Failed to get tool calls", "error", err, "session_id", sessionID)
+		s.logger.Errorw("Failed to get tool calls", "error", err, "session_id", sessionID)
 		s.writeError(w, r, http.StatusInternalServerError, "Failed to get tool calls")
 		return
 	}
 
 	response := contracts.GetToolCallsResponse{
-		ToolCalls: convertToolCallPointers(toolCalls),
+		ToolCalls: s.convertToolCallPointers(toolCalls),
 		Total:     total,
 		Limit:     limit,
 		Offset:    offset,
@@ -3844,13 +4942,25 @@ func (s *Server) handleGetToolCallDetail(w http.ResponseWriter, r *http.Request)
 	// Get tool call by ID
 	toolCall, err := s.controller.GetToolCallByID(id)
 	if err != nil {
-		s.logger.Error("Failed to get tool call detail", "id", id, "error", err)
+		s.logger.Errorw("Failed to get tool call detail", "id", id, "error", err)
 		s.writeError(w, r, http.StatusNotFound, "Tool call not found")
 		return
 	}
 
+	// #1166 follow-up (G2): a record on a server the caller may not see takes
+	// the SAME exit as an id that does not exist — same status, same message.
+	// The oracle for this is status parity with an unknown id, not "the body
+	// omits the server name": this 404 body echoes nothing of the request.
+	if toolCall == nil || !canSeeServer(r.Context(), toolCall.ServerName) {
+		s.writeError(w, r, http.StatusNotFound, "Tool call not found")
+		return
+	}
+
+	detail := *toolCall
+	s.maskToolCallRecord(&detail)
+
 	response := contracts.GetToolCallDetailResponse{
-		ToolCall: *toolCall,
+		ToolCall: detail,
 	}
 
 	s.writeSuccess(w, response)
@@ -3895,14 +5005,14 @@ func (s *Server) handleGetServerToolCalls(w http.ResponseWriter, r *http.Request
 	// Get server tool calls
 	toolCalls, err := s.controller.GetServerToolCalls(serverID, limit)
 	if err != nil {
-		s.logger.Error("Failed to get server tool calls", "server", serverID, "error", err)
+		s.logger.Errorw("Failed to get server tool calls", "server", serverID, "error", err)
 		s.writeError(w, r, http.StatusInternalServerError, "Failed to get server tool calls")
 		return
 	}
 
 	response := contracts.GetServerToolCallsResponse{
 		ServerName: serverID,
-		ToolCalls:  convertToolCallPointers(toolCalls),
+		ToolCalls:  s.convertToolCallPointers(toolCalls),
 		Total:      len(toolCalls),
 	}
 
@@ -3910,14 +5020,43 @@ func (s *Server) handleGetServerToolCalls(w http.ResponseWriter, r *http.Request
 }
 
 // Helper to convert []*contracts.ToolCallRecord to []contracts.ToolCallRecord
-func convertToolCallPointers(pointers []*contracts.ToolCallRecord) []contracts.ToolCallRecord {
+func (s *Server) convertToolCallPointers(pointers []*contracts.ToolCallRecord) []contracts.ToolCallRecord {
 	records := make([]contracts.ToolCallRecord, 0, len(pointers))
 	for _, ptr := range pointers {
 		if ptr != nil {
-			records = append(records, *ptr)
+			record := *ptr
+			s.maskToolCallRecord(&record)
+			records = append(records, record)
 		}
 	}
 	return records
+}
+
+// maskToolCallRecord masks a tool-call record's payloads before serialisation.
+//
+// These records live in their own store, separate from the activity log, and
+// carry no detection verdict — so unlike the activity API this cannot be gated
+// on `has_sensitive_data` and masks unconditionally. Without it,
+// /api/v1/tool-calls serves in cleartext exactly what the activity drawer was
+// fixed for (audit F13).
+func (s *Server) maskToolCallRecord(record *contracts.ToolCallRecord) {
+	if record == nil {
+		return
+	}
+
+	record.Arguments = security.StripInternalArgs(record.Arguments)
+	if s.sensitiveMasker == nil {
+		return
+	}
+
+	record.Arguments = s.sensitiveMasker.MaskArguments(record.Arguments)
+	if record.Response != nil {
+		record.Response = s.sensitiveMasker.MaskJSON(record.Response)
+	}
+	if record.Error != "" {
+		masked, _ := s.sensitiveMasker.MaskText(record.Error)
+		record.Error = masked
+	}
 }
 
 // handleReplayToolCall godoc
@@ -3932,6 +5071,7 @@ func convertToolCallPointers(pointers []*contracts.ToolCallRecord) []contracts.T
 // @Failure      400      {object}  contracts.ErrorResponse             "Tool call ID required or invalid JSON payload"
 // @Failure      401      {object}  contracts.ErrorResponse             "Unauthorized - missing or invalid API key"
 // @Failure      405      {object}  contracts.ErrorResponse             "Method not allowed"
+// @Failure      429      {object}  contracts.ErrorResponse             "Shed by a concurrency limit (Retry-After header carries the wait hint)"
 // @Failure      500      {object}  contracts.ErrorResponse             "Failed to replay tool call"
 // @Security     ApiKeyAuth
 // @Security     ApiKeyQuery
@@ -3955,18 +5095,53 @@ func (s *Server) handleReplayToolCall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Replay the tool call with modified arguments
-	newToolCall, err := s.controller.ReplayToolCall(id, request.Arguments)
+	// #1166 follow-up (G2): replay dispatches a real call to the recorded
+	// server, so it must answer the same entitlement question the read door
+	// does — and with the same 404, so it cannot be used to probe for ids the
+	// caller may not read. Same shape as the /servers/{id} subtree gate: an
+	// out-of-scope record and an unknown id are one response.
+	if auth.IsScopedCaller(r.Context()) {
+		recorded, lookupErr := s.controller.GetToolCallByID(id)
+		if lookupErr != nil || recorded == nil || !canSeeServer(r.Context(), recorded.ServerName) {
+			s.writeError(w, r, http.StatusNotFound, "Tool call not found")
+			return
+		}
+	}
+
+	// Replay the tool call with modified arguments. The request context travels
+	// with it so a client that disconnects while the replay waits for a
+	// concurrency slot releases that slot immediately (spec 093 FR-005).
+	newToolCall, err := s.controller.ReplayToolCall(r.Context(), id, request.Arguments)
 	if err != nil {
-		s.logger.Error("Failed to replay tool call", "id", id, "error", err)
+		// Spec 093 FR-011: a replay shed by a concurrency limit is backpressure,
+		// answered like any other shed tool call — 429 + Retry-After, not a 500
+		// and certainly not the 200 success:true it used to produce when the
+		// rejection was flattened into the record's error field.
+		var limitErr *limiter.LimitError
+		if errors.As(err, &limitErr) &&
+			(limitErr.Reason == limiter.ReasonQueueFull || limitErr.Reason == limiter.ReasonQueueTimeout) {
+			w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds(limitErr.RetryAfter)))
+			s.logger.Warnw("Tool call replay shed by concurrency limiter",
+				"id", id,
+				"scope", string(limitErr.Scope),
+				"reason", string(limitErr.Reason))
+			s.writeError(w, r, http.StatusTooManyRequests, limitErr.UserMessage())
+			return
+		}
+		s.logger.Errorw("Failed to replay tool call", "id", id, "error", err)
 		s.writeError(w, r, http.StatusInternalServerError, fmt.Sprintf("Failed to replay tool call: %v", err))
 		return
 	}
 
+	// A replay's record is a tool call like any other — same masking as the
+	// endpoints that list it.
+	replayed := *newToolCall
+	s.maskToolCallRecord(&replayed)
+
 	response := contracts.ReplayToolCallResponse{
 		Success:      true,
 		NewCallID:    newToolCall.ID,
-		NewToolCall:  *newToolCall,
+		NewToolCall:  replayed,
 		ReplayedFrom: id,
 	}
 
@@ -3982,6 +5157,7 @@ func (s *Server) handleReplayToolCall(w http.ResponseWriter, r *http.Request) {
 // @Produce      json
 // @Success      200  {object}  contracts.GetConfigResponse  "Configuration retrieved successfully"
 // @Failure      401  {object}  contracts.ErrorResponse      "Unauthorized - missing or invalid API key"
+// @Failure      403  {object}  contracts.ErrorResponse      "Agent tokens cannot read the configuration document"
 // @Failure      500  {object}  contracts.ErrorResponse      "Failed to get configuration"
 // @Security     ApiKeyAuth
 // @Security     ApiKeyQuery
@@ -3992,9 +5168,38 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cfg, err := s.controller.GetConfig()
+	// Issues #1166 and #1167. This route was registered as a bare
+	// r.Get("/config", …) beside POST/PATCH twins that DO carry
+	// auth.ServerOpConfigWrite, so a scoped read-only agent token GET the
+	// whole document: every server name (the #1166 enumeration), and — with
+	// reveal_secret_headers on — every env value, header, oauth.client_secret,
+	// URL credential AND the global admin api_key. That last one is a
+	// privilege-escalation primitive: the scoped token reads the key that
+	// grants full admin on every route it is denied.
+	//
+	// This is an admin document, not a server list, so it is DENIED rather
+	// than filtered. Filtering it leaf by leaf is an open-ended allowlist
+	// problem (profiles[].servers enumerates names a second time, api_key,
+	// listen, docker_isolation.extra_args, registries, telemetry endpoints…)
+	// and it is a GET-then-POST-back document whose write twin binds
+	// mcpServers BY NAME — serving a truncated document that looks complete is
+	// the #1142 corruption shape. A denial has no allowlist to keep in sync.
+	// Agents that need server metadata have GET /api/v1/servers, which returns
+	// their scoped subset with richer runtime state than this document holds.
+	if !s.requireAdminRead(w, r, "Agent tokens cannot read the configuration document") {
+		return
+	}
+
+	// The DESIRED config — what the file holds and what the next start will
+	// use. This endpoint backs the raw-JSON editor and every client that
+	// round-trips the config through PUT/POST, so serving the running one would
+	// hand back a document missing whatever is waiting for a restart, which the
+	// client then saves. A restart-gated field that differs from the running
+	// value is reported by /api/v1/routing (pending_routing_mode) and badged in
+	// Settings, not hidden here.
+	cfg, err := s.desiredConfigForPatch()
 	if err != nil {
-		s.logger.Error("Failed to get configuration", "error", err)
+		s.logger.Errorw("Failed to get configuration", "error", err)
 		s.writeError(w, r, http.StatusInternalServerError, "Failed to get configuration")
 		return
 	}
@@ -4004,9 +5209,39 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Issue #1148, round 9: this endpoint used to serve the RAW config.Config —
+	// every server's env, headers, oauth.client_secret and url credentials, the
+	// global docker_isolation.extra_args and the api_key — while every sibling
+	// door masked the same leaves. It was the widest door on the tree and it
+	// had no row in the decision table at all.
+	//
+	// The shared LIVE walk answers here too. Its write twin is
+	// oauth.UnmaskLiveConfigTree, called by handleApplyConfig and
+	// handlePatchConfig below: the raw-JSON editor and the onboarding wizard
+	// GET this document and POST it straight back, so masking the read without
+	// the matching bind-or-refuse would persist the mask over the credential —
+	// the #1142 corruption. The two are one change.
+	//
+	// `reveal_secret_headers` opts out exactly as it does on GET
+	// /api/v1/servers; the flag is read off the RUNNING config, not the desired
+	// one, so a client cannot widen its own read by staging the flag and
+	// re-reading before the restart, and (#1167) it is ANDed with the caller's
+	// identity so only an authenticated admin can exercise the opt-out.
+	published := cfg
+	if !s.revealSecrets(r.Context()) {
+		published = oauth.RedactedConfig(cfg)
+		if published == nil {
+			// Fail CLOSED. Serving the unmasked config because the walk could
+			// not round-trip is the fail-open shape this issue is made of.
+			s.logger.Errorw("Failed to redact configuration for publication")
+			s.writeError(w, r, http.StatusInternalServerError, "Failed to get configuration")
+			return
+		}
+	}
+
 	// Convert config to contracts type for consistent API response
 	response := contracts.GetConfigResponse{
-		Config:     contracts.ConvertConfigToContract(cfg),
+		Config:     contracts.ConvertConfigToContract(published),
 		ConfigPath: s.controller.GetConfigPath(),
 	}
 
@@ -4042,7 +5277,7 @@ func (s *Server) handleValidateConfig(w http.ResponseWriter, r *http.Request) {
 	// Perform validation
 	validationErrors, err := s.controller.ValidateConfig(&cfg)
 	if err != nil {
-		s.logger.Error("Failed to validate configuration", "error", err)
+		s.logger.Errorw("Failed to validate configuration", "error", err)
 		s.writeError(w, r, http.StatusInternalServerError, fmt.Sprintf("Validation failed: %v", err))
 		return
 	}
@@ -4076,11 +5311,42 @@ func (s *Server) handleApplyConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var cfg config.Config
-	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+	// Decoded as a generic document first, so the masks a client echoed back
+	// from GET /api/v1/config can be resolved BEFORE anything is typed or
+	// persisted (issue #1148, round 9). UseNumber keeps integers exact through
+	// the round trip instead of degrading them to float64.
+	decoder := json.NewDecoder(r.Body)
+	decoder.UseNumber()
+	var document map[string]interface{}
+	if err := decoder.Decode(&document); err != nil {
 		s.writeError(w, r, http.StatusBadRequest, "Invalid JSON payload")
 		return
 	}
+
+	// Spec 107 FR-039: the removed server-edition keys / auth_broker modes
+	// are refused on the raw document, before it is typed (see
+	// handlePatchConfig). No-op in the personal build.
+	if s.refuseRemovedConfigKeys(w, r, document, "Invalid configuration") {
+		return
+	}
+
+	stored, err := s.desiredConfigForPatch()
+	if err != nil {
+		s.logger.Errorw("Failed to read configuration for apply", "error", err)
+		s.writeError(w, r, http.StatusInternalServerError, "Failed to read configuration")
+		return
+	}
+
+	// Revert what binds to a key, refuse what does not. Without this the
+	// raw-JSON editor's own GET → edit → POST round trip would write the read
+	// door's masks over the operator's credentials.
+	resolved, err := oauth.UnmaskLiveConfigDocument(document, stored)
+	if err != nil {
+		s.logger.Warnw("Refused a configuration write carrying an unbindable mask", "error", err)
+		s.writeError(w, r, http.StatusBadRequest, err.Error())
+		return
+	}
+	cfg := *resolved
 
 	// Get config path from controller
 	cfgPath := s.controller.GetConfigPath()
@@ -4088,8 +5354,7 @@ func (s *Server) handleApplyConfig(w http.ResponseWriter, r *http.Request) {
 	// Apply configuration
 	result, err := s.controller.ApplyConfig(&cfg, cfgPath)
 	if err != nil {
-		s.logger.Error("Failed to apply configuration", "error", err)
-		s.writeError(w, r, http.StatusInternalServerError, fmt.Sprintf("Failed to apply configuration: %v", err))
+		s.writeApplyConfigError(w, r, "Failed to apply configuration", result, err)
 		return
 	}
 
@@ -4138,9 +5403,11 @@ func (s *Server) handlePatchDockerIsolation(w http.ResponseWriter, r *http.Reque
 	// the existing apply pipeline so we benefit from validation, change
 	// detection, disk persistence, and hot-reload without duplicating any of
 	// that logic here.
-	cfg, err := s.controller.GetConfig()
+	// Desired, not running: same reason as handlePatchConfig — a read-modify-
+	// write of the running config discards any restart-pending field.
+	cfg, err := s.desiredConfigForPatch()
 	if err != nil {
-		s.logger.Error("Failed to get configuration for docker-isolation patch", "error", err)
+		s.logger.Errorw("Failed to get configuration for docker-isolation patch", "error", err)
 		s.writeError(w, r, http.StatusInternalServerError, "Failed to read configuration")
 		return
 	}
@@ -4157,8 +5424,7 @@ func (s *Server) handlePatchDockerIsolation(w http.ResponseWriter, r *http.Reque
 	cfgPath := s.controller.GetConfigPath()
 	result, err := s.controller.ApplyConfig(cfg, cfgPath)
 	if err != nil {
-		s.logger.Error("Failed to apply docker-isolation toggle", "error", err)
-		s.writeError(w, r, http.StatusInternalServerError, fmt.Sprintf("Failed to apply configuration: %v", err))
+		s.writeApplyConfigError(w, r, "Failed to apply docker-isolation toggle", result, err)
 		return
 	}
 
@@ -4189,22 +5455,39 @@ func (s *Server) handlePatchDockerIsolation(w http.ResponseWriter, r *http.Reque
 // @Failure      403 {object} contracts.ErrorResponse "Forbidden (agent tokens cannot mutate configuration)"
 // @Router       /api/v1/config [patch]
 func (s *Server) handlePatchConfig(w http.ResponseWriter, r *http.Request) {
+	// UseNumber: every number rides through the merge as its decimal text, so
+	// the personal build's opaque server_edition / auth_broker carriers (Spec
+	// 107 FR-040) and any large integer survive the round trip exactly.
+	patchDecoder := json.NewDecoder(r.Body)
+	patchDecoder.UseNumber()
 	var patchMap map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&patchMap); err != nil {
+	if err := patchDecoder.Decode(&patchMap); err != nil {
 		s.writeError(w, r, http.StatusBadRequest, "Invalid JSON payload")
 		return
 	}
+	// One PATCH at a time: the read-merge-apply below is not atomic, and a
+	// concurrent PATCH merging from the same snapshot would be silently
+	// clobbered by whichever full-config apply lands second.
+	s.patchConfigMu.Lock()
+	defer s.patchConfigMu.Unlock()
 	if len(patchMap) == 0 {
 		s.writeError(w, r, http.StatusBadRequest, "Patch body must contain at least one field")
 		return
 	}
 
-	// Read the REAL in-memory config (secrets intact — redaction only happens
-	// on the GET response path). We deep-merge only the client-sent keys so
-	// untouched fields, including masked secrets, are preserved verbatim.
-	cfg, err := s.controller.GetConfig()
+	// Read the REAL config (secrets intact — redaction only happens on the GET
+	// response path). We deep-merge only the client-sent keys so untouched
+	// fields, including masked secrets, are preserved verbatim.
+	//
+	// The merge base is the DESIRED config — what is on disk — not the running
+	// one. They differ only while a restart-gated field (routing_mode, listen,
+	// api_key, …) has been saved but not yet adopted, and merging onto the
+	// running config there silently reverted it: an operator who switched to
+	// Direct and then changed any other setting lost the routing switch with no
+	// warning, on disk, with a success toast.
+	cfg, err := s.desiredConfigForPatch()
 	if err != nil {
-		s.logger.Error("Failed to get configuration for patch", "error", err)
+		s.logger.Errorw("Failed to get configuration for patch", "error", err)
 		s.writeError(w, r, http.StatusInternalServerError, "Failed to read configuration")
 		return
 	}
@@ -4217,22 +5500,49 @@ func (s *Server) handlePatchConfig(w http.ResponseWriter, r *http.Request) {
 	// deep-merge the patch onto without enumerating every field.
 	baseBytes, err := json.Marshal(cfg)
 	if err != nil {
-		s.logger.Error("Failed to marshal live configuration", "error", err)
+		s.logger.Errorw("Failed to marshal live configuration", "error", err)
 		s.writeError(w, r, http.StatusInternalServerError, "Failed to read configuration")
 		return
 	}
+	baseDecoder := json.NewDecoder(bytes.NewReader(baseBytes))
+	baseDecoder.UseNumber()
 	var baseMap map[string]interface{}
-	if err := json.Unmarshal(baseBytes, &baseMap); err != nil {
-		s.logger.Error("Failed to unmarshal live configuration", "error", err)
+	if err := baseDecoder.Decode(&baseMap); err != nil {
+		s.logger.Errorw("Failed to unmarshal live configuration", "error", err)
 		s.writeError(w, r, http.StatusInternalServerError, "Failed to read configuration")
 		return
+	}
+
+	// Issue #1148, round 9: resolve any mask the client echoed back BEFORE the
+	// merge. A patch is exactly the shape that used to corrupt — the client
+	// read `env: {GITHUB_TOKEN: "••••56 (40 chars)"}` off a read door and sent
+	// it back — and the merge would have written the mask straight over the
+	// stored credential. Bound by key it is reverted; unbound (an argv slot, a
+	// renamed server) the write is refused.
+	resolvedPatch, err := oauth.UnmaskLiveConfigTree(patchMap, cfg)
+	if err != nil {
+		s.logger.Warnw("Refused a configuration patch carrying an unbindable mask", "error", err)
+		s.writeError(w, r, http.StatusBadRequest, err.Error())
+		return
+	}
+	if m, ok := resolvedPatch.(map[string]interface{}); ok {
+		patchMap = m
 	}
 
 	deepMergeJSON(baseMap, patchMap)
 
+	// Spec 107 FR-039: refuse the removed server-edition keys / auth_broker
+	// modes on the MERGED generic map, before the typed decode drops them
+	// without a trace (json.Unmarshal into config.Config ignores unknown
+	// keys, so Config.Validate can never see them). No-op in the personal
+	// build.
+	if s.refuseRemovedConfigKeys(w, r, baseMap, "Invalid configuration patch") {
+		return
+	}
+
 	mergedBytes, err := json.Marshal(baseMap)
 	if err != nil {
-		s.logger.Error("Failed to marshal merged configuration", "error", err)
+		s.logger.Errorw("Failed to marshal merged configuration", "error", err)
 		s.writeError(w, r, http.StatusInternalServerError, "Failed to build configuration")
 		return
 	}
@@ -4244,8 +5554,7 @@ func (s *Server) handlePatchConfig(w http.ResponseWriter, r *http.Request) {
 
 	result, err := s.controller.ApplyConfig(&merged, s.controller.GetConfigPath())
 	if err != nil {
-		s.logger.Error("Failed to apply configuration patch", "error", err)
-		s.writeError(w, r, http.StatusInternalServerError, fmt.Sprintf("Failed to apply configuration: %v", err))
+		s.writeApplyConfigError(w, r, "Failed to apply configuration patch", result, err)
 		return
 	}
 
@@ -4258,6 +5567,115 @@ func (s *Server) handlePatchConfig(w http.ResponseWriter, r *http.Request) {
 		ValidationErrors:   contracts.ConvertValidationErrors(result.ValidationErrors),
 	}
 	s.writeSuccess(w, response)
+}
+
+// writeApplyConfigError reports an ApplyConfig failure with the right status
+// class (#1084).
+//
+// ApplyConfig fails for two very different reasons: the operator sent a value
+// the config rejects, or the server could not persist/commit a valid one. Both
+// used to come back as 500, so `{"direct_tool_response_mode":"bogus"}` — a
+// plain enum typo — was reported as a server fault, which is also what tells a
+// client whether retrying could ever help. The structured ValidationErrors on
+// the result are what distinguish them; when they are present this is a 400 and
+// the payload carries them so the caller can point at the offending field.
+//
+// Returns the status it wrote, for the callers that log.
+func (s *Server) writeApplyConfigError(w http.ResponseWriter, r *http.Request, msg string, result *internalRuntime.ConfigApplyResult, err error) {
+	if result != nil && len(result.ValidationErrors) > 0 {
+		// A rejected value is the operator's, not the server's: log it at warn
+		// and answer 400. The structured errors ride in `data` so a client can
+		// point at the offending field instead of scraping the message.
+		s.logger.Warnw(msg, "error", err)
+		requestID := reqcontext.GetRequestID(r.Context())
+		s.writeJSON(w, http.StatusBadRequest, contracts.APIResponse{
+			Success:   false,
+			Error:     fmt.Sprintf("%s: %v", msg, err),
+			RequestID: requestID,
+			Data: map[string]interface{}{
+				"validation_errors": contracts.ConvertValidationErrors(result.ValidationErrors),
+			},
+		})
+		return
+	}
+	s.logger.Errorw(msg, "error", err)
+	s.writeError(w, r, http.StatusInternalServerError, fmt.Sprintf("%s: %v", msg, err))
+}
+
+// withLiveUpstreamStats returns a copy of a status snapshot whose nested
+// upstream_stats / tools_indexed carry the LIVE values passed in (#1084).
+//
+// The snapshot comes from the last PUBLISHED status event, and nothing
+// refreshes its embedded stats once connection settles: they sat at
+// "Connecting"/0 for the whole life of a process whose servers were long Ready,
+// while the sibling top-level upstream_stats — computed live from the
+// supervisor's StateView — was correct. Two fields describing one thing
+// disagreed and only one ever converged.
+//
+// Applied here rather than inside Server.GetStatus() for two reasons: every
+// emission site (the REST poll and both SSE paths) already computes the live
+// stats once for its top-level field, so this reuses that value instead of
+// repeating an O(servers) traversal per response; and the SSE stream forwards a
+// snapshot straight off the channel, which never passes through GetStatus() at
+// all.
+//
+// Copies rather than mutates: the SSE value is a map owned by the publisher,
+// and refreshing it in place would edit something another goroutine may hold.
+// Keys are preserved rather than dropped — clients read data.status.*.
+//
+// ctx carries the caller so `message` can be scoped. That string is written by
+// runtime.UpdatePhaseMessage as "Connected to %d/%d servers, retrying..." — a
+// verbatim count of the WHOLE inventory, sitting one key away from the
+// total_servers that #1166 recomputed precisely so it would stop being a count
+// oracle. A scoped caller gets it blanked; `phase` (Ready/Loading/…) survives,
+// carries no counts, and is what clients switch on.
+func withLiveUpstreamStats(ctx context.Context, status interface{}, live map[string]interface{}) interface{} {
+	snapshot, ok := status.(map[string]interface{})
+	if !ok || live == nil {
+		return status
+	}
+	refreshed := make(map[string]interface{}, len(snapshot))
+	for k, v := range snapshot {
+		refreshed[k] = v
+	}
+	refreshed["upstream_stats"] = live
+	if totalTools, ok := live["total_tools"].(int); ok {
+		refreshed["tools_indexed"] = totalTools
+	}
+	if _, present := refreshed["message"]; present && auth.IsScopedCaller(ctx) {
+		refreshed["message"] = ""
+	}
+	return refreshed
+}
+
+// refuseRemovedConfigKeys runs config.ValidateRemovedKeys on a generic
+// configuration document and, when it reports anything, answers 400 with the
+// structured validation_errors payload (the #1084 shape) and returns true.
+// It is the Spec 107 FR-039 write-time gate for keys the typed decode would
+// otherwise drop silently; the boot path normalises + records instead.
+func (s *Server) refuseRemovedConfigKeys(w http.ResponseWriter, r *http.Request, document map[string]interface{}, msg string) bool {
+	errs := config.ValidateRemovedKeys(document)
+	if len(errs) == 0 {
+		return false
+	}
+	s.writeApplyConfigError(w, r, msg, &internalRuntime.ConfigApplyResult{
+		Success:          false,
+		ValidationErrors: errs,
+	}, fmt.Errorf("%s", errs[0].Error()))
+	return true
+}
+
+// MergeConfigPatch deep-merges patch into a copy of base and returns the
+// merged document — the exact merge handlePatchConfig performs. Exported so
+// the personal-build round-trip test (Spec 107 FR-040, T010) can drive the
+// PATCH path without an HTTP server.
+func MergeConfigPatch(base, patch map[string]interface{}) map[string]interface{} {
+	merged := make(map[string]interface{}, len(base))
+	for k, v := range base {
+		merged[k] = v
+	}
+	deepMergeJSON(merged, patch)
+	return merged
 }
 
 // deepMergeJSON recursively merges patch into base. When both base[k] and
@@ -4287,6 +5705,7 @@ func deepMergeJSON(base, patch map[string]interface{}) {
 // @Param request body object{tool_name=string,arguments=object} true "Tool call request with tool name and arguments"
 // @Success 200 {object} contracts.SuccessResponse "Tool call result"
 // @Failure 400 {object} contracts.ErrorResponse "Bad request (invalid payload or missing tool name)"
+// @Failure 429 {object} contracts.ErrorResponse "Shed by a concurrency limit (Retry-After header carries the wait hint)"
 // @Failure 500 {object} contracts.ErrorResponse "Internal server error or tool execution failure"
 // @Router /api/v1/tools/call [post]
 func (s *Server) handleCallTool(w http.ResponseWriter, r *http.Request) {
@@ -4310,14 +5729,31 @@ func (s *Server) handleCallTool(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Set request source to CLI for REST API tool calls (typically from CLI)
-	// This allows activity logging to distinguish between MCP protocol and CLI calls
-	ctx := reqcontext.WithRequestSource(r.Context(), reqcontext.SourceCLI)
+	// Attribute the call to the surface that actually made it. This endpoint is
+	// shared by the CLI, the Web UI and the tray, so hard-coding CLI here
+	// overwrote the REST source the middleware had already established and
+	// logged every Web-UI tool call — and every shed of one — as if it came from
+	// the CLI. The surface header the clients already send is the discriminator.
+	ctx := reqcontext.WithRequestSource(r.Context(), toolCallRequestSource(r))
 
 	// Call tool via controller
 	result, err := s.controller.CallTool(ctx, request.ToolName, request.Arguments)
 	if err != nil {
-		s.logger.Error("Failed to call tool", "tool", request.ToolName, "error", err)
+		// Spec 093 FR-011: a concurrency-limiter shed is backpressure, not a
+		// server fault — answer 429 with a Retry-After derived from the shedding
+		// scope's effective queue_timeout so a client can back off correctly.
+		var limitErr *limiter.LimitError
+		if errors.As(err, &limitErr) &&
+			(limitErr.Reason == limiter.ReasonQueueFull || limitErr.Reason == limiter.ReasonQueueTimeout) {
+			w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds(limitErr.RetryAfter)))
+			s.logger.Warnw("Tool call shed by concurrency limiter",
+				"tool", request.ToolName,
+				"scope", string(limitErr.Scope),
+				"reason", string(limitErr.Reason))
+			s.writeError(w, r, http.StatusTooManyRequests, limitErr.UserMessage())
+			return
+		}
+		s.logger.Errorw("Failed to call tool", "tool", request.ToolName, "error", err)
 		s.writeError(w, r, http.StatusInternalServerError, fmt.Sprintf("Failed to call tool: %v", err))
 		return
 	}
@@ -4340,7 +5776,7 @@ func (s *Server) handleCallTool(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleListRegistries(w http.ResponseWriter, r *http.Request) {
 	registries, err := s.controller.ListRegistries()
 	if err != nil {
-		s.logger.Error("Failed to list registries", "error", err)
+		s.logger.Errorw("Failed to list registries", "error", err)
 		s.writeError(w, r, http.StatusInternalServerError, fmt.Sprintf("Failed to list registries: %v", err))
 		return
 	}
@@ -4350,7 +5786,7 @@ func (s *Server) handleListRegistries(w http.ResponseWriter, r *http.Request) {
 	for i, reg := range registries {
 		regMap, ok := reg.(map[string]interface{})
 		if !ok {
-			s.logger.Warn("Invalid registry type", "registry", reg)
+			s.logger.Warnw("Invalid registry type", "registry", reg)
 			continue
 		}
 
@@ -4440,7 +5876,7 @@ func (s *Server) handleSearchRegistryServers(w http.ResponseWriter, r *http.Requ
 			})
 			return
 		}
-		s.logger.Error("Failed to search registry servers", "registry", registryID, "error", err)
+		s.logger.Errorw("Failed to search registry servers", "registry", registryID, "error", err)
 		s.writeError(w, r, http.StatusInternalServerError, fmt.Sprintf("Failed to search servers: %v", err))
 		return
 	}
@@ -4450,7 +5886,7 @@ func (s *Server) handleSearchRegistryServers(w http.ResponseWriter, r *http.Requ
 	for i, srv := range servers {
 		srvMap, ok := srv.(map[string]interface{})
 		if !ok {
-			s.logger.Warn("Invalid server type", "server", srv)
+			s.logger.Warnw("Invalid server type", "server", srv)
 			continue
 		}
 
@@ -4568,19 +6004,37 @@ func (s *Server) handleAddFromRegistry(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		status := registryAddErrorStatus(rerr.Code)
 		if status >= http.StatusInternalServerError {
-			logger.Error("Add from registry failed", "registry", registryID, "server", serverID, "error", err)
+			logger.Errorw("Add from registry failed", "registry", registryID, "server", serverID, "error", err)
 		}
 		s.writeRegistryAddError(w, r, status, rerr)
 		return
 	}
+	if cfg == nil {
+		// A controller that reports success without a server config (the
+		// test doubles do) used to be dereferenced here; chi's recoverer
+		// turned that into a bare 500 — and on windows/amd64 the recovered
+		// hardware fault corrupts the Go heap under Go 1.26 (golang/go#81238),
+		// so the httpapi test binary then died in a later GC. Same
+		// nil-tolerance as redactedRegistrySummary.
+		logger.Errorw("Add from registry returned no server config", "registry", registryID, "server", serverID)
+		s.writeError(w, r, http.StatusInternalServerError, "registry returned no server configuration")
+		return
+	}
 
+	// Issue #1148, round 8: the MCP twin of this handler
+	// (`upstream_servers add_from_registry`) has sourced this echo from the
+	// shared redacted view since round 1; this one still read the struct, so a
+	// registry entry carrying `?token=…` or a `--api-key …` arg vector was
+	// masked on one surface and republished on the other. Same summary, same
+	// view, one answer.
+	registryView := oauth.RedactedConfigView("", cfg)
 	s.writeSuccess(w, contracts.AddFromRegistryData{
 		Server: contracts.AddedServerSummary{
 			Name:        cfg.Name,
 			Protocol:    cfg.Protocol,
-			Command:     cfg.Command,
-			Args:        cfg.Args,
-			URL:         cfg.URL,
+			Command:     viewString(registryView, "command", cfg.Command),
+			Args:        oauth.LiveRedaction.Argv(cfg.Args),
+			URL:         viewString(registryView, "url", cfg.URL),
 			Enabled:     cfg.Enabled,
 			Quarantined: cfg.Quarantined,
 		},
@@ -4618,22 +6072,14 @@ func (s *Server) handleAddRegistrySource(w http.ResponseWriter, r *http.Request)
 	if err != nil {
 		status := registryAddErrorStatus(rerr.Code)
 		if status >= http.StatusInternalServerError {
-			logger.Error("Add registry source failed", "url", req.URL, "error", err)
+			logger.Errorw("Add registry source failed", "url", req.URL, "error", err)
 		}
 		s.writeRegistryAddError(w, r, status, rerr)
 		return
 	}
 
 	s.writeSuccess(w, contracts.AddRegistrySourceData{
-		Registry: contracts.RegistrySummary{
-			ID:         entry.ID,
-			Name:       entry.Name,
-			URL:        entry.URL,
-			ServersURL: entry.ServersURL,
-			Protocol:   entry.Protocol,
-			Provenance: entry.Provenance,
-			Trusted:    entry.IsTrusted(),
-		},
+		Registry: redactedRegistrySummary(entry),
 	})
 }
 
@@ -4663,22 +6109,14 @@ func (s *Server) handleRemoveRegistrySource(w http.ResponseWriter, r *http.Reque
 	if err != nil {
 		status := registryAddErrorStatus(rerr.Code)
 		if status >= http.StatusInternalServerError {
-			logger.Error("Remove registry source failed", "id", registryID, "error", err)
+			logger.Errorw("Remove registry source failed", "id", registryID, "error", err)
 		}
 		s.writeRegistryAddError(w, r, status, rerr)
 		return
 	}
 
 	s.writeSuccess(w, contracts.RemoveRegistrySourceData{
-		Registry: contracts.RegistrySummary{
-			ID:         entry.ID,
-			Name:       entry.Name,
-			URL:        entry.URL,
-			ServersURL: entry.ServersURL,
-			Protocol:   entry.Protocol,
-			Provenance: entry.Provenance,
-			Trusted:    entry.IsTrusted(),
-		},
+		Registry: redactedRegistrySummary(entry),
 	})
 }
 
@@ -4716,22 +6154,14 @@ func (s *Server) handleEditRegistrySource(w http.ResponseWriter, r *http.Request
 	if err != nil {
 		status := registryAddErrorStatus(rerr.Code)
 		if status >= http.StatusInternalServerError {
-			logger.Error("Edit registry source failed", "id", registryID, "error", err)
+			logger.Errorw("Edit registry source failed", "id", registryID, "error", err)
 		}
 		s.writeRegistryAddError(w, r, status, rerr)
 		return
 	}
 
 	s.writeSuccess(w, contracts.EditRegistrySourceData{
-		Registry: contracts.RegistrySummary{
-			ID:         entry.ID,
-			Name:       entry.Name,
-			URL:        entry.URL,
-			ServersURL: entry.ServersURL,
-			Protocol:   entry.Protocol,
-			Provenance: entry.Provenance,
-			Trusted:    entry.IsTrusted(),
-		},
+		Registry: redactedRegistrySummary(entry),
 	})
 }
 
@@ -4754,7 +6184,7 @@ func (s *Server) handleRefreshRegistryCache(w http.ResponseWriter, r *http.Reque
 
 	cleared, err := s.controller.RefreshRegistryCache(registryID)
 	if err != nil {
-		s.logger.Error("Failed to refresh registry cache", "registry", registryID, "error", err)
+		s.logger.Errorw("Failed to refresh registry cache", "registry", registryID, "error", err)
 		s.writeError(w, r, http.StatusInternalServerError, fmt.Sprintf("Failed to refresh registry cache: %v", err))
 		return
 	}
@@ -4828,8 +6258,11 @@ func getBool(m map[string]interface{}, key string) bool {
 // @Produce      json
 // @Param        limit   query     int                               false  "Maximum number of sessions to return (1-100, default 10)"
 // @Param        offset  query     int                               false  "Number of sessions to skip for pagination (default 0)"
+// @Param        status  query     string                            false  "Filter by session status"  Enums(active, closed)
 // @Success      200     {object}  contracts.GetSessionsResponse     "Sessions retrieved successfully"
+// @Failure      400     {object}  contracts.ErrorResponse           "Invalid status filter"
 // @Failure      401     {object}  contracts.ErrorResponse           "Unauthorized - missing or invalid API key"
+// @Failure      403     {object}  contracts.ErrorResponse           "Agent tokens cannot read MCP session history"
 // @Failure      405     {object}  contracts.ErrorResponse           "Method not allowed"
 // @Failure      500     {object}  contracts.ErrorResponse           "Failed to get sessions"
 // @Security     ApiKeyAuth
@@ -4838,6 +6271,10 @@ func getBool(m map[string]interface{}, key string) bool {
 func (s *Server) handleGetSessions(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		s.writeError(w, r, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	if !s.requireAdminRead(w, r, sessionsDenialMessage) {
 		return
 	}
 
@@ -4859,10 +6296,19 @@ func (s *Server) handleGetSessions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Status filter. The domain is closed ("active" / "closed"), so an unknown
+	// value is a client bug — rejecting it is honest, where silently ignoring it
+	// would return unfiltered sessions that the caller believes are filtered.
+	status := r.URL.Query().Get("status")
+	if status != "" && status != "active" && status != "closed" {
+		s.writeError(w, r, http.StatusBadRequest, "Invalid status. Use 'active' or 'closed'")
+		return
+	}
+
 	// Get recent sessions from controller
-	sessions, total, err := s.controller.GetRecentSessions(limit)
+	sessions, total, err := s.controller.GetRecentSessions(limit, status)
 	if err != nil {
-		s.logger.Error("Failed to get sessions", "error", err)
+		s.logger.Errorw("Failed to get sessions", "error", err)
 		s.writeError(w, r, http.StatusInternalServerError, "Failed to get sessions")
 		return
 	}
@@ -4894,6 +6340,7 @@ func (s *Server) handleGetSessions(w http.ResponseWriter, r *http.Request) {
 // @Success      200  {object}  contracts.GetSessionDetailResponse      "Session details retrieved successfully"
 // @Failure      400  {object}  contracts.ErrorResponse                 "Session ID required"
 // @Failure      401  {object}  contracts.ErrorResponse                 "Unauthorized - missing or invalid API key"
+// @Failure      403  {object}  contracts.ErrorResponse                 "Agent tokens cannot read MCP session history"
 // @Failure      404  {object}  contracts.ErrorResponse                 "Session not found"
 // @Failure      405  {object}  contracts.ErrorResponse                 "Method not allowed"
 // @Security     ApiKeyAuth
@@ -4902,6 +6349,10 @@ func (s *Server) handleGetSessions(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleGetSessionDetail(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		s.writeError(w, r, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	if !s.requireAdminRead(w, r, sessionsDenialMessage) {
 		return
 	}
 
@@ -4914,7 +6365,7 @@ func (s *Server) handleGetSessionDetail(w http.ResponseWriter, r *http.Request) 
 	// Get session by ID
 	session, err := s.controller.GetSessionByID(id)
 	if err != nil {
-		s.logger.Error("Failed to get session detail", "id", id, "error", err)
+		s.logger.Errorw("Failed to get session detail", "id", id, "error", err)
 		s.writeError(w, r, http.StatusNotFound, "Session not found")
 		return
 	}
@@ -4959,13 +6410,15 @@ func (s *Server) handleGetDockerStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	response := map[string]interface{}{
-		"docker_available":   dockerAvailable,
-		"isolation_enabled":  isolationEnabled,
-		"recovery_mode":      status.RecoveryMode,
-		"failure_count":      status.FailureCount,
-		"attempts_since_up":  status.AttemptsSinceUp,
-		"last_attempt":       status.LastAttempt,
-		"last_error":         status.LastError,
+		"docker_available":  dockerAvailable,
+		"isolation_enabled": isolationEnabled,
+		"recovery_mode":     status.RecoveryMode,
+		"failure_count":     status.FailureCount,
+		"attempts_since_up": status.AttemptsSinceUp,
+		"last_attempt":      status.LastAttempt,
+		// Round 8: a Docker daemon failure quotes the `docker run` command line
+		// it choked on, `-e API_KEY=…` and all. One shared free-text rule.
+		"last_error":         oauth.ScrubUpstreamText(status.LastError),
 		"last_successful_at": status.LastSuccessfulAt,
 	}
 
@@ -5350,6 +6803,16 @@ func (s *Server) handleAnnotationCoverage(w http.ResponseWriter, r *http.Request
 	for _, srv := range allServers {
 		name, _ := srv["name"].(string)
 		if name == "" {
+			continue
+		}
+		// #1166: same enumeration gate as GET /api/v1/tools — this route emits
+		// one row per server name.
+		if !canSeeServer(r.Context(), name) {
+			continue
+		}
+		// #1064: a quarantined server's tools are not available, so they are
+		// not part of the annotation-coverage denominator either.
+		if quarantined, _ := srv["quarantined"].(bool); quarantined {
 			continue
 		}
 

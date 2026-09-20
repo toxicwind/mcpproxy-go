@@ -9,8 +9,11 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"go.uber.org/zap"
+
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/oauth"
 )
 
 // LoggingTransport wraps http.RoundTripper to log all HTTP traffic including SSE frames
@@ -38,9 +41,14 @@ func (t *LoggingTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 
 	startTime := time.Now()
 
-	// Log request
-	fmt.Printf("📤 HTTP REQUEST: %s %s\n", req.Method, req.URL.String())
-	fmt.Printf("   Headers: %v\n", req.Header)
+	// Log request.
+	//
+	// Issue #1158: BOTH sinks in this file get the same scrubbed string, never
+	// one and not the other — the Printf copy goes to the operator's terminal
+	// and an observer-only test would show green against a zap-only fix.
+	// The method, host and path survive; only credentials are replaced.
+	fmt.Printf("📤 HTTP REQUEST: %s %s\n", req.Method, oauth.AuditRedaction.URLValueDeep(req.URL.String()))
+	fmt.Printf("   Headers: %v\n", oauth.RedactHeaders(req.Header))
 
 	// Log request body if present (for non-SSE requests)
 	if req.Body != nil && req.Method != "GET" {
@@ -48,7 +56,11 @@ func (t *LoggingTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 		if err == nil {
 			req.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 			if len(bodyBytes) > 0 && len(bodyBytes) < 10000 {
-				t.logger.Debug("📤 REQUEST BODY", zap.String("body", string(bodyBytes)))
+				// An OAuth token-exchange body carries client_secret and
+				// refresh_token; ScrubUpstreamText rewrites only the
+				// recognised credential shapes, so the rest of the JSON stays
+				// byte-identical and trace mode keeps its purpose.
+				t.logger.Debug("📤 REQUEST BODY", zap.String("body", oauth.ScrubUpstreamText(string(bodyBytes))))
 			}
 		}
 	}
@@ -58,21 +70,26 @@ func (t *LoggingTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 	duration := time.Since(startTime)
 
 	if err != nil {
-		fmt.Printf("❌ HTTP REQUEST FAILED: %v (duration: %v)\n", err, duration)
+		// #1148: the transport error quotes the request URL, credentials and
+		// all. Both sinks get the redacted rendering; the error itself is
+		// returned untouched to the caller.
+		safeErr := oauth.ScrubUpstreamText(err.Error())
+		fmt.Printf("❌ HTTP REQUEST FAILED: %v (duration: %v)\n", safeErr, duration)
 		t.logger.Error("❌ HTTP REQUEST FAILED",
-			zap.Error(err),
+			logSafeErrorField(err),
 			zap.Duration("duration", duration))
 		return nil, err
 	}
 
 	// Log response using fmt.Printf
 	fmt.Printf("📥 HTTP RESPONSE: %d %s (duration: %v)\n", resp.StatusCode, resp.Status, duration)
-	fmt.Printf("   Response Headers: %v\n", resp.Header)
+	safeRespHeaders := oauth.RedactHeaders(resp.Header)
+	fmt.Printf("   Response Headers: %v\n", safeRespHeaders)
 
 	t.logger.Info("📥 HTTP RESPONSE",
 		zap.Int("status", resp.StatusCode),
 		zap.String("status_text", resp.Status),
-		zap.Any("headers", resp.Header),
+		zap.Any("headers", safeRespHeaders),
 		zap.Duration("duration", duration))
 
 	// Check if this is an SSE connection
@@ -143,7 +160,7 @@ func (lr *loggingReader) readSSEFramesFromPipe(pr *io.PipeReader) {
 
 	for scanner.Scan() {
 		line := scanner.Text()
-		fmt.Printf("   📜 Raw SSE line: %q\n", line)
+		fmt.Printf("   📜 Raw SSE line: %q\n", oauth.ScrubUpstreamText(line))
 
 		// Empty line indicates end of frame
 		if line == "" {
@@ -152,12 +169,14 @@ func (lr *loggingReader) readSSEFramesFromPipe(pr *io.PipeReader) {
 				frameDuration := time.Since(frameStartTime)
 
 				frameContent := currentFrame.String()
+				safeData := oauth.ScrubUpstreamText(dataContent)
+				safeContent := oauth.ScrubUpstreamText(frameContent)
 				fmt.Printf("🔵 SSE FRAME #%d (event: %s, data: %s, duration since prev: %v)\n%s\n",
-					lr.frameID, eventType, dataContent, frameDuration, frameContent)
+					lr.frameID, eventType, safeData, frameDuration, safeContent)
 				lr.logger.Info(fmt.Sprintf("🔵 SSE FRAME #%d", lr.frameID),
 					zap.String("event", eventType),
-					zap.String("data", dataContent),
-					zap.String("content", frameContent),
+					zap.String("data", safeData),
+					zap.String("content", safeContent),
 					zap.Duration("time_since_prev", frameDuration),
 					zap.Time("timestamp", time.Now()))
 
@@ -190,7 +209,9 @@ func (lr *loggingReader) readSSEFramesFromPipe(pr *io.PipeReader) {
 	}
 
 	if err := scanner.Err(); err != nil {
-		lr.logger.Error("❌ SSE STREAM ERROR", zap.Error(err))
+		// #1148 round 4: a stream read can fail with a *url.Error that quotes
+		// the request URL, credentials and all.
+		lr.logger.Error("❌ SSE STREAM ERROR", logSafeErrorField(err))
 	}
 
 	lr.logger.Info("🔴 SSE STREAM CLOSED",
@@ -210,11 +231,11 @@ func (lr *loggingReader) Read(p []byte) (n int, err error) {
 	if err == io.EOF && !lr.isSSE && lr.buffer.Len() > 0 {
 		body := lr.buffer.String()
 		if len(body) < 10000 {
-			lr.logger.Debug("📥 RESPONSE BODY", zap.String("body", body))
+			lr.logger.Debug("📥 RESPONSE BODY", zap.String("body", oauth.ScrubUpstreamText(body)))
 		} else {
 			lr.logger.Debug("📥 RESPONSE BODY (truncated)",
 				zap.Int("total_size", len(body)),
-				zap.String("preview", body[:1000]+"..."))
+				zap.String("preview", scrubbedPreview(body, 1000)+"..."))
 		}
 	}
 
@@ -226,4 +247,31 @@ func (lr *loggingReader) Close() error {
 		lr.logger.Info("🔴 Closing SSE stream")
 	}
 	return lr.rc.Close()
+}
+
+// scrubbedPreview redacts a response body and THEN truncates it (issue #1158,
+// review round 2 minor).
+//
+// The order matters and the old one was wrong: `ScrubUpstreamText(body[:1000])`
+// cut the body first, so a credential straddling byte 1000 was handed to the
+// detectors as a FRAGMENT. Every vendor-shaped matcher is anchored on a
+// complete token — a `ghp_` of the right length, a JWT with three segments, a
+// `<name>=<value>` pair with a value — so the fragment matched nothing, and the
+// leading bytes of a real secret were published while the log line claimed to
+// be redacted. Scrubbing the whole body first means the matchers see the
+// complete token; only the masked rendering is then cut.
+//
+// The cut is moved back to a rune boundary because the mask rendering is a run
+// of multi-byte U+2022 bullets, and slicing one in half produces invalid UTF-8
+// that zap escapes into noise.
+func scrubbedPreview(body string, limit int) string {
+	scrubbed := oauth.ScrubUpstreamText(body)
+	if len(scrubbed) <= limit {
+		return scrubbed
+	}
+	cut := limit
+	for cut > 0 && !utf8.RuneStart(scrubbed[cut]) {
+		cut--
+	}
+	return scrubbed[:cut]
 }

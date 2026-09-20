@@ -41,8 +41,15 @@ func GetSecurityCommand() *cobra.Command {
 		Long: `Commands for managing security scanners, scanning MCP servers,
 and reviewing scan results.
 
-Security scanners run as Docker containers and analyze upstream MCP servers
-for vulnerabilities, tool poisoning attacks, and other security issues.
+Scanning works out of the box: the offline baseline scanner is built into
+mcpproxy, runs in-process on every scan, and needs no Docker and no setup. It
+analyzes tool descriptions and schemas for tool poisoning attacks (TPAs),
+prompt injection, and data exfiltration.
+
+Deep scanners are the optional extra layer. They run as Docker containers for
+source and dependency analysis (CVEs, secrets), so they need Docker plus
+"deep scan" enabled — and when they are unavailable they are skipped, never
+blocking the baseline verdict.
 
 Examples:
   mcpproxy security scanners
@@ -1690,6 +1697,12 @@ func runSecurityOverview(_ *cobra.Command, _ []string) error {
 	}
 	fmt.Println()
 
+	// Signature bundle (spec 086 FR-019 / GH #938): which TPA corpus is live,
+	// where it came from, and how fresh it is.
+	for _, line := range signatureBundleLines(overview) {
+		fmt.Println(line)
+	}
+
 	// Findings breakdown
 	if findings, ok := overview["findings_by_severity"].(map[string]interface{}); ok {
 		fmt.Println("  Findings:")
@@ -2247,6 +2260,55 @@ func secJoinSlice(m map[string]interface{}, key string) string {
 }
 
 // secFormatInt formats a numeric field from a map as a string.
+// signatureBundleLines renders the security overview's `signature_bundle`
+// descriptor (spec 086 FR-019 / GH #938 finding 2). Before this, no supported
+// surface could answer "which signatures is my proxy running, and how old are
+// they?" — a years-stale corpus looked identical to a fresh export.
+//
+// Returns nil when the field is absent so an older daemon renders nothing
+// rather than an empty block.
+func signatureBundleLines(overview map[string]interface{}) []string {
+	bundle, ok := overview["signature_bundle"].(map[string]interface{})
+	if !ok || len(bundle) == 0 {
+		return nil
+	}
+
+	source, _ := bundle["source"].(string)
+	if path, _ := bundle["path"].(string); path != "" {
+		source = fmt.Sprintf("%s (%s)", source, path)
+	}
+
+	lines := []string{
+		"  Signature bundle:",
+		fmt.Sprintf("    Source:      %s", source),
+	}
+	if version, _ := bundle["bundle_version"].(string); version != "" {
+		lines = append(lines, fmt.Sprintf("    Version:     %s", version))
+	}
+	if generated, _ := bundle["generated_at"].(string); generated != "" {
+		lines = append(lines, fmt.Sprintf("    Generated:   %s", generated))
+	}
+	if fingerprint, _ := bundle["fingerprint"].(string); fingerprint != "" {
+		lines = append(lines, fmt.Sprintf("    Fingerprint: %s", fingerprint))
+	}
+	lines = append(lines, fmt.Sprintf("    Rules:       %s runnable, %s skipped, %s declared-skipped",
+		secFormatInt(bundle, "runnable_rules"),
+		secFormatInt(bundle, "skipped_rules"),
+		secFormatInt(bundle, "declared_skipped")))
+	if loadErr, _ := bundle["load_error"].(string); loadErr != "" {
+		// A configured bundle that failed to load keeps the previous corpus
+		// live; say so loudly rather than letting the counts imply all is well.
+		lines = append(lines, fmt.Sprintf("    load error:  %s", loadErr))
+	}
+	if runnable, _ := bundle["runnable_rules"].(float64); runnable == 0 {
+		// Zero runnable rules means offline TPA coverage is OFF. Printed in the
+		// same tone as a healthy count, it read as "fine" — the exact class of
+		// "the runtime is right but the operator is misled" bug #938 is about.
+		lines = append(lines, "    WARNING:     no TPA signatures are running — offline scan coverage is OFF")
+	}
+	return append(lines, "")
+}
+
 func secFormatInt(m map[string]interface{}, key string) string {
 	if v, ok := m[key].(float64); ok {
 		return fmt.Sprintf("%d", int(v))

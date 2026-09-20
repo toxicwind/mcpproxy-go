@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"os"
 	"os/exec"
@@ -28,6 +29,7 @@ import (
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/index"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/oauth"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/registries"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/reqcontext"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/runtime/configsvc"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/runtime/supervisor"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/secret"
@@ -35,12 +37,14 @@ import (
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/server/tokens"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/shellwrap"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/storage"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/stringutil"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/telemetry"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/toolsig"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/truncate"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/updatecheck"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/upstream"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/upstream/core"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/upstream/limiter"
 )
 
 // Status captures high-level state for API consumers.
@@ -64,6 +68,33 @@ type Runtime struct {
 
 	mu      sync.RWMutex
 	running bool
+
+	// lastToolCount is the most recent SUCCESSFUL index document count, used by
+	// GetToolCount when the index cannot answer. See the note there: the
+	// upstream tool-count cache is not a usable fallback, so a stale-but-true
+	// value beats falling through to a structural zero.
+	lastToolCount atomic.Int64
+
+	// desiredCfg is the configuration as it stands ON DISK — what the next
+	// start will use. It differs from r.cfg only while a restart-gated field
+	// (listen, routing_mode, data_dir, api_key, tls, the HTTP deadlines) has
+	// been saved but deliberately not adopted in memory.
+	//
+	// It exists because every read-modify-write caller — PATCH /api/v1/config,
+	// the Settings page, the tray, any REST client — has to merge its change
+	// onto SOMETHING, and merging onto the live config silently reverted the
+	// pending value on the next save: the operator switched to Direct, then
+	// changed any other setting, and their routing choice vanished with no
+	// warning. Guarded by r.mu.
+	desiredCfg *config.Config
+
+	// servedRoutingMode is the mode /mcp actually bound at startup
+	// (server.go → GetMCPServerForMode). Recorded rather than derived: the
+	// file-watcher reload path adopts a hand-edited routing_mode into r.cfg,
+	// after which reading the mode from the config would name a surface /mcp
+	// is not serving. Empty until the server binds (stdio/tests). Guarded by
+	// r.mu.
+	servedRoutingMode string
 
 	// configCommitMu serializes whole config-commit operations against each
 	// other. ApplyConfig (API path) and ReloadConfiguration (disk-reload path,
@@ -99,11 +130,17 @@ type Runtime struct {
 
 	eventMu   sync.RWMutex
 	eventSubs map[chan Event]struct{}
+	// internalEventSubs receive detector-only fields used by ActivityService.
+	// Ordinary subscribers, including SSE, receive a sanitized copy.
+	internalEventSubs map[chan Event]struct{}
 
 	storageManager  *storage.Manager
 	indexManager    *index.Manager
 	upstreamManager *upstream.Manager
 	cacheManager    *cache.Manager
+	// promptsRefresh debounces upstream prompts/list_changed notifications into a
+	// single RefreshPrompts fan-out (F13). Nil until lifecycle registration.
+	promptsRefresh *promptsRefreshDebouncer
 	// truncator is swapped on config hot-reload (tool_response_limit) while the
 	// MCP serving path reads it via Truncator(). An atomic.Pointer makes the
 	// swap/read race-free (#861) and independent of r.mu, so the accessor stays
@@ -125,6 +162,13 @@ type Runtime struct {
 	previousShutdown  string
 	managementService interface{}      // Initialized later to avoid import cycle
 	activityService   *ActivityService // Activity logging service
+
+	// rejectionMetric counts a concurrency shed SYNCHRONOUSLY at the rejection
+	// site (spec 093 FR-013). Installed by the observability bridge. It is
+	// deliberately not driven off the event bus: the bus drops events when a
+	// subscriber falls behind, and a rejection burst — the one moment the
+	// counter matters — is exactly when that happens.
+	rejectionMetric atomic.Pointer[RejectionMetricSink]
 
 	// workSessions derives a unit of USER WORK from the churn of transport
 	// sessions underneath it (Spec 082).
@@ -150,6 +194,19 @@ type Runtime struct {
 	// global discovery races/restarts.
 	lastGoodToolsMu sync.RWMutex
 	lastGoodTools   map[string][]*config.ToolMetadata
+
+	// legacyStampBeforeWrite is a test-only interleaving seam for
+	// stampRemainingLegacyToolApprovals (Spec 105 FR-009, astra r1 P4): when
+	// set, it runs between the sweep's listing of a server's unstamped
+	// pre-105 records and the stamp write, so a test can land an operator
+	// write in that window and assert it survives. Nil in production.
+	legacyStampBeforeWrite func()
+
+	// consultStampBeforeWrite is the same kind of seam for
+	// stampConsultedLegacySibling (astra r2 C1): when set, it runs between
+	// the consult's read of the collapsed sibling record and its stamp
+	// write. Nil in production.
+	consultStampBeforeWrite func()
 
 	// Profiles v2 (Spec 057, T1): tracks the last-synced effective server set per
 	// profile so a config reload can rebuild only the profiles whose membership
@@ -285,18 +342,28 @@ func New(cfg *config.Config, cfgPath string, logger *zap.Logger) (*Runtime, erro
 		activityService.SetUsagePersistInterval(cfg.Observability.UsagePersistInterval.Duration())
 	}
 
+	// Per-record size caps are applied UNCONDITIONALLY, outside the retention
+	// guard below. They used to ride on that `if`, which only ever fired
+	// because `cfg.ActivityMaxSizeMB >= 0` is trivially true for a plain int —
+	// so making that field a tri-state pointer (#1175) would have silently
+	// disabled the 64KB cap #1174 shipped, for every config that omits the
+	// key. The caps are not retention; they do not belong behind its guard.
+	activityService.SetMaxResponseSize(cfg.ActivityMaxResponseSize)
+	storageManager.SetToolCallLimits(cfg.ToolCallMaxResponseSize, cfg.ToolCallMaxRecordsPerServer)
+
 	// Wire activity retention config from config file
-	if cfg.ActivityRetentionDays > 0 || cfg.ActivityMaxRecords > 0 || cfg.ActivityCleanupIntervalMin > 0 || cfg.ActivityMaxSizeMB >= 0 {
-		maxAge := time.Duration(cfg.ActivityRetentionDays) * 24 * time.Hour
+	if cfg.ActivityRetentionDays > 0 || cfg.ActivityMaxRecords > 0 || cfg.ActivityCleanupIntervalMin > 0 || cfg.EffectiveActivityMaxSizeMB() >= 0 {
+		maxAge := time.Duration(cfg.EffectiveActivityRetentionDays()) * 24 * time.Hour
 		checkInterval := time.Duration(cfg.ActivityCleanupIntervalMin) * time.Minute
 		// ActivityMaxSizeMB: 0 disables the size cap, so pass the explicit byte
 		// value (>= 0 is applied; -1 would mean "unchanged").
-		maxSizeBytes := int64(cfg.ActivityMaxSizeMB) * 1024 * 1024
-		activityService.SetRetentionConfig(maxAge, cfg.ActivityMaxRecords, checkInterval, maxSizeBytes)
+		maxSizeBytes := int64(cfg.EffectiveActivityMaxSizeMB()) * 1024 * 1024
+		activityService.SetRetentionConfig(maxAge, cfg.EffectiveActivityMaxRecords(), checkInterval, maxSizeBytes)
 		logger.Info("Activity retention config applied",
-			zap.Int("retention_days", cfg.ActivityRetentionDays),
-			zap.Int("max_records", cfg.ActivityMaxRecords),
-			zap.Int("max_size_mb", cfg.ActivityMaxSizeMB),
+			zap.Int("max_response_size", cfg.ActivityMaxResponseSize),
+			zap.Int("retention_days", cfg.EffectiveActivityRetentionDays()),
+			zap.Int("max_records", cfg.EffectiveActivityMaxRecords()),
+			zap.Int("max_size_mb", cfg.EffectiveActivityMaxSizeMB()),
 			zap.Int("cleanup_interval_min", cfg.ActivityCleanupIntervalMin))
 	}
 
@@ -316,7 +383,9 @@ func New(cfg *config.Config, cfgPath string, logger *zap.Logger) (*Runtime, erro
 	}
 
 	rt := &Runtime{
-		cfg:              cfg,
+		cfg: cfg,
+		// Boot: memory and disk agree by definition.
+		desiredCfg:       cfg,
 		cfgPath:          cfgPath,
 		logger:           logger,
 		configSvc:        configSvc,
@@ -341,6 +410,7 @@ func New(cfg *config.Config, cfgPath string, logger *zap.Logger) (*Runtime, erro
 		},
 		statusCh:          make(chan Status, 10),
 		eventSubs:         make(map[chan Event]struct{}),
+		internalEventSubs: make(map[chan Event]struct{}),
 		phaseMachine:      newPhaseMachine(PhaseInitializing),
 		lastGoodTools:     make(map[string][]*config.ToolMetadata),
 		profileMembership: make(map[string][]string),
@@ -356,6 +426,11 @@ func New(cfg *config.Config, cfgPath string, logger *zap.Logger) (*Runtime, erro
 	// into one settled event per server. 750ms bridges the rapid lifecycle
 	// signals of a reconnect storm without noticeably delaying the result.
 	rt.scanNotify = newScanNotifyDebouncer(rt, 750*time.Millisecond)
+
+	// Spec 093 FR-012/FR-013: origin-independent shed seam. Installed here (not
+	// in the MCP dispatch layer) so code_execution and activity replay are
+	// covered by construction.
+	rt.installRejectionObserver()
 
 	return rt, nil
 }
@@ -414,6 +489,68 @@ func (r *Runtime) ConfigPath() string {
 	return r.cfgPath
 }
 
+// setDesiredLocked records a newly committed configuration as the desired one,
+// keeping whatever restart-gated value is still waiting for a restart.
+//
+// Every commit path has to call this, not just ApplyConfig: UpdateConfig and
+// SaveConfiguration replace or mutate the live config and write it to disk too,
+// and desiredCfg is the merge base for every read-modify-write of the
+// configuration (PATCH /api/v1/config, the raw editor, the tray). A desired copy
+// frozen at the last ApplyConfig would make the next PATCH re-persist a document
+// that has lost whatever those paths added — registries are the sharpest case,
+// since they live only in the config file and nothing splices them back from
+// config.db.
+//
+// Caller must hold r.mu.
+func (r *Runtime) setDesiredLocked(cfg *config.Config) {
+	if cfg == nil {
+		return
+	}
+	if r.desiredCfg == nil {
+		r.desiredCfg = cfg
+		return
+	}
+	// pinRestartGated(live, desired) == desired with live's restart-gated
+	// fields, which is exactly "take every hot field just committed, keep what
+	// is pending".
+	r.desiredCfg = pinRestartGated(r.desiredCfg, cfg)
+}
+
+// setDesired is setDesiredLocked's locking wrapper.
+func (r *Runtime) setDesired(cfg *config.Config) {
+	r.mu.Lock()
+	r.setDesiredLocked(cfg)
+	r.mu.Unlock()
+}
+
+// pendingAwareDiskConfig returns running with the restart-gated fields that are
+// pending on disk restored, or nil when nothing is pending and the caller can
+// write `running` as-is.
+//
+// SaveConfiguration rewrites the whole file from the running configuration, so
+// without this a server enable/disable silently reverts a routing-mode switch
+// the API is still reporting as pending.
+func (r *Runtime) pendingAwareDiskConfig(running *config.Config) *config.Config {
+	if running == nil {
+		return nil
+	}
+	r.mu.RLock()
+	desired := r.desiredCfg
+	r.mu.RUnlock()
+	if desired == nil {
+		return nil
+	}
+	// pinRestartGated(live, desired) == desired with live's restart-gated
+	// fields; here the roles are reversed — take `running` and restore the
+	// PENDING restart-gated values from the desired config.
+	withPending := pinRestartGated(desired, running)
+	if DetectConfigChanges(running, withPending).RequiresRestart {
+		return withPending
+	}
+	// Nothing restart-gated differs; let the normal save path run.
+	return nil
+}
+
 // UpdateConfig replaces the runtime configuration in-place.
 // This now updates both the legacy field and the ConfigService.
 func (r *Runtime) UpdateConfig(cfg *config.Config, cfgPath string) {
@@ -441,6 +578,7 @@ func (r *Runtime) updateConfigLocked(cfg *config.Config, cfgPath string) {
 	// Update legacy fields for backward compatibility
 	r.mu.Lock()
 	r.cfg = cfg
+	r.setDesiredLocked(cfg)
 	if cfgPath != "" {
 		r.cfgPath = cfgPath
 	}
@@ -725,12 +863,6 @@ func (r *Runtime) Close() error {
 		r.cacheManager.Close()
 	}
 
-	if r.indexManager != nil {
-		if err := r.indexManager.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("close index manager: %w", err))
-		}
-	}
-
 	// Spec 080 (FR-010, review round 4): the ActivityService owns BBolt
 	// writers — activity records, retention pruning, usage-snapshot flushes,
 	// async sensitive-data detection. The appCancel at the top of Close
@@ -759,8 +891,29 @@ func (r *Runtime) Close() error {
 	// ActivityService.Stop above — terminally stops the service so a Start
 	// goroutine not yet scheduled (lifecycle.go launches it via `go`) becomes
 	// a no-op instead of writing after this point.
+	//
+	// Stop also performs the graceful-shutdown heartbeat flush — one bounded
+	// (4s) final send of the counters recorded since the last accepted
+	// heartbeat, which would otherwise die with the process. It runs after the
+	// loop is joined, so it is the only sender at that moment, and it happens
+	// HERE — while the BBolt handle is still open and before the marker
+	// resolves below — because its buildHeartbeat writes funnel activity.
 	if r.telemetryService != nil {
 		r.telemetryService.Stop()
+	}
+
+	// The index closes AFTER the telemetry flush above, not before it. That
+	// flush builds one last heartbeat, and tool_count is read from this index
+	// (GetToolCount). Closing first made GetDocumentCount fail, which sent the
+	// final heartbeat down the upstream-cache fallback — and by this point the
+	// upstream clients are disconnected, so it would have reported tool_count=0
+	// for an install with a full index. Nothing between the old position and
+	// here touches the index: cacheManager.Close, activityService.Stop and
+	// telemetryService.Stop are all BBolt/HTTP work.
+	if r.indexManager != nil {
+		if err := r.indexManager.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("close index manager: %w", err))
+		}
 	}
 
 	// Spec 080 (US3, FR-010): resolve the shutdown marker to "clean" at the
@@ -1003,8 +1156,14 @@ func convertToolAnnotations(a *config.ToolAnnotations) *contracts.ToolAnnotation
 	}
 }
 
-// GetToolCalls retrieves tool call history with pagination
-func (r *Runtime) GetToolCalls(limit, offset int) ([]*contracts.ToolCallRecord, int, error) {
+// GetToolCalls retrieves tool call history with pagination.
+//
+// scope restricts the result to a set of server names (nil = unrestricted,
+// #1166 follow-up). It is applied BEFORE pagination so `total`, the page and
+// the offset all describe the same record set — a post-filter in the handler
+// would shrink the page while the total kept counting the hidden records, which
+// is both a broken pager and an exact oracle for what was hidden.
+func (r *Runtime) GetToolCalls(limit, offset int, scope storage.ToolCallScope) ([]*contracts.ToolCallRecord, int, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
@@ -1035,6 +1194,17 @@ func (r *Runtime) GetToolCalls(limit, offset int) ([]*contracts.ToolCallRecord, 
 		allCalls = append(allCalls, codeExecCalls...)
 	}
 
+	// Entitlement filter, before the sort and before pagination.
+	if scope != nil {
+		visible := make([]*storage.ToolCallRecord, 0, len(allCalls))
+		for _, call := range allCalls {
+			if call != nil && scope.Allows(call.ServerName) {
+				visible = append(visible, call)
+			}
+		}
+		allCalls = visible
+	}
+
 	// Sort by timestamp (most recent first)
 	sort.Slice(allCalls, func(i, j int) bool {
 		return allCalls[i].Timestamp.After(allCalls[j].Timestamp)
@@ -1058,24 +1228,27 @@ func (r *Runtime) GetToolCalls(limit, offset int) ([]*contracts.ToolCallRecord, 
 	contractCalls := make([]*contracts.ToolCallRecord, len(pagedCalls))
 	for i, call := range pagedCalls {
 		contractCalls[i] = &contracts.ToolCallRecord{
-			ID:               call.ID,
-			ServerID:         call.ServerID,
-			ServerName:       call.ServerName,
-			ToolName:         call.ToolName,
-			Arguments:        call.Arguments,
-			Response:         call.Response,
-			Error:            call.Error,
-			Duration:         call.Duration,
-			Timestamp:        call.Timestamp,
-			ConfigPath:       call.ConfigPath,
-			RequestID:        call.RequestID,
-			Metrics:          convertTokenMetrics(call.Metrics),
-			ParentCallID:     call.ParentCallID,
-			ExecutionType:    call.ExecutionType,
-			MCPSessionID:     call.MCPSessionID,
-			MCPClientName:    call.MCPClientName,
-			MCPClientVersion: call.MCPClientVersion,
-			Annotations:      convertToolAnnotations(call.Annotations),
+			ID:                 call.ID,
+			ServerID:           call.ServerID,
+			ServerName:         call.ServerName,
+			ToolName:           call.ToolName,
+			Arguments:          call.Arguments,
+			Response:           call.Response,
+			Error:              call.Error,
+			Duration:           call.Duration,
+			Timestamp:          call.Timestamp,
+			ConfigPath:         call.ConfigPath,
+			RequestID:          call.RequestID,
+			Metrics:            convertTokenMetrics(call.Metrics),
+			ParentCallID:       call.ParentCallID,
+			ExecutionType:      call.ExecutionType,
+			MCPSessionID:       call.MCPSessionID,
+			MCPClientName:      call.MCPClientName,
+			MCPClientVersion:   call.MCPClientVersion,
+			Annotations:        convertToolAnnotations(call.Annotations),
+			ResponseTruncated:  call.ResponseTruncated,
+			ResponseBytes:      call.ResponseBytes,
+			ArgumentsTruncated: call.ArgumentsTruncated,
 		}
 	}
 
@@ -1102,24 +1275,27 @@ func (r *Runtime) GetToolCallByID(id string) (*contracts.ToolCallRecord, error) 
 		for _, call := range calls {
 			if call.ID == id {
 				return &contracts.ToolCallRecord{
-					ID:               call.ID,
-					ServerID:         call.ServerID,
-					ServerName:       call.ServerName,
-					ToolName:         call.ToolName,
-					Arguments:        call.Arguments,
-					Response:         call.Response,
-					Error:            call.Error,
-					Duration:         call.Duration,
-					Timestamp:        call.Timestamp,
-					ConfigPath:       call.ConfigPath,
-					RequestID:        call.RequestID,
-					Metrics:          convertTokenMetrics(call.Metrics),
-					ParentCallID:     call.ParentCallID,
-					ExecutionType:    call.ExecutionType,
-					MCPSessionID:     call.MCPSessionID,
-					MCPClientName:    call.MCPClientName,
-					MCPClientVersion: call.MCPClientVersion,
-					Annotations:      convertToolAnnotations(call.Annotations),
+					ID:                 call.ID,
+					ServerID:           call.ServerID,
+					ServerName:         call.ServerName,
+					ToolName:           call.ToolName,
+					Arguments:          call.Arguments,
+					Response:           call.Response,
+					Error:              call.Error,
+					Duration:           call.Duration,
+					Timestamp:          call.Timestamp,
+					ConfigPath:         call.ConfigPath,
+					RequestID:          call.RequestID,
+					Metrics:            convertTokenMetrics(call.Metrics),
+					ParentCallID:       call.ParentCallID,
+					ExecutionType:      call.ExecutionType,
+					MCPSessionID:       call.MCPSessionID,
+					MCPClientName:      call.MCPClientName,
+					MCPClientVersion:   call.MCPClientVersion,
+					Annotations:        convertToolAnnotations(call.Annotations),
+					ResponseTruncated:  call.ResponseTruncated,
+					ResponseBytes:      call.ResponseBytes,
+					ArgumentsTruncated: call.ArgumentsTruncated,
 				}, nil
 			}
 		}
@@ -1151,44 +1327,64 @@ func (r *Runtime) GetServerToolCalls(serverName string, limit int) ([]*contracts
 	contractCalls := make([]*contracts.ToolCallRecord, len(calls))
 	for i, call := range calls {
 		contractCalls[i] = &contracts.ToolCallRecord{
-			ID:               call.ID,
-			ServerID:         call.ServerID,
-			ServerName:       call.ServerName,
-			ToolName:         call.ToolName,
-			Arguments:        call.Arguments,
-			Response:         call.Response,
-			Error:            call.Error,
-			Duration:         call.Duration,
-			Timestamp:        call.Timestamp,
-			ConfigPath:       call.ConfigPath,
-			RequestID:        call.RequestID,
-			Metrics:          convertTokenMetrics(call.Metrics),
-			ParentCallID:     call.ParentCallID,
-			ExecutionType:    call.ExecutionType,
-			MCPSessionID:     call.MCPSessionID,
-			MCPClientName:    call.MCPClientName,
-			MCPClientVersion: call.MCPClientVersion,
-			Annotations:      convertToolAnnotations(call.Annotations),
+			ID:                 call.ID,
+			ServerID:           call.ServerID,
+			ServerName:         call.ServerName,
+			ToolName:           call.ToolName,
+			Arguments:          call.Arguments,
+			Response:           call.Response,
+			Error:              call.Error,
+			Duration:           call.Duration,
+			Timestamp:          call.Timestamp,
+			ConfigPath:         call.ConfigPath,
+			RequestID:          call.RequestID,
+			Metrics:            convertTokenMetrics(call.Metrics),
+			ParentCallID:       call.ParentCallID,
+			ExecutionType:      call.ExecutionType,
+			MCPSessionID:       call.MCPSessionID,
+			MCPClientName:      call.MCPClientName,
+			MCPClientVersion:   call.MCPClientVersion,
+			Annotations:        convertToolAnnotations(call.Annotations),
+			ResponseTruncated:  call.ResponseTruncated,
+			ResponseBytes:      call.ResponseBytes,
+			ArgumentsTruncated: call.ArgumentsTruncated,
 		}
 	}
 
 	return contractCalls, nil
 }
 
-// ReplayToolCall replays a tool call with modified arguments
-func (r *Runtime) ReplayToolCall(id string, arguments map[string]interface{}) (*contracts.ToolCallRecord, error) {
+// ReplayToolCall replays a tool call with modified arguments.
+//
+// ctx is the CALLER's context (the HTTP request's). It governs the whole
+// replay, including the wait for a concurrency slot: a client that disconnects
+// mid-queue releases the slot immediately instead of leaving a call queued for
+// a caller that is gone (FR-005).
+func (r *Runtime) ReplayToolCall(ctx context.Context, id string, arguments map[string]interface{}) (*contracts.ToolCallRecord, error) {
+	// Spec 093 FR-008: snapshot the collaborators under the lock and release it
+	// before anything that can block. Replay dispatches through the same
+	// admission seam as every other origin, so holding r.mu across the call
+	// would let one queued replay stall ApplyConfig and every other writer for
+	// the whole queue-plus-execution duration.
 	r.mu.RLock()
-	defer r.mu.RUnlock()
+	storageManager := r.storageManager
+	upstreamManager := r.upstreamManager
+	cfgPath := r.cfgPath
+	r.mu.RUnlock()
+
+	if storageManager == nil || upstreamManager == nil {
+		return nil, fmt.Errorf("runtime is not ready to replay tool calls")
+	}
 
 	// Get the original tool call using the same pattern as GetToolCallByID
 	var originalCall *storage.ToolCallRecord
-	identities, err := r.storageManager.ListServerIdentities()
+	identities, err := storageManager.ListServerIdentities()
 	if err != nil {
 		return nil, fmt.Errorf("failed to list server identities: %w", err)
 	}
 
 	for _, identity := range identities {
-		calls, err := r.storageManager.GetServerToolCalls(identity.ID, 1000)
+		calls, err := storageManager.GetServerToolCalls(identity.ID, 1000)
 		if err != nil {
 			continue
 		}
@@ -1208,21 +1404,47 @@ func (r *Runtime) ReplayToolCall(id string, arguments map[string]interface{}) (*
 		return nil, fmt.Errorf("tool call not found: %s", id)
 	}
 
-	// Use modified arguments if provided, otherwise use original
+	// Use modified arguments if provided, otherwise use original.
+	//
+	// Refuse to reuse arguments that storage shortened (#1176). The stored
+	// value is then a {truncated, original_bytes, preview} placeholder, and
+	// re-dispatching THAT would call the upstream tool with nonsense — which
+	// for a call_tool_write or destructive replay reaches a real system. The
+	// caller can still replay by supplying the arguments explicitly.
 	callArgs := arguments
 	if callArgs == nil {
+		if originalCall.ArgumentsTruncated {
+			return nil, fmt.Errorf(
+				"cannot replay tool call %s: its stored arguments were shortened to stay within tool_call_max_response_size, "+
+					"so they are a placeholder rather than the original input; supply arguments explicitly to replay it", id)
+		}
 		callArgs = originalCall.Arguments
 	}
 
 	// Get the upstream client
-	client, ok := r.upstreamManager.GetClient(originalCall.ServerName)
+	client, ok := upstreamManager.GetClient(originalCall.ServerName)
 	if !ok || client == nil {
 		return nil, fmt.Errorf("server not found: %s", originalCall.ServerName)
 	}
 
-	// Call the tool with modified arguments
-	ctx, cancel := context.WithTimeout(context.Background(), r.cfg.CallToolTimeout.Duration())
-	defer cancel()
+	// Call the tool with modified arguments.
+	//
+	// Spec 093 FR-005: NO execution-timeout context is created here. Replay used
+	// to wrap the call in a CallToolTimeout context before dispatch, which meant
+	// time spent waiting in a concurrency-limiter queue was subtracted from the
+	// call's execution budget — a replay that queued for 20s would get 20s less
+	// upstream time than the same call made from an agent. The execution timeout
+	// is applied by core.Client.CallTool AFTER admission, so passing the caller's
+	// context gives replay the same post-admission budget as every other origin.
+	// Cancellation still works: the caller's context governs the queue wait, and
+	// the deeper timeout governs execution.
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// Spec 093 FR-012/P3: replay never crossed an external surface, so its sheds
+	// are attributed to the internal origin rather than to whichever surface
+	// asked for the replay.
+	ctx = reqcontext.WithRequestSource(ctx, reqcontext.SourceInternal)
 
 	startTime := time.Now()
 	result, callErr := client.CallTool(ctx, originalCall.ToolName, callArgs)
@@ -1237,7 +1459,7 @@ func (r *Runtime) ReplayToolCall(id string, arguments map[string]interface{}) (*
 		Arguments:  callArgs,
 		Duration:   duration.Nanoseconds(),
 		Timestamp:  time.Now(),
-		ConfigPath: r.cfgPath,
+		ConfigPath: cfgPath,
 	}
 
 	if callErr != nil {
@@ -1247,33 +1469,53 @@ func (r *Runtime) ReplayToolCall(id string, arguments map[string]interface{}) (*
 	}
 
 	// Store the new tool call
-	if err := r.storageManager.RecordToolCall(newCall); err != nil {
+	if err := storageManager.RecordToolCall(newCall); err != nil {
 		r.logger.Warn("Failed to record replayed tool call", zap.Error(err))
+	}
+
+	// Spec 093 FR-011: a shed is backpressure, not a completed replay. Flattening
+	// it into the record's Error field and returning nil made the REST endpoint
+	// answer 200 success:true for a call that never ran; the typed identity is
+	// returned instead so the handler can map it to 429 + Retry-After. Other
+	// upstream errors keep the existing "replay ran, the tool failed" contract.
+	if callErr != nil {
+		var limitErr *limiter.LimitError
+		if errors.As(callErr, &limitErr) &&
+			(limitErr.Reason == limiter.ReasonQueueFull || limitErr.Reason == limiter.ReasonQueueTimeout) {
+			return nil, callErr
+		}
 	}
 
 	// Convert to contract type
 	return &contracts.ToolCallRecord{
-		ID:          newCall.ID,
-		ServerID:    newCall.ServerID,
-		ServerName:  newCall.ServerName,
-		ToolName:    newCall.ToolName,
-		Arguments:   newCall.Arguments,
-		Response:    newCall.Response,
-		Error:       newCall.Error,
-		Duration:    newCall.Duration,
-		Timestamp:   newCall.Timestamp,
-		ConfigPath:  newCall.ConfigPath,
-		RequestID:   newCall.RequestID,
-		Annotations: convertToolAnnotations(newCall.Annotations),
+		ID:                 newCall.ID,
+		ServerID:           newCall.ServerID,
+		ServerName:         newCall.ServerName,
+		ToolName:           newCall.ToolName,
+		Arguments:          newCall.Arguments,
+		Response:           newCall.Response,
+		Error:              newCall.Error,
+		Duration:           newCall.Duration,
+		Timestamp:          newCall.Timestamp,
+		ConfigPath:         newCall.ConfigPath,
+		RequestID:          newCall.RequestID,
+		Annotations:        convertToolAnnotations(newCall.Annotations),
+		ResponseTruncated:  newCall.ResponseTruncated,
+		ResponseBytes:      newCall.ResponseBytes,
+		ArgumentsTruncated: newCall.ArgumentsTruncated,
 	}, nil
 }
 
-// GetToolCallsBySession returns tool calls filtered by session ID
-func (r *Runtime) GetToolCallsBySession(sessionID string, limit, offset int) ([]*contracts.ToolCallRecord, int, error) {
+// GetToolCallsBySession returns tool calls filtered by session ID.
+//
+// scope restricts the result to a set of server names (nil = unrestricted). It
+// is pushed down into storage so it lands in the same pass that computes
+// `total` (#1166 follow-up).
+func (r *Runtime) GetToolCallsBySession(sessionID string, limit, offset int, scope storage.ToolCallScope) ([]*contracts.ToolCallRecord, int, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	storageRecords, total, err := r.storageManager.GetToolCallsBySession(sessionID, limit, offset)
+	storageRecords, total, err := r.storageManager.GetToolCallsBySession(sessionID, limit, offset, scope)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to get tool calls by session: %w", err)
 	}
@@ -1282,36 +1524,43 @@ func (r *Runtime) GetToolCallsBySession(sessionID string, limit, offset int) ([]
 	records := make([]*contracts.ToolCallRecord, 0, len(storageRecords))
 	for _, rec := range storageRecords {
 		records = append(records, &contracts.ToolCallRecord{
-			ID:               rec.ID,
-			ServerID:         rec.ServerID,
-			ServerName:       rec.ServerName,
-			ToolName:         rec.ToolName,
-			Arguments:        rec.Arguments,
-			Response:         rec.Response,
-			Error:            rec.Error,
-			Duration:         rec.Duration,
-			Timestamp:        rec.Timestamp,
-			ConfigPath:       rec.ConfigPath,
-			RequestID:        rec.RequestID,
-			Metrics:          convertTokenMetrics(rec.Metrics),
-			ParentCallID:     rec.ParentCallID,
-			ExecutionType:    rec.ExecutionType,
-			MCPSessionID:     rec.MCPSessionID,
-			MCPClientName:    rec.MCPClientName,
-			MCPClientVersion: rec.MCPClientVersion,
-			Annotations:      convertToolAnnotations(rec.Annotations),
+			ID:                 rec.ID,
+			ServerID:           rec.ServerID,
+			ServerName:         rec.ServerName,
+			ToolName:           rec.ToolName,
+			Arguments:          rec.Arguments,
+			Response:           rec.Response,
+			Error:              rec.Error,
+			Duration:           rec.Duration,
+			Timestamp:          rec.Timestamp,
+			ConfigPath:         rec.ConfigPath,
+			RequestID:          rec.RequestID,
+			Metrics:            convertTokenMetrics(rec.Metrics),
+			ParentCallID:       rec.ParentCallID,
+			ExecutionType:      rec.ExecutionType,
+			MCPSessionID:       rec.MCPSessionID,
+			MCPClientName:      rec.MCPClientName,
+			MCPClientVersion:   rec.MCPClientVersion,
+			Annotations:        convertToolAnnotations(rec.Annotations),
+			ResponseTruncated:  rec.ResponseTruncated,
+			ResponseBytes:      rec.ResponseBytes,
+			ArgumentsTruncated: rec.ArgumentsTruncated,
 		})
 	}
 
 	return records, total, nil
 }
 
-// GetRecentSessions returns recent MCP sessions
-func (r *Runtime) GetRecentSessions(limit int) ([]*contracts.MCPSession, int, error) {
+// GetRecentSessions returns recent MCP sessions.
+//
+// status filters on the session status ("active" / "closed"); an empty string
+// means no filtering. Both the filter and the last-activity ordering are pushed
+// down into storage, so they are applied before truncation to limit.
+func (r *Runtime) GetRecentSessions(limit int, status string) ([]*contracts.MCPSession, int, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	storageRecords, total, err := r.storageManager.GetRecentSessions(limit)
+	storageRecords, total, err := r.storageManager.GetRecentSessions(limit, status)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to get recent sessions: %w", err)
 	}
@@ -1337,8 +1586,10 @@ func (r *Runtime) GetRecentSessions(limit int) ([]*contracts.MCPSession, int, er
 		})
 	}
 
-	// Stable order for UI consumers: most-recently-active first, break ties
-	// by session ID so the list doesn't reshuffle on identical timestamps.
+	// Storage already returns this order (and applies it before truncating, so
+	// re-sorting here can never recover a dropped record). Kept as a cheap
+	// belt-and-braces over an already-short page, and because it pins the
+	// tie-break to session ID rather than leaving it to storage's key order.
 	sort.SliceStable(sessions, func(i, j int) bool {
 		if !sessions[i].LastActivity.Equal(sessions[j].LastActivity) {
 			return sessions[i].LastActivity.After(sessions[j].LastActivity)
@@ -1401,15 +1652,38 @@ func (r *Runtime) ApplyConfig(newCfg *config.Config, cfgPath string) (*ConfigApp
 	// r.cfg swap → configSvc.Update below. MUST be acquired before r.mu.
 	r.configCommitMu.Lock()
 	defer r.configCommitMu.Unlock()
+	return r.applyConfigLocked(newCfg, cfgPath)
+}
 
+func (r *Runtime) applyConfigLocked(newCfg *config.Config, cfgPath string) (*ConfigApplyResult, error) {
 	r.mu.Lock()
+
+	// Migrate an unrecognized per-server trust_mode to the fail-closed tier
+	// BEFORE validating, exactly as config.LoadFromFile does (GH #938). A
+	// full-config apply usually round-trips whatever is already on disk, so a
+	// bogus value a PREVIOUS release persisted would otherwise reject every
+	// subsequent apply — including ones that have nothing to do with trust
+	// tiers. The per-server write seams (POST/PATCH /api/v1/servers,
+	// upstream_servers, --trust-mode) still reject a bad value outright, which
+	// is where an operator is actually typing one.
+	for _, n := range config.NormalizeTrustModes(newCfg) {
+		r.logger.Warn("Unrecognized trust_mode in applied config; treating it as manual",
+			zap.String("server", n.Server),
+			zap.String("trust_mode", n.Original))
+	}
 
 	// Validate the new configuration first
 	validationErrors := newCfg.ValidateDetailed()
 	if len(validationErrors) > 0 {
 		r.mu.Unlock() // Unlock before returning
+		// Carry the structured errors back on the RESULT, not only inside the
+		// error string (#1084). A caller cannot tell "the operator sent a bad
+		// value" from "the server failed to persist" by string-matching, so the
+		// REST handlers used to report every apply failure as 500 — including
+		// a plainly invalid enum value, which is a 400.
 		return &ConfigApplyResult{
-			Success: false,
+			Success:          false,
+			ValidationErrors: validationErrors,
 		}, fmt.Errorf("configuration validation failed: %v", validationErrors[0].Error())
 	}
 
@@ -1421,8 +1695,26 @@ func (r *Runtime) ApplyConfig(newCfg *config.Config, cfgPath string) (*ConfigApp
 	// Idempotent + nil-safe.
 	config.MigrateDeepScanConfig(newCfg)
 
-	// Detect changes and determine if restart is required
-	result := DetectConfigChanges(r.cfg, newCfg)
+	// Issue #937 (review P1): gate BEFORE the diff and BEFORE the disk write
+	// below. ApplyConfig saves first and only reaches LoadConfiguredServers at
+	// the very end — and not at all when result.RequiresRestart — so a
+	// `PUT /api/v1/config` that adds a first-seen server used to put it on disk
+	// unquarantined and, on the restart branch, never gate it in this process at
+	// all. Gating here also means the diff reports the value that is actually
+	// persisted. The gate returns a copy, so the caller's config is untouched.
+	newCfg = r.gateConfigForAdmission(newCfg)
+
+	// Detect changes against the DESIRED config — what the caller edited — not
+	// against the running one. The two differ only while a restart-gated field
+	// is pending, and diffing against the running config there reported that
+	// pending field as a fresh restart-required change on every subsequent
+	// save: flipping a hot setting while a routing-mode switch waited for a
+	// restart answered "restart required" for a change that was already live.
+	baseCfg := r.desiredCfg
+	if baseCfg == nil {
+		baseCfg = r.cfg
+	}
+	result := DetectConfigChanges(baseCfg, newCfg)
 	if !result.Success {
 		r.mu.Unlock() // Unlock before returning
 		return result, fmt.Errorf("failed to detect config changes")
@@ -1445,16 +1737,23 @@ func (r *Runtime) ApplyConfig(newCfg *config.Config, cfgPath string) (*ConfigApp
 	// (config_watcher.go). If the save fails, its entry is removed again on
 	// the error path below — nothing reached disk, so a later byte-identical
 	// EXTERNAL write of this config is a genuine edit the watcher must reload.
-	r.noteConfigSelfWrite(newCfg)
+	//
+	// The overridden fields this apply MOVED relative to its merge base are
+	// the caller's edits and are persisted as they are — whatever they moved
+	// to, including a serve flag's own value; a round trip of a value the
+	// base already held keeps restoring the file value. The override records
+	// stay: a concurrent save of the still-live config must keep restoring
+	// the file value (config.PersistableConfigWithEdits).
+	r.noteConfigSelfWriteWithEdits(newCfg, baseCfg, savePath)
 
-	saveErr := config.SaveConfig(newCfg, savePath)
+	saveErr := config.SaveConfigWithEdits(newCfg, baseCfg, savePath)
 	if saveErr != nil {
 		// Drop the pre-armed self-write entry: the save never landed, so no
 		// future fs event for these bytes can be our own echo. Keeping it
 		// would suppress a genuine external write of byte-identical JSON.
 		// Only this payload is forgotten — markers from other still-pending
 		// successful saves stay live.
-		r.forgetConfigSelfWrite(newCfg)
+		r.forgetConfigSelfWriteWithEdits(newCfg, baseCfg, savePath)
 		r.logger.Error("Failed to save configuration to disk",
 			zap.String("path", savePath),
 			zap.Error(saveErr))
@@ -1467,14 +1766,69 @@ func (r *Runtime) ApplyConfig(newCfg *config.Config, cfgPath string) (*ConfigApp
 			zap.String("path", savePath))
 	}
 
-	// If restart is required, don't apply changes in-memory (let user restart)
+	// Disk is now the desired configuration, whether or not this process can
+	// adopt all of it. Recorded on BOTH branches: a caller that read-modify-
+	// writes the config has to merge onto this, not onto the live one, or the
+	// next save silently reverts whatever is waiting for a restart.
+	r.desiredCfg = newCfg
+
+	// A write that puts a restart-gated field BACK to the value this process is
+	// already running needs no restart, however much it changes the file — it is
+	// how an operator cancels a pending switch. Diffing against the desired
+	// config (right, for reporting what changed) cannot see that on its own, so
+	// ask the running config directly before promising a restart.
+	if result.RequiresRestart {
+		if live := DetectConfigChanges(r.cfg, newCfg); live.Success && !live.RequiresRestart {
+			result.RequiresRestart = false
+			result.RestartReason = ""
+		}
+	}
+
+	// The running config can NEVER adopt a restart-gated field: /mcp is bound to
+	// its routing mode on an http.ServeMux pattern, the listener is bound, the
+	// DB is open, the auth middleware and TLS chain are built. Pin those to the
+	// live values and carry every hot field of the same write through.
+	//
+	// This matters on both branches. On the restart branch it stops the write
+	// from being discarded wholesale — switching to Direct and enabling deferred
+	// schemas in one operation used to leave deferred schemas off, behind a
+	// "restart required" toast that did not say so. On the hot branch it stops a
+	// caller that (correctly) merged its change onto the DESIRED config from
+	// smuggling the still-pending value into memory.
+	hotCfg := pinRestartGated(r.cfg, newCfg)
+
+	// What this process can actually adopt, always computed against the running
+	// config — never against the desired one `result` was diffed from, which can
+	// hold a value that was never live. Restart-gated fields are equal by
+	// construction here, so it can never come back RequiresRestart and can never
+	// hit one of the detector's early returns.
+	hotResult := DetectConfigChanges(r.cfg, hotCfg)
 	if result.RequiresRestart {
 		r.logger.Warn("Configuration changes require restart",
 			zap.String("reason", result.RestartReason),
 			zap.Strings("changed_fields", result.ChangedFields))
-		r.mu.Unlock() // Unlock before returning
-		return result, nil
+
+		if !hotResult.Success || len(hotResult.ChangedFields) == 0 {
+			// Nothing else in this write can apply now.
+			r.mu.Unlock() // Unlock before returning
+			return result, nil
+		}
+
+		r.logger.Info("Applying the hot-reloadable half of a restart-required change",
+			zap.Strings("hot_fields", hotResult.ChangedFields))
+		// The hot half IS live when this returns; the restart flag and reason
+		// stay set for the half that is not.
+		result.AppliedImmediately = true
 	}
+	// Merge on every path, not only the restart one. The caller-facing diff is
+	// taken against the desired config, so when a pending value is being
+	// reverted (cancelling a switch) it lists only that field — and the
+	// downstream side effects below key off ChangedFields, so the hot half of
+	// the same write would skip its server reload and update-check re-gate.
+	if hotResult.Success {
+		result.ChangedFields = mergeChangedFields(result.ChangedFields, hotResult.ChangedFields)
+	}
+	newCfg = hotCfg
 
 	// Apply hot-reloadable changes
 	oldCfg := r.cfg
@@ -1590,6 +1944,56 @@ func (r *Runtime) GetConfig() (*config.Config, error) {
 	// For now, we return the same reference (caller should not modify)
 	// TODO: Implement deep copy if needed
 	return r.cfg, nil
+}
+
+// GetDesiredConfig returns the configuration as persisted on disk — what the
+// next start will use. Identical to GetConfig() unless a restart-gated field is
+// pending; callers that read-modify-write the configuration MUST merge onto this
+// one, or they silently revert whatever is waiting for a restart.
+//
+// Shares the same aliasing caveat as GetConfig: the caller must not mutate the
+// returned value in place.
+func (r *Runtime) GetDesiredConfig() (*config.Config, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	src := r.desiredCfg
+	if src == nil {
+		src = r.cfg
+	}
+	if src == nil {
+		return nil, fmt.Errorf("config not initialized")
+	}
+
+	// A copy, unlike GetConfig: every caller of this accessor exists to EDIT the
+	// result and apply it back, and handing out the pointer would let them
+	// mutate the pending configuration in place — the change would then be
+	// invisible to the change detector and adopted with no diff at all.
+	data, err := json.Marshal(src)
+	if err != nil {
+		return nil, fmt.Errorf("failed to copy desired config: %w", err)
+	}
+	var out config.Config
+	if err := json.Unmarshal(data, &out); err != nil {
+		return nil, fmt.Errorf("failed to copy desired config: %w", err)
+	}
+	return &out, nil
+}
+
+// SetServedRoutingMode records the routing mode /mcp bound at startup. Called
+// once, from the server as it registers the handler.
+func (r *Runtime) SetServedRoutingMode(mode string) {
+	r.mu.Lock()
+	r.servedRoutingMode = mode
+	r.mu.Unlock()
+}
+
+// ServedRoutingMode returns the mode /mcp is actually serving, or "" before the
+// server has bound one.
+func (r *Runtime) ServedRoutingMode() string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.servedRoutingMode
 }
 
 // Tokenizer returns the tokenizer instance.
@@ -1717,8 +2121,11 @@ func (r *Runtime) ListRegistries() ([]interface{}, error) {
 			"id":          reg.ID,
 			"name":        reg.Name,
 			"description": reg.Description,
-			"url":         reg.URL,
-			"servers_url": reg.ServersURL,
+			// Issue #1148, round 8: a custom registry source is
+			// operator-configured, so its URL can carry a query credential
+			// exactly as an upstream URL can. Same shared rule.
+			"url":         oauth.LiveRedaction.URLValue(reg.URL),
+			"servers_url": oauth.LiveRedaction.URLValue(reg.ServersURL),
 			"tags":        reg.Tags,
 			"protocol":    reg.Protocol,
 			"count":       reg.Count,
@@ -1833,10 +2240,15 @@ func (r *Runtime) SearchRegistryServers(registryID, tag, query string, limit int
 	}
 
 	// Cache the freshly fetched list so subsequent searches surface its age.
+	// The entry is stamped internal (Spec 105 FR-002): read_cache refuses it
+	// for every caller without evicting it, and the Peek above keeps serving
+	// it. An unstamped entry would be legacy provenance — invalidated by the
+	// first read_cache probe of this guessable key.
 	var cacheInfo *contracts.RegistryCacheInfo
 	if r.cacheManager != nil {
 		if data, mErr := json.Marshal(result); mErr == nil {
-			if sErr := r.cacheManager.Store(cacheKey, "registry-servers", nil, string(data), "", len(result)); sErr != nil {
+			if sErr := r.cacheManager.StoreAs(cacheKey, "registry-servers", nil, string(data), "", len(result),
+				cache.Authorization{CallerKind: cache.CallerKindInternal}); sErr != nil {
 				r.logger.Warn("Failed to cache registry search", zap.Error(sErr))
 			}
 		}
@@ -1929,6 +2341,13 @@ func (r *Runtime) GetAllServers() ([]map[string]interface{}, error) {
 	snapshot := stateView.Snapshot()
 	r.logger.Debug("StateView snapshot retrieved", zap.Int("count", len(snapshot.Servers)))
 
+	// Read the global isolation block ONCE, outside the loop: every server's
+	// projection needs it to resolve the effective isolation state (GH #1142).
+	var globalIsolation *config.DockerIsolationConfig
+	if cfg, err := r.GetConfig(); err == nil && cfg != nil {
+		globalIsolation = cfg.DockerIsolation
+	}
+
 	result := make([]map[string]interface{}, 0, len(snapshot.Servers))
 	for _, serverStatus := range snapshot.Servers {
 		// Convert StateView ServerStatus to API response format
@@ -1977,14 +2396,21 @@ func (r *Runtime) GetAllServers() ([]map[string]interface{}, error) {
 				}
 			}
 
+			// GH #1172: a token record left behind by an earlier OAuth login
+			// is not evidence about a server that now authenticates with a
+			// static Authorization header — see StoredOAuthTokenInPlay.
+			tokenInPlay := r.StoredOAuthTokenInPlay(serverStatus.Name, serverStatus.Config)
+
 			// Check if server has valid OAuth token in storage
 			// IMPORTANT: This runs for ALL servers with a URL, including autodiscovery servers
 			// PersistentTokenStore uses serverKey (name + URL hash), not just server name
 			// We need to generate the same key format: "servername_hash16"
-			if url != "" && r.storageManager != nil {
+			if url != "" && r.storageManager != nil && tokenInPlay {
 				r.logger.Debug("Checking OAuth token in storage",
 					zap.String("server", serverStatus.Name),
-					zap.String("url", url),
+					// #1158: the configured upstream URL routinely carries a
+					// `?token=` credential; the host and path stay readable.
+					zap.String("url", oauth.AuditRedaction.URLValue(url)),
 					zap.Bool("has_explicit_oauth_config", serverStatus.Config.OAuth != nil))
 
 				// Generate server key matching PersistentTokenStore format
@@ -2064,6 +2490,23 @@ func (r *Runtime) GetAllServers() ([]map[string]interface{}, error) {
 			}
 		}
 
+		// Audit F12: mcp-go's streamable-HTTP transport wraps a send failure with
+		// the same "failed to send request" text at two nesting levels, so the
+		// error the UI shows repeats itself. Collapse adjacent duplicate wrappers
+		// once, here, so every consumer (Web UI, tray, CLI) gets the clean chain.
+		lastError := stringutil.CollapseRepeatedErrorWrappers(serverStatus.LastError)
+
+		// #1064: a quarantined server's tools are not available to an agent --
+		// every dispatch is refused and the search index is purged (#1061) --
+		// but the stale pre-quarantine count survives in the StateView because
+		// the supervisor re-sticks it on reconcile and AddServer re-dials the
+		// server for inspection. Zero it here, at the wire boundary, so every
+		// consumer of this projection agrees with the index.
+		availableToolCount := serverStatus.ToolCount
+		if serverStatus.Quarantined {
+			availableToolCount = 0
+		}
+
 		serverMap := map[string]interface{}{
 			"id":              serverStatus.Name,
 			"name":            serverStatus.Name,
@@ -2075,8 +2518,8 @@ func (r *Runtime) GetAllServers() ([]map[string]interface{}, error) {
 			"created":         created,
 			"connected":       connected,
 			"connecting":      connecting,
-			"tool_count":      serverStatus.ToolCount,
-			"last_error":      serverStatus.LastError,
+			"tool_count":      availableToolCount,
+			"last_error":      lastError,
 			"status":          status,
 			"should_retry":    false,
 			"retry_count":     serverStatus.RetryCount,
@@ -2107,23 +2550,9 @@ func (r *Runtime) GetAllServers() ([]map[string]interface{}, error) {
 			if len(serverStatus.Config.Env) > 0 {
 				serverMap["env"] = serverStatus.Config.Env
 			}
-			if iso := serverStatus.Config.Isolation; iso != nil {
-				isoMap := map[string]interface{}{
-					"enabled": iso.IsEnabled(),
-				}
-				if iso.Image != "" {
-					isoMap["image"] = iso.Image
-				}
-				if iso.NetworkMode != "" {
-					isoMap["network_mode"] = iso.NetworkMode
-				}
-				if len(iso.ExtraArgs) > 0 {
-					isoMap["extra_args"] = iso.ExtraArgs
-				}
-				if iso.WorkingDir != "" {
-					isoMap["working_dir"] = iso.WorkingDir
-				}
+			if isoMap, effMap := buildIsolationMaps(globalIsolation, serverStatus.Config); isoMap != nil {
 				serverMap["isolation"] = isoMap
+				serverMap["isolation_effective"] = effMap
 			}
 		}
 
@@ -2138,6 +2567,14 @@ func (r *Runtime) GetAllServers() ([]map[string]interface{}, error) {
 		// nil for servers that never configured it.
 		if serverStatus.Config != nil && serverStatus.Config.AutoApproveToolChanges != nil {
 			serverMap["auto_approve_tool_changes"] = *serverStatus.Config.AutoApproveToolChanges
+		}
+
+		// F9: surface the per-server expose_prompts override so the REST GET
+		// payload can read back a configured value. Tri-state *bool — only emit
+		// the key when set so the projection stays nil for servers that never
+		// configured it.
+		if serverStatus.Config != nil && serverStatus.Config.ExposePrompts != nil {
+			serverMap["expose_prompts"] = *serverStatus.Config.ExposePrompts
 		}
 
 		// Spec 086: surface the per-server trust tier so the REST GET payload
@@ -2226,37 +2663,53 @@ func (r *Runtime) GetAllServers() ([]map[string]interface{}, error) {
 		}
 
 		healthInput := health.HealthCalculatorInput{
-			Name:                  serverStatus.Name,
-			Enabled:               serverStatus.Enabled,
-			Quarantined:           serverStatus.Quarantined,
-			State:                 serverStatus.State,
-			Connected:             connected,
-			LastError:             serverStatus.LastError,
+			Name:        serverStatus.Name,
+			Enabled:     serverStatus.Enabled,
+			Quarantined: serverStatus.Quarantined,
+			State:       serverStatus.State,
+			Connected:   connected,
+			LastError:   lastError,
+			// Only a URL-addressed server has an endpoint the user can edit; a
+			// stdio server's own network failures must not offer "Edit URL".
+			HasEndpointURL:        url != "",
 			OAuthRequired:         oauthConfig != nil,
 			OAuthStatus:           oauthStatus,
 			HasRefreshToken:       hasRefreshToken,
 			UserLoggedOut:         userLoggedOut,
 			CallTimeOAuthRequired: callTimeOAuthRequired,
-			ToolCount:             serverStatus.ToolCount,
-			MissingSecret:         health.ExtractMissingSecret(serverStatus.LastError),
-			OAuthConfigErr:        health.ExtractOAuthConfigError(serverStatus.LastError),
+			ToolCount:             availableToolCount,
+			MissingSecret:         health.ExtractMissingSecret(lastError),
+			OAuthConfigErr:        health.ExtractOAuthConfigError(lastError),
+			// GH #1145: a permanently parked server must not render as a
+			// generic "Connection error" that looks like it is still retrying.
+			RetryStopped:       serverStatus.RetryStopped,
+			RetryStoppedCode:   serverStatus.RetryStoppedCode,
+			RetryStoppedReason: serverStatus.RetryStoppedReason,
+			RetryCount:         serverStatus.RetryCount,
 		}
 		if !tokenExpiresAt.IsZero() {
 			healthInput.TokenExpiresAt = &tokenExpiresAt
 		}
 
 		// T032: Wire refresh state into health calculation (Spec 023)
-		if r.refreshManager != nil {
-			if refreshState := r.refreshManager.GetRefreshState(serverStatus.Name); refreshState != nil {
-				healthInput.RefreshState = health.RefreshState(refreshState.State)
-				healthInput.RefreshRetryCount = refreshState.RetryCount
-				healthInput.RefreshLastError = refreshState.LastError
-				healthInput.RefreshNextAttempt = refreshState.NextAttempt
-			}
+		if refreshState := r.HealthRefreshState(serverStatus.Name, serverStatus.Config); refreshState != nil {
+			healthInput.RefreshState = health.RefreshState(refreshState.State)
+			healthInput.RefreshRetryCount = refreshState.RetryCount
+			healthInput.RefreshLastError = refreshState.LastError
+			healthInput.RefreshNextAttempt = refreshState.NextAttempt
 		}
 
 		healthStatus := health.CalculateHealth(healthInput, healthConfig)
 		serverMap["health"] = healthStatus
+
+		// GH #1145: agents and the CLI read these directly rather than parsing
+		// the health summary. Emitted only when set, so the payload shape is
+		// unchanged for every healthy or ordinarily-failing server.
+		if serverStatus.RetryStopped {
+			serverMap["retry_stopped"] = true
+			serverMap["retry_stopped_code"] = serverStatus.RetryStoppedCode
+			serverMap["retry_stopped_reason"] = serverStatus.RetryStoppedReason
+		}
 
 		// M-005: Log health status for debugging
 		r.logger.Debug("Server health calculated",
@@ -2329,6 +2782,12 @@ func (r *Runtime) getAllServersLegacy() ([]map[string]interface{}, error) {
 		// StateView path. Tri-state *bool — only emit when set.
 		if srv.AutoApproveToolChanges != nil {
 			serverInfo["auto_approve_tool_changes"] = *srv.AutoApproveToolChanges
+		}
+
+		// F9: per-server expose_prompts override in parity with the StateView
+		// path. Tri-state *bool — only emit when set.
+		if srv.ExposePrompts != nil {
+			serverInfo["expose_prompts"] = *srv.ExposePrompts
 		}
 
 		// Spec 086: per-server trust tier in parity with the StateView path.
@@ -2490,6 +2949,55 @@ func (r *Runtime) TriggerOAuthLoginQuick(serverName string) (*core.OAuthStartRes
 	return result, nil
 }
 
+// StoredOAuthTokenInPlay reports whether a record in the oauth_tokens bucket
+// (and the RefreshManager schedule built from it) is evidence about the named
+// server's authentication state (GH #1172).
+//
+// It is not when the server has no `oauth` block and carries a static
+// Authorization header: the headers-auth strategy runs first and OAuth is
+// never attempted while it works, and OAuth would populate that very header,
+// so a token left behind by an earlier OAuth login (autodiscovery servers have
+// no `oauth` block whose removal could have cleared it) is stale. Consulting
+// it used to report a connected, tool-serving upstream as unhealthy / "Token
+// expired" / login for as long as the record existed, and its failed refresh
+// schedule as "Refresh token expired". The record is left alone (logout still
+// removes it); it is simply not consulted.
+//
+// The live connection has the final say: if the configured header was
+// rejected and the OAuth strategy rescued the connection with that very
+// token, the token IS in play and is reported as for any other OAuth server.
+// A nil config (server known only to the state view) keeps the historical
+// behaviour of consulting the record.
+func (r *Runtime) StoredOAuthTokenInPlay(name string, cfg *config.ServerConfig) bool {
+	if cfg == nil || cfg.OAuth != nil || !cfg.HasStaticAuthorizationHeader() {
+		return true
+	}
+	return r.serverConnectedWithOAuth(name)
+}
+
+// HealthRefreshState returns the RefreshManager state to feed into the health
+// calculator for the named server, or nil when there is none or when the token
+// it rides on is not in play for this server (StoredOAuthTokenInPlay). Every
+// CalculateHealth call site must read refresh state through this, or the
+// REST, MCP and tray surfaces disagree about a header-authenticated server.
+func (r *Runtime) HealthRefreshState(name string, cfg *config.ServerConfig) *oauth.RefreshStateInfo {
+	if r.refreshManager == nil || !r.StoredOAuthTokenInPlay(name, cfg) {
+		return nil
+	}
+	return r.refreshManager.GetRefreshState(name)
+}
+
+// serverConnectedWithOAuth reports whether the named server's live connection
+// was authenticated by the OAuth strategy (GH #1172). False when the upstream
+// manager or the client is absent, or the client is not connected that way.
+func (r *Runtime) serverConnectedWithOAuth(name string) bool {
+	if r.upstreamManager == nil {
+		return false
+	}
+	client, exists := r.upstreamManager.GetClient(name)
+	return exists && client != nil && client.ConnectedWithOAuth()
+}
+
 // TriggerOAuthLogout implements RuntimeOperations interface for management service.
 // Clears OAuth token and disconnects a specific server.
 func (r *Runtime) TriggerOAuthLogout(serverName string) error {
@@ -2512,6 +3020,14 @@ func (r *Runtime) TriggerOAuthLogout(serverName string) error {
 	// Clear OAuth token from persistent storage
 	if err := r.upstreamManager.ClearOAuthToken(serverName); err != nil {
 		return fmt.Errorf("failed to clear OAuth token: %w", err)
+	}
+
+	// GH #1172: the refresh schedule rides on the token that was just removed.
+	// Left behind, a failed schedule kept reporting the logged-out server as
+	// "Refresh token expired" instead of "Logged out" — the server-removal path
+	// already does this, logout did not.
+	if r.refreshManager != nil {
+		r.refreshManager.OnTokenCleared(serverName)
 	}
 
 	// Disconnect the server to force re-authentication
@@ -2637,6 +3153,17 @@ func (r *Runtime) GetVersionInfo() *updatecheck.VersionInfo {
 	return r.updateChecker.GetVersionInfo()
 }
 
+// UpdatePolicy returns the effective update policy (Spec 092 FR-015): the
+// kill-switch state, the release channel, and whether UI nudges are suppressed.
+// Without an update checker automatic checking cannot happen at all, which is
+// reported as an explicit disabled policy rather than as missing data.
+func (r *Runtime) UpdatePolicy() updatecheck.Policy {
+	if r.updateChecker == nil {
+		return updatecheck.UnavailablePolicy()
+	}
+	return r.updateChecker.Policy()
+}
+
 // RefreshVersionInfo performs an immediate update check and returns the result.
 // Returns nil if the update checker has not been initialized.
 func (r *Runtime) RefreshVersionInfo() *updatecheck.VersionInfo {
@@ -2690,6 +3217,14 @@ func (r *Runtime) SetTelemetry(version, edition string) {
 			diagStore := telemetry.NewDiagnosticsCounterStore()
 			r.telemetryService.SetDiagnosticsCounterStore(diagStore, db)
 
+			// Issue #969 (Phase 0): wire the preflight baseline counter store
+			// on the same DB, pre-creating its bucket for the same
+			// first-write-race reason as the diagnostics bucket above.
+			if err := telemetry.EnsurePreflightCountersBucket(db); err != nil {
+				r.logger.Warn("Failed to ensure preflight_counters bucket", zap.Error(err))
+			}
+			r.telemetryService.SetPreflightCounterStore(telemetry.NewPreflightCounterStore(), db)
+
 			// Wire error-code notifier into supervisor so every classified
 			// DiagnosticError increments the 24h per-code counter. Spec 080
 			// (US3, FR-012): the same stream also refreshes last_error_code —
@@ -2718,6 +3253,19 @@ func (r *Runtime) SetTelemetry(version, edition string) {
 					// supervisor re-entry, so no lock cycle even when the
 					// caller holds stateMu.
 					_ = diagStore.RecordErrorCode(db, code)
+				})
+
+				// MCP-2967: the notifier above is now EDGE-triggered inside
+				// the supervisor, so error_code_counts_24h counts new
+				// failures instead of re-counting standing ones every 30s
+				// reconcile tick. That alone would delete the "installs
+				// currently affected" signal — the 24h window decays and the
+				// whole diagnostics object is omitempty — so pair it with the
+				// standing state, recomputed from the live stateview at each
+				// heartbeat. No DB involved; codes only, no server names.
+				sup := r.supervisor
+				r.telemetryService.SetCurrentErrorCodesProvider(func() map[string]int {
+					return sup.CurrentErrorCodes()
 				})
 			}
 
@@ -2801,6 +3349,50 @@ func (r *Runtime) RecordRetrieveToolsCallForActivation() {
 	if err := store.IncrementRetrieveToolsCall(db); err != nil {
 		r.logger.Debug("activation: IncrementRetrieveToolsCall failed", zap.Error(err))
 	}
+}
+
+// --- Issue #969 (Phase 0): preflight baseline counters ---
+//
+// These forwarders keep internal/server unaware of BBolt, exactly like
+// RecordRetrieveToolsCallForActivation above. Each is nil-safe and the
+// telemetry service applies the event-time opt-out gate, so a counter is never
+// persisted for an install that has telemetry off.
+
+// RecordFilterDiagnosticsEmitted counts one retrieve_tools response that
+// attached a spec-094 filter_diagnostics block, plus that block's summed
+// per-reason-class counts.
+func (r *Runtime) RecordFilterDiagnosticsEmitted(missingAnnotation, explicit int) {
+	if r == nil || r.telemetryService == nil {
+		return
+	}
+	r.telemetryService.RecordFilterDiagnosticsEmitted(missingAnnotation, explicit)
+}
+
+// RecordFilterDiagnosticsFollowed counts one diagnostics block the agent acted
+// on within the same MCP session.
+func (r *Runtime) RecordFilterDiagnosticsFollowed() {
+	if r == nil || r.telemetryService == nil {
+		return
+	}
+	r.telemetryService.RecordFilterDiagnosticsFollowed()
+}
+
+// RecordAvailabilityBlock counts one policy block by its structured reason key
+// (closed enum; see telemetry.BlockReason*).
+func (r *Runtime) RecordAvailabilityBlock(reason string) {
+	if r == nil || r.telemetryService == nil {
+		return
+	}
+	r.telemetryService.RecordAvailabilityBlock(reason)
+}
+
+// RecordDiscoveryOmission counts one retrieve_tools response that withheld
+// locked/quarantined matches the caller could not see.
+func (r *Runtime) RecordDiscoveryOmission() {
+	if r == nil || r.telemetryService == nil {
+		return
+	}
+	r.telemetryService.RecordDiscoveryOmission()
 }
 
 // SetSessionClientResolver wires the session -> MCP client lookup that stamps
@@ -2936,7 +3528,53 @@ func (r *Runtime) GetConnectedServerCount() int {
 }
 
 // GetToolCount returns the total number of indexed tools (implements telemetry.RuntimeStats).
+//
+// This reads the Bleve index document count — one document per tool, durable
+// across restarts — rather than the upstream manager's per-client tool-count
+// cache. Reading that cache made the telemetry heartbeat report tool_count=0 for
+// installs that held a fully populated index: every indexing pass calls
+// InvalidateAllToolCountCaches() as its LAST step (see lifecycle.go), and the
+// only paths that refill the cache without re-zeroing it are UI/API-triggered
+// ListTools calls. The field metric was therefore biased toward installs whose
+// owner had opened the dashboard, which is not what "indexed tools" means.
+//
+// Per-profile indexes are not double-counted: RebuildProfileFromShared derives
+// each of them from this shared index, so the shared count is the superset.
+//
+// When the index CANNOT answer — it is closed, mid-reopen, or returned an
+// error — the last successful POSITIVE count is reported instead of falling
+// through to the upstream cache. That matters most at shutdown: Close()
+// performs a final graceful heartbeat flush (telemetryService.Stop), and the
+// upstream clients are disconnected by then, so the cache path would answer 0
+// for an install with a fully populated durable index — reintroducing the
+// exact structural zero this function was changed to remove. Close() also now
+// closes the index AFTER that flush, so this is defence in depth rather than
+// the only guard.
+//
+// A memoised ZERO is deliberately not preferred over the cache. Zero is only
+// ever memoised when the index genuinely held no tools at the last successful
+// read, and in that state the cache cannot produce the structural zero this
+// guard exists for — it can only report MORE (tools held by live clients that
+// the index has not caught up with yet), which is the closer answer. So the
+// guard protects the one value that is expensive to lose and lets the cache
+// arbitrate the empty case.
+//
+// The upstream cache is otherwise the fallback only for the case it is
+// actually right for: no index manager wired at all (unit tests, early
+// startup).
 func (r *Runtime) GetToolCount() int {
+	if r.indexManager != nil {
+		if count, err := r.indexManager.GetDocumentCount(); err == nil {
+			if count > uint64(math.MaxInt32) {
+				count = math.MaxInt32
+			}
+			r.lastToolCount.Store(int64(count))
+			return int(count)
+		}
+		if last := r.lastToolCount.Load(); last > 0 {
+			return int(last)
+		}
+	}
 	if r.upstreamManager == nil {
 		return 0
 	}
@@ -2952,6 +3590,32 @@ func (r *Runtime) GetRoutingMode() string {
 		return config.RoutingModeRetrieveTools
 	}
 	return r.cfg.RoutingMode
+}
+
+// GetToolResponseMode returns the retrieve_tools serialization mode as a closed
+// enum (implements telemetry.RuntimeStats, schema v10).
+//
+// Reads the LIVE snapshot via Config() rather than the legacy r.cfg field the
+// older getters use: these are hot-reloadable settings, and a heartbeat that
+// reported the value an operator had at startup would be measuring the wrong
+// thing precisely for the installs that experimented with the mode.
+func (r *Runtime) GetToolResponseMode() string {
+	cfg := r.Config()
+	if cfg == nil || cfg.ToolResponseMode == "" {
+		return config.ToolResponseModeFull
+	}
+	return cfg.ToolResponseMode
+}
+
+// GetDirectToolResponseMode returns the direct-surface serialization mode as a
+// closed enum (implements telemetry.RuntimeStats, schema v10). Live-snapshot
+// read, for the same reason as above.
+func (r *Runtime) GetDirectToolResponseMode() string {
+	cfg := r.Config()
+	if cfg == nil || cfg.DirectToolResponseMode == "" {
+		return config.DirectToolResponseModeFull
+	}
+	return cfg.DirectToolResponseMode
 }
 
 // IsQuarantineEnabled returns whether tool-level quarantine is enabled (implements telemetry.RuntimeStats).

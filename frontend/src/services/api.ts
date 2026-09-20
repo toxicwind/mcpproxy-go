@@ -1,4 +1,6 @@
-import type { APIResponse, Server, Tool, ToolApproval, SearchResult, StatusUpdate, SecretRef, MigrationAnalysis, ConfigSecretsResponse, GetToolCallsResponse, GetToolCallDetailResponse, GetServerToolCallsResponse, GetConfigResponse, ValidateConfigResponse, ConfigApplyResult, ServerTokenMetrics, GetRegistriesResponse, SearchRegistryServersResponse, RegistrySummary, GetSessionsResponse, GetSessionDetailResponse, InfoResponse, ActivityListResponse, ActivityDetailResponse, ActivitySummaryResponse, ImportResponse, AgentTokenInfo, CreateAgentTokenRequest, CreateAgentTokenResponse, RoutingInfo, ConnectStatusResponse, ClientStatus, ConnectResult, ConnectPreview, OnboardingStateResponse, OnboardingMarkRequest, DiagnosticFixResponse, GlobalToolsResponse, UsageAggregateResponse, UsageWindow, UsageSort, UsageStatus, ListProfilesResponse, ActiveProfileResponse } from '@/types'
+import type { APIResponse, Server, Tool, ToolApproval, SearchResult, StatusUpdate, SecretRef, MigrationAnalysis, ConfigSecretsResponse, GetToolCallsResponse, GetToolCallDetailResponse, GetServerToolCallsResponse, GetConfigResponse, ValidateConfigResponse, ConfigApplyResult, ServerTokenMetrics, GetRegistriesResponse, SearchRegistryServersResponse, RegistrySummary, GetSessionsResponse, GetSessionDetailResponse, InfoResponse, ActivityListResponse, ActivityDetailResponse, ActivityRecord, ActivitySummaryResponse, ImportResponse, AgentTokenInfo, CreateAgentTokenRequest, CreateAgentTokenResponse, RoutingInfo, ConnectStatusResponse, ClientStatus, ConnectResult, ConnectPreview, OnboardingStateResponse, OnboardingMarkRequest, DiagnosticFixResponse, GlobalToolsResponse, UsageAggregateResponse, UsageWindow, UsageSort, UsageStatus, ListProfilesResponse, ActiveProfileResponse } from '@/types'
+
+import { joinHoldEvidence, type HoldEvidenceSource } from '@/utils/holdEvidence'
 
 // Event types for API service
 export interface APIAuthEvent {
@@ -249,8 +251,12 @@ class APIService {
   // `default_instructions` is the resolved built-in MCP instructions default
   // (MCP-2175) — present once the backend exposes it; optional so the Web UI
   // degrades gracefully against older cores.
-  async getStatus(): Promise<APIResponse<{ edition: string; running: boolean; routing_mode: string; default_instructions?: string }>> {
-    return this.request<{ edition: string; running: boolean; routing_mode: string; default_instructions?: string }>('/api/v1/status')
+  //
+  // `activation` is the Spec 044 activation funnel snapshot the endpoint
+  // already serves to an admin caller (omitted for scoped agent tokens, and
+  // absent when telemetry is not yet wired) — hence optional all the way down.
+  async getStatus(): Promise<APIResponse<{ edition: string; running: boolean; routing_mode: string; default_instructions?: string; activation?: { first_real_tool_call_ever?: boolean } }>> {
+    return this.request<{ edition: string; running: boolean; routing_mode: string; default_instructions?: string; activation?: { first_real_tool_call_ever?: boolean } }>('/api/v1/status')
   }
 
   // Routing mode endpoint
@@ -392,11 +398,24 @@ class APIService {
     return this.request<GlobalToolsResponse>('/api/v1/tools')
   }
 
-  // Tool-level quarantine (Spec 032)
+  // Tool-level quarantine (Spec 032) + scan-gate hold evidence (Spec 088).
+  //
+  // The record source stays `/tools/export`: those approval records are durable,
+  // so pending/blocked tools remain visible when a server is disconnected or the
+  // index is empty. That payload carries no held_* evidence, so the inventory
+  // endpoint `/tools` is fetched in parallel purely as ENRICHMENT and joined by
+  // tool name. The enrichment call is caught individually and degrades to null —
+  // a failed evidence fetch must never drop a durable approval record.
   async getToolApprovals(serverName: string): Promise<APIResponse<{ tools: ToolApproval[], count: number }>> {
-    const response = await this.request<{ tools: ToolApproval[], count: number }>(`/api/v1/servers/${encodeURIComponent(serverName)}/tools/export`)
+    const encoded = encodeURIComponent(serverName)
+    const [response, enrichment] = await Promise.all([
+      this.request<{ tools: ToolApproval[], count: number }>(`/api/v1/servers/${encoded}/tools/export`),
+      this.request<{ tools: HoldEvidenceSource[] }>(`/api/v1/servers/${encoded}/tools`)
+        .catch(() => null),
+    ])
+
     if (response.success && response.data?.tools) {
-      response.data.tools = response.data.tools.map((tool) => {
+      const normalized = response.data.tools.map((tool) => {
         const disabled = typeof tool.disabled === 'boolean'
           ? tool.disabled
           : (typeof tool.enabled === 'boolean' ? !tool.enabled : false)
@@ -406,6 +425,8 @@ class APIService {
           enabled: !disabled,
         }
       })
+      const evidence = enrichment?.success ? enrichment.data?.tools ?? null : null
+      response.data.tools = joinHoldEvidence(normalized, evidence)
     }
     return response
   }
@@ -630,9 +651,15 @@ class APIService {
   }
 
   // Session management endpoints
-  async getSessions(limit?: number): Promise<APIResponse<GetSessionsResponse>> {
-    const url = `/api/v1/sessions${limit ? `?limit=${limit}` : ''}`
-    return this.request<GetSessionsResponse>(url)
+  // status narrows the listing server-side ('active' | 'closed'). Without it the
+  // backend returns the most recent sessions of ANY status, so a small limit can
+  // be filled entirely by closed ones and hide a live client (audit F10).
+  async getSessions(limit?: number, status?: 'active' | 'closed'): Promise<APIResponse<GetSessionsResponse>> {
+    const params = new URLSearchParams()
+    if (limit) params.set('limit', String(limit))
+    if (status) params.set('status', status)
+    const query = params.toString()
+    return this.request<GetSessionsResponse>(`/api/v1/sessions${query ? `?${query}` : ''}`)
   }
 
   async getSessionDetail(sessionId: string): Promise<APIResponse<GetSessionDetailResponse>> {
@@ -920,6 +947,10 @@ class APIService {
     session_id?: string
     status?: string
     intent_type?: string
+    /** Sub-calls of one code_execution run: the parent record's request_id. */
+    parent_id?: string
+    /** Exact correlation id — used to jump from a sub-call back to its parent. */
+    request_id?: string
     start_time?: string
     end_time?: string
     limit?: number
@@ -935,6 +966,23 @@ class APIService {
     }
     const url = `/api/v1/activity${searchParams.toString() ? '?' + searchParams.toString() : ''}`
     return this.request<ActivityListResponse>(url)
+  }
+
+  // Spec 107 FR-041/FR-043(k), T086/T088: the tenant-scoped twin of
+  // getActivities() above — the core `/activity*` doors 403 a session
+  // principal (contracts/rest-endpoints.md); a tenant reads their own
+  // records, entitled-server-filtered, from this door instead. Response
+  // shape is `{items,total}` with only `limit`/`offset` (no type/server/etc.
+  // query params — those apply client-side in Activity.vue, same as today).
+  async getUserActivity(params?: { limit?: number; offset?: number }): Promise<APIResponse<{ items: ActivityRecord[]; total: number }>> {
+    const searchParams = new URLSearchParams()
+    if (params) {
+      Object.entries(params).forEach(([key, value]) => {
+        if (value !== undefined) searchParams.append(key, String(value))
+      })
+    }
+    const url = `/api/v1/user/activity${searchParams.toString() ? '?' + searchParams.toString() : ''}`
+    return this.request<{ items: ActivityRecord[]; total: number }>(url)
   }
 
   async getActivityDetail(id: string): Promise<APIResponse<ActivityDetailResponse>> {
@@ -971,6 +1019,8 @@ class APIService {
     type?: string
     server?: string
     status?: string
+    /** Export only the sub-calls of one code_execution run. */
+    parent_id?: string
     start_time?: string
     end_time?: string
     include_bodies?: boolean

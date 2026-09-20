@@ -46,6 +46,11 @@ type MetricsManager struct {
 
 	// Quarantine event metrics (MCP-32)
 	quarantineEvents *prometheus.CounterVec
+
+	// Concurrency limiter metrics (spec 093, FR-013)
+	toolCallsRejected *prometheus.CounterVec
+	concurrencyQueued *prometheus.GaugeVec
+	concurrencyActive *prometheus.GaugeVec
 }
 
 // NewMetricsManager creates a new metrics manager
@@ -234,6 +239,31 @@ func (mm *MetricsManager) initMetrics() {
 		},
 		[]string{"scope", "action"},
 	)
+
+	// Concurrency limiter metrics (spec 093, FR-013)
+	mm.toolCallsRejected = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "mcpproxy_tool_calls_rejected_total",
+			Help: "Total number of tool calls shed by a concurrency limit",
+		},
+		[]string{"server", "reason", "scope"},
+	)
+
+	mm.concurrencyQueued = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "mcpproxy_concurrency_queue_depth",
+			Help: "Tool calls currently waiting for a concurrency slot",
+		},
+		[]string{"scope", "server"},
+	)
+
+	mm.concurrencyActive = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "mcpproxy_concurrency_active",
+			Help: "Tool calls currently holding a concurrency slot",
+		},
+		[]string{"scope", "server"},
+	)
 }
 
 // registerMetrics registers all metrics with the registry
@@ -264,11 +294,69 @@ func (mm *MetricsManager) registerMetrics() {
 		mm.oauthRefreshDuration,
 		// Quarantine event metrics (MCP-32)
 		mm.quarantineEvents,
+		// Concurrency limiter metrics (spec 093)
+		mm.toolCallsRejected,
+		mm.concurrencyQueued,
+		mm.concurrencyActive,
 	)
 
 	// Also register Go runtime metrics
 	mm.registry.MustRegister(collectors.NewGoCollector())
 	mm.registry.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
+}
+
+// auditFailureSource is the minimal surface RegisterAuditSink needs from
+// audit.Sink (declared locally to avoid an import cycle risk between
+// internal/observability and internal/audit).
+type auditFailureSource interface {
+	WriteFailures() uint64
+}
+
+// RegisterAuditSink wires the Spec 107 audit sink's always-on write-failure
+// counter into Prometheus as mcpproxy_audit_write_failures_total (T109,
+// FR-018). It is a CounterFunc reading sink.WriteFailures() directly -
+// monotonic by construction, so it can never regress into looking like a
+// gauge, and it needs no separate bookkeeping to stay in sync with the sink's
+// own atomic counter. Safe to call at most once per sink (a second call on
+// the same registry panics via MustRegister, same as every other metric
+// here); server.go only calls it when a sink exists.
+func (mm *MetricsManager) RegisterAuditSink(sink auditFailureSource) {
+	if sink == nil {
+		return
+	}
+	mm.registry.MustRegister(prometheus.NewCounterFunc(
+		prometheus.CounterOpts{
+			Name: "mcpproxy_audit_write_failures_total",
+			Help: "Total number of audit-log lines that failed to write since the sink was constructed",
+		},
+		func() float64 { return float64(sink.WriteFailures()) },
+	))
+}
+
+// auditSanitizerSource is the minimal surface RegisterAuditSanitizer needs
+// from audit.Sink (declared locally, same reasoning as auditFailureSource).
+type auditSanitizerSource interface {
+	SanitizerHits() uint64
+}
+
+// RegisterAuditSanitizer wires the Spec 107 audit sink's always-on
+// defence-in-depth sanitizer-hit counter into Prometheus as
+// mcpproxy_audit_sanitizer_hits_total (contracts/audit-line-events.md
+// "Redaction (FR-015)"). A hit means the whole-line pass caught a
+// credential-shaped string that a builder bug let past per-field masking;
+// it should read zero for the life of a healthy process. Safe to call at
+// most once per sink; server.go only calls it when a sink exists.
+func (mm *MetricsManager) RegisterAuditSanitizer(sink auditSanitizerSource) {
+	if sink == nil {
+		return
+	}
+	mm.registry.MustRegister(prometheus.NewCounterFunc(
+		prometheus.CounterOpts{
+			Name: "mcpproxy_audit_sanitizer_hits_total",
+			Help: "Total number of audit-log lines where the defence-in-depth whole-line sanitizer masked a credential-shaped string that per-field masking missed",
+		},
+		func() float64 { return float64(sink.SanitizerHits()) },
+	))
 }
 
 // Handler returns an HTTP handler for the /metrics endpoint
@@ -421,4 +509,38 @@ func (mm *MetricsManager) RecordOAuthRefreshDuration(server, result string, dura
 // quarantined, lifted, pending, changed, approved).
 func (mm *MetricsManager) RecordQuarantineEvent(scope, action string) {
 	mm.quarantineEvents.WithLabelValues(scope, action).Inc()
+}
+
+// RecordToolCallRejected counts one call shed by a concurrency limiter (spec
+// 093 FR-013). reason is queue_full | queue_timeout; scope is server | global.
+// server is the call's TARGET even for a global shed — a rejection an operator
+// cannot attribute to a workload is not actionable.
+func (mm *MetricsManager) RecordToolCallRejected(server, reason, scope string) {
+	if mm == nil || mm.toolCallsRejected == nil {
+		return
+	}
+	mm.toolCallsRejected.WithLabelValues(server, reason, scope).Inc()
+}
+
+// SetConcurrencyDepth publishes one scope's live occupancy: how many calls are
+// running and how many are waiting for a slot (spec 093 FR-013). Sampled
+// periodically rather than written on every acquire/release — the gauges exist
+// to show sustained saturation, and per-call writes would put a metrics
+// mutex on the hot path.
+func (mm *MetricsManager) SetConcurrencyDepth(scope, server string, running, queued int) {
+	if mm == nil || mm.concurrencyQueued == nil {
+		return
+	}
+	mm.concurrencyActive.WithLabelValues(scope, server).Set(float64(running))
+	mm.concurrencyQueued.WithLabelValues(scope, server).Set(float64(queued))
+}
+
+// ResetConcurrencyDepth drops every concurrency gauge series. Called before a
+// fresh sample so a server that has been removed stops reporting a stale depth.
+func (mm *MetricsManager) ResetConcurrencyDepth() {
+	if mm == nil || mm.concurrencyQueued == nil {
+		return
+	}
+	mm.concurrencyActive.Reset()
+	mm.concurrencyQueued.Reset()
 }

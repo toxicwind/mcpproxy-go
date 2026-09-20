@@ -311,7 +311,14 @@ func outputDiagnostics(diag map[string]interface{}, info map[string]interface{},
 					releaseURL := getStringField(updateInfo, "release_url")
 
 					if updateAvailable && latestVersion != "" {
-						fmt.Printf("Version: %s (update available: %s)\n", version, latestVersion)
+						// Spec 079 FR-002: the same daemon-rendered delta
+						// clause status prints, so the two surfaces cannot
+						// word it differently. Absent from an older daemon.
+						behind := ""
+						if b := getStringField(updateInfo, "behind_summary"); b != "" {
+							behind = ", " + b
+						}
+						fmt.Printf("Version: %s (update available: %s%s)\n", version, latestVersion, behind)
 						if releaseURL != "" {
 							fmt.Printf("Download: %s\n", releaseURL)
 						}
@@ -610,7 +617,11 @@ func displaySecurityFeaturesStatus() {
 	if routingMode == "" {
 		routingMode = config.RoutingModeRetrieveTools
 	}
-	fmt.Printf("  Routing Mode: %s\n", routingMode)
+	// Labelled "configured" on purpose: this function reads the config FILE, and
+	// /mcp binds its routing mode at startup — a mode saved but not yet adopted
+	// (or hand-edited into the file) is not what a running daemon is serving.
+	// `mcpproxy status` asks the daemon and reports the served one.
+	fmt.Printf("  Routing Mode (configured): %s\n", routingMode)
 	switch routingMode {
 	case config.RoutingModeDirect:
 		fmt.Println("    All upstream tools exposed directly via /mcp endpoint")
@@ -620,6 +631,7 @@ func displaySecurityFeaturesStatus() {
 		fmt.Println("    BM25 search via retrieve_tools + call_tool variants")
 	}
 	fmt.Printf("    Endpoints: /mcp/all (direct), /mcp/code (code_execution), /mcp/call (retrieve_tools)\n")
+	fmt.Println("    A running daemon keeps serving the mode it started with — `mcpproxy status` reports that one")
 	fmt.Println()
 
 	// Sensitive Data Detection status

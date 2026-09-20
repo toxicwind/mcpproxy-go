@@ -43,7 +43,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
         with:
-          go-version: "1.25"
+          go-version: "1.26"
           cache: true
 
       # Node ≥20 is required both for the npx-launched MCP reference servers
@@ -56,7 +56,31 @@ jobs:
           cache-dependency-path: bench/tscg/package-lock.json
 
       - name: Set up uv (uvx-launched MCP reference servers)
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # v10.1.0
+
+      # tiktoken (bench/tokens.go) fetches its BPE vocabulary from a remote host
+      # the first time an encoding is loaded, unless TIKTOKEN_CACHE_DIR points at
+      # a directory that already holds it. Naming the directory does not fill it,
+      # so the restore below is the half that actually buys offline reproduction:
+      # on a hit the vocabulary is on disk before the first bench run, on a miss
+      # the run fetches it once and the post-job save publishes it for next time.
+      # Kept under RUNNER_TEMP so the vocabulary never lands in the working tree
+      # that Cloudflare Pages publishes.
+      - name: Configure tiktoken vocabulary cache
+        run: |
+          mkdir -p "$RUNNER_TEMP/tiktoken"
+          echo "TIKTOKEN_CACHE_DIR=$RUNNER_TEMP/tiktoken" >> "$GITHUB_ENV"
+
+      # Keyed on bench/tokens.go because that file pins the encoding name
+      # (DefaultEncoding = cl100k_base); the prefix restore-key still serves an
+      # unrelated edit to that file, at worst re-fetching one vocabulary.
+      - name: Restore tiktoken vocabulary cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ${{ runner.temp }}/tiktoken
+          key: ${{ runner.os }}-tiktoken-${{ hashFiles('bench/tokens.go') }}
+          restore-keys: |
+            ${{ runner.os }}-tiktoken-
 
       - name: Build mcpproxy (personal edition)
         run: go build -o mcpproxy ./cmd/mcpproxy
@@ -187,7 +211,7 @@ jobs:
       # as a publishable artifact (FR-013, license unstated upstream).
       - name: Upload dashboard artifact
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: bench-dashboard-${{ github.ref_name }}
           path: |
@@ -243,11 +267,27 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
         with:
-          go-version: "1.25"
+          go-version: "1.26"
           cache: true
 
       - name: Set up uv (ToolRet parquet fetch)
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # v10.1.0
+
+      # Same tiktoken vocabulary cache as the dashboard job above (this job also
+      # runs the bench binary, so it needs the vocabulary on disk); see there for
+      # why naming the directory is not enough on its own.
+      - name: Configure tiktoken vocabulary cache
+        run: |
+          mkdir -p "$RUNNER_TEMP/tiktoken"
+          echo "TIKTOKEN_CACHE_DIR=$RUNNER_TEMP/tiktoken" >> "$GITHUB_ENV"
+
+      - name: Restore tiktoken vocabulary cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ${{ runner.temp }}/tiktoken
+          key: ${{ runner.os }}-tiktoken-${{ hashFiles('bench/tokens.go') }}
+          restore-keys: |
+            ${{ runner.os }}-tiktoken-
 
       # Pinned HF revisions live inside the script; bumping a pin is a
       # reviewed event. Cache lands in bench/results/cache/toolret/<revision>/.
@@ -269,7 +309,7 @@ jobs:
       # Report only — never the cache (FR-013).
       - name: Upload ToolRet subset report
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: bench-toolret-subset-${{ github.run_id }}
           path: |

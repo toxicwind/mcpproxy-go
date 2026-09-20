@@ -2,6 +2,7 @@ package managed
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -9,6 +10,9 @@ import (
 	"time"
 
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/diagnostics"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/diagnostics/hints"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/oauth"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/secret"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/storage"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/transport"
@@ -78,12 +82,27 @@ type Client struct {
 	// Tool discovery callback for notifications/tools/list_changed handling
 	toolDiscoveryCallback func(ctx context.Context, serverName string) error
 
+	// Prompts-changed callback for notifications/prompts/list_changed handling (F13)
+	promptsChangedCallback func(serverName string)
+
 	// consecutiveHealthFailures counts back-to-back transient health-check
 	// failures. The state-machine only flips to Error once it reaches
 	// healthCheckFailureThreshold; one success resets it. Hard failures
 	// (connection refused, no such host, unreachable) bypass the counter
 	// and trigger Error immediately. See recordHealthCheckFailure().
 	consecutiveHealthFailures int
+
+	// toolInvoker is the tools/call surface CallTool dispatches through. In
+	// production it is the coreClient; the narrow interface lets tests inject a
+	// fake outcome so the call-path error classification (GH #965) is testable
+	// without a live upstream. When nil it falls back to coreClient
+	// (hand-constructed clients in tests).
+	toolInvoker toolCaller
+
+	// ambiguousProbeInFlight gates the async liveness probe fired after an
+	// ambiguous tools/call cancellation (GH #965) so a burst of canceled calls
+	// results in at most one probe against the upstream.
+	ambiguousProbeInFlight atomic.Bool
 
 	// healthProbe is the liveness surface the background health loop uses. In
 	// production it is the coreClient (a lightweight MCP `ping`, spec 074); the
@@ -99,6 +118,189 @@ type Client struct {
 	// calculator so the UI shows a proactive Sign-in CTA instead of "Ready". A
 	// successful call or a fresh Connect clears it. MCP-2084.
 	oauthCallRequired atomic.Bool
+
+	// connectionEpoch is bumped on every successful connect. It identifies the
+	// current connection generation so detached goroutines (the ambiguous-call
+	// liveness probe) can tell whether the session they observed is still the
+	// live one: coreClient is created once and never replaced, so pointer
+	// identity proves nothing, and a disconnect+reconnect leaves the state
+	// machine back at Ready — indistinguishable from "never left". A stale
+	// verdict must not be applied to a brand-new healthy session (GH #965
+	// review).
+	//
+	// Values are drawn from the PROCESS-WIDE counter below, never restarted per
+	// client: a replacement client instance installed under the same server
+	// name (remove + re-add, config reload) must not restart at the epoch a
+	// discovery stamp was certified against, or an epoch-pinned dispatch would
+	// match the new instance's first connection and send a stale name to it
+	// (Spec 105 FR-009, codex review round 8).
+	connectionEpoch atomic.Int64
+
+	// epochMu serializes the probe goroutine's final epoch-check-and-SetError
+	// with Connect's epoch bump. Without it a reconnect could complete between
+	// the probe's staleness check and its SetError, letting a stale verdict
+	// evict the new session (GH #965 review, rounds 2-3). Lock invariant:
+	// epochMu is never held across code that can run foreign callbacks —
+	// TransitionTo invokes its state-change callback SYNCHRONOUSLY and so must
+	// stay outside; SetError dispatches its callback in a goroutine, so the
+	// probe may call it under epochMu.
+	epochMu sync.Mutex
+
+	// admission carries the spec-093 concurrency limiter registry and the
+	// rejection observer installed by the manager. Nil (the default) means no
+	// admission control at all — the zero-config behaviour (FR-006). Swapped
+	// atomically so a hot reload can republish the wiring without a lock; see
+	// admission.go.
+	admission atomic.Pointer[admissionControl]
+
+	// inFlightMu guards inFlightCalls and inFlightSuppressionSince as ONE
+	// coherent pair (#1317 round 3 review): a plain mutex, not two
+	// independent atomics, so "the last call ends, count hits 0, the
+	// suppression clock resets" and "a new call begins, checks the clock"
+	// can never interleave — one always fully precedes the other. A
+	// beginInFlightCall()/end() pair replaces the old raw Add(1)/Add(-1),
+	// and hasInFlightToolCall/trackInFlightSuppression/
+	// resetInFlightSuppression all take this same lock.
+	inFlightMu sync.Mutex
+	// inFlightCalls counts callTool() invocations currently accepted for
+	// dispatch (from just after the connectivity check, through the
+	// admission-control wait, to the transport call returning). The
+	// background health check and tryReconnect() consult it (#1317): a
+	// stdio upstream serves one JSON-RPC exchange at a time on its own
+	// process, so a legitimately slow call (e.g. a human consent prompt the
+	// upstream is blocked on) can make the health loop's concurrent `ping`
+	// time out too. Without this counter that reads as 3 consecutive
+	// transient failures, flips the server to Error, and tryReconnect() then
+	// disconnects — killing the very process the in-flight call is still
+	// waiting on, destroying any state (like that consent) it held.
+	inFlightCalls int
+	// inFlightSuppressionSince is the moment the first transient ping
+	// failure was tolerated, in the CURRENT unbroken streak of such
+	// failures, purely because a call was in flight (#1317). Nil means no
+	// streak is open. Bounds trackInFlightSuppression's cap: reset to nil
+	// the moment a ping succeeds or inFlightCalls reaches 0, so the cap
+	// always measures one continuous busy period, never accumulated idle
+	// time.
+	inFlightSuppressionSince *time.Time
+}
+
+// inFlightSuppressionCap bounds how long consecutive transient ping
+// failures can be tolerated solely because a tool call is in flight
+// (#1317). Generous relative to the default CallToolTimeout (2m) so a
+// legitimately slow interactive call -- e.g. one blocked on a human consent
+// prompt -- survives, but finite: a caller that keeps a call perpetually in
+// flight (immediate back-to-back retries, or overlapping calls with no
+// gap) must not suppress eviction of a truly dead upstream forever.
+//
+// A var, not a const, so tests can shrink it instead of sleeping 15
+// real-world minutes to exercise the cap.
+var inFlightSuppressionCap = 15 * time.Minute
+
+// beginInFlightCall registers one in-flight callTool() invocation and
+// returns the func that ends it. Call defer end() immediately -- the
+// decrement-to-zero-then-reset happens atomically with respect to
+// hasInFlightToolCall/trackInFlightSuppression, all under inFlightMu.
+func (mc *Client) beginInFlightCall() (end func()) {
+	mc.inFlightMu.Lock()
+	mc.inFlightCalls++
+	mc.inFlightMu.Unlock()
+
+	var ended bool
+	return func() {
+		if ended {
+			return
+		}
+		ended = true
+		mc.inFlightMu.Lock()
+		mc.inFlightCalls--
+		if mc.inFlightCalls == 0 {
+			mc.inFlightSuppressionSince = nil
+		}
+		mc.inFlightMu.Unlock()
+	}
+}
+
+// hasInFlightToolCall reports whether at least one callTool() invocation is
+// currently accepted for dispatch.
+func (mc *Client) hasInFlightToolCall() bool {
+	mc.inFlightMu.Lock()
+	defer mc.inFlightMu.Unlock()
+	return mc.inFlightCalls > 0
+}
+
+// trackInFlightSuppression opens (on first call in a streak) or continues
+// the in-flight suppression window and reports how long it has been open
+// and whether that is still within inFlightSuppressionCap, alongside
+// whether a call is actually in flight right now (checked under the same
+// lock, so callers never act on a stale read from a separate call).
+func (mc *Client) trackInFlightSuppression() (elapsed time.Duration, withinCap, inFlight bool) {
+	mc.inFlightMu.Lock()
+	defer mc.inFlightMu.Unlock()
+	if mc.inFlightCalls == 0 {
+		return 0, false, false
+	}
+	now := time.Now()
+	if mc.inFlightSuppressionSince == nil {
+		mc.inFlightSuppressionSince = &now
+	}
+	// time.Since (not now.Sub, though equivalent here) makes the monotonic
+	// dependency explicit: elapsed must never regress on a backward
+	// wall-clock adjustment.
+	elapsed = time.Since(*mc.inFlightSuppressionSince)
+	return elapsed, elapsed < inFlightSuppressionCap, true
+}
+
+// resetInFlightSuppression closes the current suppression window (if any),
+// so the NEXT busy streak starts its own cap from zero rather than
+// inheriting elapsed time from an unrelated, already-finished one. Exposed
+// separately from beginInFlightCall's end() for the ping-succeeded path in
+// performHealthCheck, which has no call of its own to attribute the reset to.
+func (mc *Client) resetInFlightSuppression() {
+	mc.inFlightMu.Lock()
+	mc.inFlightSuppressionSince = nil
+	mc.inFlightMu.Unlock()
+}
+
+// guardReconnectAgainstInFlightCall is the #1317 in-flight-call protection
+// shared by every automatic reconnect path that would otherwise disconnect
+// unconditionally (tryReconnect, TryReconnectSync): defer disconnecting
+// while a tool call is in flight and the bounded suppression window
+// (trackInFlightSuppression) hasn't expired -- but ONLY when the recorded
+// error is the same transient/ambiguous signal performHealthCheck itself
+// tolerates. A hard connection failure or an OAuth error must still evict
+// immediately, in-flight call or not, exactly like performHealthCheck's own
+// policy -- reusing this guard unconditionally for every reconnect reason
+// was review round 2's finding. Returns true if the caller should return
+// now WITHOUT disconnecting.
+func (mc *Client) guardReconnectAgainstInFlightCall() bool {
+	info := mc.StateManager.GetConnectionInfo()
+	if info.IsOAuthError || !isTransientHealthCheckError(info.LastError) {
+		return false
+	}
+	elapsed, withinCap, inFlight := mc.trackInFlightSuppression()
+	if !inFlight {
+		return false
+	}
+	if withinCap {
+		mc.logger.Info("Reconnect deferred: a tool call is still in flight",
+			zap.String("server", mc.GetConfig().Name),
+			zap.Duration("suppressed_for", elapsed))
+		return true
+	}
+	mc.logger.Warn("Reconnecting despite an in-flight tool call: in-flight suppression cap exceeded",
+		zap.String("server", mc.GetConfig().Name),
+		zap.Duration("cap", inFlightSuppressionCap))
+	return false
+}
+
+// GuardReconnectAgainstInFlightCall exposes guardReconnectAgainstInFlightCall
+// to reconnect orchestration OUTSIDE this package (#1317 round 6):
+// Manager.RetryConnection in internal/upstream/manager.go disconnects and
+// reconnects a client directly (OAuth completion, config-change and
+// token-monitor triggers), bypassing tryReconnect/Connect/TryReconnectSync
+// entirely, so it needs the same guard before its own Disconnect() call.
+func (mc *Client) GuardReconnectAgainstInFlightCall() bool {
+	return mc.guardReconnectAgainstInFlightCall()
 }
 
 // livenessProber is the minimal core-client surface the health loop needs: a
@@ -106,6 +308,16 @@ type Client struct {
 type livenessProber interface {
 	Ping(ctx context.Context) error
 }
+
+// toolCaller is the minimal core-client surface CallTool needs. Mirrors
+// livenessProber: production wires the coreClient, tests inject a fake.
+type toolCaller interface {
+	CallTool(ctx context.Context, toolName string, args map[string]interface{}) (*mcp.CallToolResult, error)
+}
+
+// ambiguousProbeTimeout bounds the liveness probe fired after an ambiguous
+// tools/call cancellation. Matches the background health-check probe budget.
+const ambiguousProbeTimeout = 5 * time.Second
 
 // healthCheckFailureThreshold is the number of consecutive transient
 // health-check failures we tolerate before marking the server Error.
@@ -132,6 +344,7 @@ func NewClient(id string, serverConfig *config.ServerConfig, logger *zap.Logger,
 		storage:        storage,
 		stopMonitoring: make(chan struct{}),
 		healthProbe:    coreClient,
+		toolInvoker:    coreClient,
 	}
 	mc.cfg.Store(serverConfig)
 	mc.globalConfig.Store(globalConfig)
@@ -170,6 +383,23 @@ func NewClient(id string, serverConfig *config.ServerConfig, logger *zap.Logger,
 		}()
 	})
 
+	// Wire core prompts/list_changed notifications to the manager-level callback
+	// (F13). Unlike the tool-discovery callback (which runs a network ListTools
+	// and therefore spawns a goroutine), the manager callback only schedules a
+	// debounced refresh — non-blocking — so no goroutine is needed on mcp-go's
+	// notification goroutine here.
+	coreClient.SetOnPromptsChangedCallback(func(serverName string) {
+		mc.mu.RLock()
+		callback := mc.promptsChangedCallback
+		mc.mu.RUnlock()
+		if callback == nil {
+			mc.logger.Debug("No prompts-changed callback set - notification ignored",
+				zap.String("server", serverName))
+			return
+		}
+		callback(serverName)
+	})
+
 	return mc, nil
 }
 
@@ -203,7 +433,18 @@ func (mc *Client) Connect(ctx context.Context) error {
 	// that died silently (e.g., HTTP server timeout). Without this, core client
 	// rejects the connect attempt with "client already connected" error.
 	currentState := mc.StateManager.GetState()
-	if currentState == types.StateError || currentState == types.StateDisconnected {
+	if currentState == types.StateError || currentState == types.StateDisconnected || currentState == types.StatePendingAuth {
+		// #1317 round 5: Connect() is ALSO reached from Error state by the
+		// runtime's periodic backgroundConnections sweep (every 60s, via
+		// Manager.ConnectAll -> Client.Connect for any non-Ready, non-backed-off
+		// client) -- a third automatic path (besides tryReconnect and
+		// TryReconnectSync) that would otherwise disconnect unconditionally
+		// while a tool call is still in flight on the same connection. Same
+		// shared guard.
+		if mc.guardReconnectAgainstInFlightCall() {
+			mc.mu.Unlock()
+			return fmt.Errorf("connect deferred: a tool call is still in flight")
+		}
 		mc.logger.Debug("Disconnecting core client before reconnect to clear stale state",
 			zap.String("server", mc.GetConfig().Name),
 			zap.String("from_state", currentState.String()))
@@ -243,13 +484,22 @@ func (mc *Client) Connect(ctx context.Context) error {
 	defer mc.mu.Unlock()
 
 	if connectErr != nil {
+		// A rate-limited upstream (429, or 503 with a hint) told us when to come
+		// back. mcp-go flattened that response into connectErr's string, so the
+		// deadline comes from the recorder the transport RoundTripper fed (#1040).
+		// Stamp it BEFORE the SetError/SetOAuthError branches below so the
+		// ConnectionInfo their callbacks publish already carries the window.
+		mc.syncRetryAfterFromTransport()
+
 		// Check if this is a deferred OAuth requirement (pending user action)
 		if core.IsOAuthPending(connectErr) {
 			mc.logger.Info("⏳ OAuth authentication pending user action",
 				zap.String("server", mc.GetConfig().Name))
-			// Transition to PendingAuth state instead of Error
-			mc.StateManager.TransitionTo(types.StatePendingAuth)
-			mc.StateManager.SetError(connectErr)
+			// Park in PendingAuth. SetPendingAuth (not TransitionTo + SetError:
+			// SetError forces StateError and would immediately undo the park, so
+			// the supervisor kept redialing a login-blocked server every 30s —
+			// #1013).
+			mc.StateManager.SetPendingAuth(connectErr)
 			return fmt.Errorf("OAuth authentication pending: %w", connectErr)
 		}
 		// Check if this is an OAuth authorization requirement (not an error)
@@ -270,6 +520,20 @@ func (mc *Client) Connect(ctx context.Context) error {
 				zap.Bool("token_refresh_scenario", isRefreshScenario),
 				zap.Error(connectErr))
 			mc.StateManager.SetOAuthError(connectErr)
+		} else if code, parkable := mc.classifyConnectFailure(connectErr); parkable {
+			// Deterministic, unrecoverable AND proven so by a typed signal — a
+			// code we attached ourselves, or an errno from our own spawn syscall.
+			// Park it so the reconcile loop stops re-spawning a guaranteed
+			// failure every ladder tick — 55 byte-identical attempts over 19
+			// hours in GH #1145. diagnostics.ParkableCode, not IsPermanent: the
+			// classifier's string fallbacks match against the child's captured
+			// stderr, which can say "no such file or directory" for reasons that
+			// clear on their own.
+			mc.logger.Warn("Connection failed permanently — automatic reconnection will stop",
+				zap.String("server", mc.GetConfig().Name),
+				zap.String("code", string(code)),
+				zap.Error(connectErr))
+			mc.StateManager.SetTerminalError(connectErr, string(code))
 		} else {
 			mc.StateManager.SetError(connectErr)
 		}
@@ -278,6 +542,19 @@ func (mc *Client) Connect(ctx context.Context) error {
 
 	mc.logger.Debug("Core client Connect returned successfully",
 		zap.String("server", mc.GetConfig().Name))
+
+	// Open a new connection generation BEFORE exposing Ready. The bump is
+	// serialized under epochMu with the ambiguous-call probe's verdict block:
+	// once it lands, any stale probe (old epoch) drops its verdict, so the new
+	// session can never be evicted by a probe that observed the previous one.
+	// A stale verdict that wins the mutex first can only mark the still
+	// pre-Ready state, which the TransitionTo below immediately overrides.
+	// TransitionTo deliberately stays OUTSIDE the critical section — it invokes
+	// the state-change callback synchronously (types.go), and epochMu must
+	// never be held across foreign code (GH #965 review, rounds 2-3).
+	mc.epochMu.Lock()
+	mc.connectionEpoch.Store(nextConnectionEpoch())
+	mc.epochMu.Unlock()
 
 	// Transition to ready state only if not already ready
 	if mc.StateManager.GetState() != types.StateReady {
@@ -352,10 +629,23 @@ func (mc *Client) Disconnect() error {
 	// Stop background monitoring
 	mc.stopBackgroundMonitoring()
 
-	// Disconnect core client
-	if err := mc.coreClient.Disconnect(); err != nil {
-		mc.logger.Error("Core client disconnect failed", zap.Error(err))
+	// Disconnect core client. Nil only for hand-constructed test clients —
+	// the same fallback contract as toolInvoker/healthProbe.
+	if mc.coreClient != nil {
+		if err := mc.coreClient.Disconnect(); err != nil {
+			mc.logger.Error("Core client disconnect failed", zap.Error(err))
+		}
 	}
+
+	// Close this connection generation BEFORE resetting state, serialized with
+	// the ambiguous-call probe's verdict block. An in-flight probe either
+	// finishes its verdict first (its SetError is overridden by the Reset
+	// below) or observes the bumped epoch and drops the verdict — it can never
+	// flip the freshly Disconnected state back to Error (GH #965 review,
+	// round 4).
+	mc.epochMu.Lock()
+	mc.connectionEpoch.Store(nextConnectionEpoch())
+	mc.epochMu.Unlock()
 
 	// Reset state
 	mc.StateManager.Reset()
@@ -367,9 +657,34 @@ func (mc *Client) Disconnect() error {
 	return nil
 }
 
+// classifyConnectFailure resolves a failed connection attempt to a stable MCPX_*
+// code and reports whether that classification is strong enough to park the
+// server. It uses the SAME hints builder the supervisor uses for the status
+// view (internal/diagnostics/hints) so the retry decision and the message the
+// user reads can never disagree about, for instance, whether the server was
+// launched through Docker.
+func (mc *Client) classifyConnectFailure(err error) (diagnostics.Code, bool) {
+	cfg := mc.GetConfig()
+	return diagnostics.ParkableCode(err, hints.For(mc.GetGlobalConfig(), cfg, transport.DetermineTransportType(cfg)))
+}
+
 // IsConnected returns whether the client is ready for operations
 func (mc *Client) IsConnected() bool {
 	return mc.StateManager.IsReady()
+}
+
+// ConnectionEpoch returns the client's connection-instance token: a
+// monotonically increasing counter bumped on every successful Connect and on
+// every Disconnect (see connectionEpoch), so two observations that read the
+// same value were made on the SAME live connection. The runtime captures it
+// before listing a server's tools and the supervisor stamps it on the
+// discovery snapshot with ToolsDiscovered (stateview.ServerStatus.
+// DiscoveryEpoch); every tool-identity read compares the stamp with the live
+// value, so a discovery result that belongs to a previous connection can
+// never certify a name on the current one when the connection events were
+// dropped or lag (Spec 105 FR-009 "stale generation"; astra r2 C3).
+func (mc *Client) ConnectionEpoch() int64 {
+	return mc.connectionEpoch.Load()
 }
 
 // IsConnecting returns whether the client is in a connecting state
@@ -395,8 +710,17 @@ func (mc *Client) GetConfig() *config.ServerConfig {
 
 // SetConfig atomically swaps the server configuration. Lock-free; callers must
 // not hold mc.mu (they don't need to — the swap is atomic).
+//
+// Also pushes ExposePrompts down to the coreClient (PR #973 review, P2):
+// coreClient.config is set once at connect time and never reassigned, so
+// without this a hot-reloaded expose_prompts value would stay frozen at
+// whatever was in effect when the connection was created, until the next
+// reconnect-forcing change or restart.
 func (mc *Client) SetConfig(config *config.ServerConfig) {
 	mc.cfg.Store(config)
+	if mc.coreClient != nil {
+		mc.coreClient.SetExposePrompts(config.ExposePrompts)
+	}
 }
 
 // GetServerInfo returns server information
@@ -446,19 +770,29 @@ func (mc *Client) ShouldRetry() bool {
 	return mc.StateManager.ShouldRetry()
 }
 
-// IsDockerIsolated returns true if this server will use Docker isolation.
-// Used to select appropriate connect timeouts (Docker containers need more time for package installation).
-func (mc *Client) IsDockerIsolated() bool {
-	gc := mc.globalConfig.Load()
-	if gc == nil || gc.DockerIsolation == nil || !gc.DockerIsolation.Enabled {
-		return false
+// DependsOnDocker reports whether starting this server needs a working Docker
+// daemon, and therefore whether its connect budget has to absorb an image pull.
+// It is the ONLY input to the 3-minute connect-timeout floor
+// (Manager.resolveConnectTimeout).
+//
+// It delegates to config.ServerDependsOnDocker, which is built on the SAME
+// resolver the spawn path branches on, so the budget can never be chosen for a
+// launch shape the server will not have — while still covering the server whose
+// OWN command is `docker`, which the resolver deliberately reports as
+// mode=none (we must not double-wrap it) but which pays image-pull latency all
+// the same.
+//
+// It replaced a hand-rolled mirror of the two LEGACY booleans, which pre-date
+// isolation modes: a per-server `mode: "docker"` override is honoured at spawn
+// even over a legacy `enabled: false`, yet got the SHORT stdio timeout and
+// could be killed mid-pull; while `mode: "sandbox"` servers were handed the long
+// Docker budget they have no use for (GH #1142).
+func (mc *Client) DependsOnDocker() bool {
+	var global *config.DockerIsolationConfig
+	if gc := mc.globalConfig.Load(); gc != nil {
+		global = gc.DockerIsolation
 	}
-	// Check if server has isolation explicitly disabled
-	if mc.GetConfig().Isolation != nil && mc.GetConfig().Isolation.Enabled != nil && !*mc.GetConfig().Isolation.Enabled {
-		return false
-	}
-	// Only stdio servers with commands get Docker-isolated
-	return mc.GetConfig().Command != ""
+	return config.ServerDependsOnDocker(global, mc.GetConfig())
 }
 
 // SetUserLoggedOut marks that the user has explicitly logged out
@@ -470,6 +804,16 @@ func (mc *Client) SetUserLoggedOut(loggedOut bool) {
 // IsUserLoggedOut returns true if the user has explicitly logged out
 func (mc *Client) IsUserLoggedOut() bool {
 	return mc.StateManager.IsUserLoggedOut()
+}
+
+// ConnectedWithOAuth reports whether the live connection was established by
+// the OAuth auth strategy — i.e. the stored OAuth token is what authenticated
+// it. False when disconnected, when another strategy (static headers,
+// anonymous) won, or for a hand-constructed client with no core. The runtime
+// uses it to decide whether a stored token record is evidence about this
+// server at all (GH #1172).
+func (mc *Client) ConnectedWithOAuth() bool {
+	return mc.coreClient != nil && mc.coreClient.AuthStrategy() == core.AuthStrategyOAuth
 }
 
 // IsOAuthCallRequired reports whether a tools/call against this otherwise-
@@ -492,6 +836,15 @@ func (mc *Client) SetToolDiscoveryCallback(callback func(ctx context.Context, se
 	mc.mu.Lock()
 	defer mc.mu.Unlock()
 	mc.toolDiscoveryCallback = callback
+}
+
+// SetPromptsChangedCallback sets the callback invoked when a
+// notifications/prompts/list_changed notification is received from the upstream
+// server (F13).
+func (mc *Client) SetPromptsChangedCallback(callback func(serverName string)) {
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+	mc.promptsChangedCallback = callback
 }
 
 // acquireListToolsContext claims the in-progress flag for an upstream ListTools
@@ -619,7 +972,11 @@ func (mc *Client) runListToolsAsLeader(listCtx context.Context, release func() b
 	mc.publishListToolsResult(tools, err)
 
 	if err != nil {
-		mc.logger.Error("ListTools operation failed",
+		// Debug for the same reason as the core layer: this is the middle of
+		// three logs of one failure. A ListTools miss that matters is either
+		// re-logged by the caller or promoted by the isConnectionError branch
+		// just below, which raises a Warn AND moves the state machine.
+		mc.logger.Debug("ListTools operation failed",
 			zap.String("server", mc.GetConfig().Name),
 			zap.Error(err))
 
@@ -636,18 +993,158 @@ func (mc *Client) runListToolsAsLeader(listCtx context.Context, release func() b
 	return tools, nil
 }
 
+// ErrConnectionGenerationChanged is CallToolOnEpoch's refusal: the client's
+// connection generation is no longer the one the caller certified the tool
+// identity against, so the call was NOT sent. It is returned verbatim (never
+// wrapped with server context) so the dispatch paths can map it onto their
+// own unresolved-identity refusal with errors.Is.
+var ErrConnectionGenerationChanged = errors.New("connection generation changed since the tool identity was resolved")
+
 // CallTool executes a tool with error handling
 func (mc *Client) CallTool(ctx context.Context, toolName string, args map[string]interface{}) (*mcp.CallToolResult, error) {
+	return mc.callTool(ctx, toolName, args, nil)
+}
+
+// CallToolOnEpoch is CallTool pinned to the connection generation the caller
+// certified the tool identity against (Spec 105 FR-009 "stale generation";
+// codex r3 D2). The server-side identity check (resolveExactToolIdentity /
+// liveIdentityRefusal) validates a name, its tier and its approval hash on
+// ONE generation (ConnectionEpoch); this entry point makes the dispatch reach
+// the transport on that same generation, or not at all. The generation is
+// re-checked twice: cheaply on entry, and again AFTER the admission-control
+// queue wait — where a call can sit for seconds while a disconnect and a
+// reconnect complete — immediately before the transport, under epochMu, the
+// mutex Connect's and Disconnect's bumps take. A mismatch is refused with
+// ErrConnectionGenerationChanged and zero transport calls. A disconnected
+// client is refused the same way (Disconnect closes the generation), so a
+// reconnect can never happen inside a pinned dispatch.
+//
+// epochMu is never held across the transport (Client.epochMu's invariant), so
+// check→invoke is not atomic; the residual gap is the scheduling instant
+// between the unlock and the transport's own send, which no lock-free design
+// can close without holding the mutex across foreign code.
+func (mc *Client) CallToolOnEpoch(ctx context.Context, toolName string, args map[string]interface{}, expectedEpoch int64) (*mcp.CallToolResult, error) {
+	return mc.callTool(ctx, toolName, args, &expectedEpoch)
+}
+
+// generationIs reports whether the client is connected on exactly the
+// expected generation, read under epochMu so it cannot interleave with
+// Connect's or Disconnect's bump.
+func (mc *Client) generationIs(expectedEpoch int64) bool {
+	mc.epochMu.Lock()
+	defer mc.epochMu.Unlock()
+	return mc.IsConnected() && mc.connectionEpoch.Load() == expectedEpoch
+}
+
+// callTool is the shared body of CallTool and CallToolOnEpoch; expectedEpoch
+// nil means unpinned.
+func (mc *Client) callTool(ctx context.Context, toolName string, args map[string]interface{}, expectedEpoch *int64) (*mcp.CallToolResult, error) {
+	// A pinned call on a moved generation is refused before the connection
+	// check: a Disconnect bumps the epoch, so a dropped client fails here
+	// too, with the generation verdict rather than the not-connected one.
+	if expectedEpoch != nil && !mc.generationIs(*expectedEpoch) {
+		return nil, ErrConnectionGenerationChanged
+	}
 	if !mc.IsConnected() {
 		return nil, fmt.Errorf("client not connected (state: %s)", mc.StateManager.GetState().String())
 	}
 
-	result, err := mc.coreClient.CallTool(ctx, toolName, args)
+	// #1317 round 2: counted from HERE, before admission control, not just
+	// around the transport call below — a call already queued in
+	// acquireAdmission's wait is just as "in flight" from tryReconnect()'s
+	// point of view as one actively on the wire, and a health check or
+	// reconnect racing the admission wait must see it too.
+	// beginInFlightCall's end() decrements and, exactly on the transition to
+	// 0, resets the suppression clock -- under the SAME lock
+	// hasInFlightToolCall/trackInFlightSuppression use (#1317 round 3), so a
+	// health check or tryReconnect() can never observe a stale, already-
+	// expired clock left over from a streak that has actually ended.
+	endInFlightCall := mc.beginInFlightCall()
+	defer endInFlightCall()
+
+	// #1317 round 4: publish-then-revalidate. The FIRST connectivity check
+	// above and this registration are two separate reads with a gap between
+	// them, so a reconnect could read the counter as 0 in that exact gap and
+	// proceed to disconnect before the registration lands. Re-checking here,
+	// immediately after registering, closes it: either a reconnect's guard
+	// runs AFTER this registration (sees this call, defers per
+	// guardReconnectAgainstInFlightCall) or it ran BEFORE (this re-check then
+	// observes the state it already set, e.g. StateError -- tryReconnect
+	// never runs while still Ready, so the transition always precedes it).
+	// No mutex is held across Disconnect() or the transport to get this.
+	if expectedEpoch != nil {
+		if !mc.generationIs(*expectedEpoch) {
+			return nil, ErrConnectionGenerationChanged
+		}
+	} else if !mc.IsConnected() {
+		return nil, fmt.Errorf("client not connected (state: %s)", mc.StateManager.GetState().String())
+	}
+
+	// Spec 093 FR-003/FR-005: admission control sits here, above
+	// coreClient.CallTool (which is where the call_tool_timeout context is
+	// created), so queue waiting never consumes the execution budget and every
+	// in-process dispatch path is bounded by the same limits.
+	releaseSlot, err := mc.acquireAdmission(ctx, toolName)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseSlot()
+
+	// The queue wait is the window D2 names: re-check the generation after
+	// it, immediately before the transport (the deferred release returns the
+	// slot on refusal).
+	if expectedEpoch != nil && !mc.generationIs(*expectedEpoch) {
+		return nil, ErrConnectionGenerationChanged
+	}
+
+	invoker := mc.toolInvoker
+	if invoker == nil {
+		invoker = mc.coreClient
+	}
+
+	result, err := invoker.CallTool(ctx, toolName, args)
 	if err != nil {
 		mc.recordCallToolOAuthSignal(toolName, err)
-		// Check if it's a connection error and update state
-		if mc.isConnectionError(err) {
-			// Use different log levels based on error type
+		// A 429 answered to a tools/call is the same instruction as one answered
+		// to connect (#1040). Recording it here does NOT mark the server
+		// unhealthy — the classification below owns that — it only makes sure
+		// the hint survives into the state machine, where the reconnect gates
+		// can honour it if this upstream later needs redialing.
+		mc.syncRetryAfterFromTransport()
+		// GH #965: a canceled or timed-out CALL is not a dead SERVER. SetError
+		// flips the whole upstream to Error and burns a retry, evicting it for
+		// every other client — so only hard evidence of a broken transport may
+		// take that path. Classify, most-specific first.
+		switch {
+		case ctx.Err() != nil:
+			// The caller itself went away (HTTP client disconnect, per-request
+			// deadline). Call-scoped by definition — never touch server state.
+			mc.logger.Warn("Tool call canceled/deadline by caller; not marking server unhealthy",
+				zap.String("server", mc.GetConfig().Name),
+				zap.String("tool", toolName),
+				zap.Error(ctx.Err()))
+
+		case !mc.isConnectionError(err):
+			// Log non-connection errors at error level
+			mc.logger.Error("Tool call failed",
+				zap.String("server", mc.GetConfig().Name),
+				zap.String("tool", toolName),
+				zap.Error(err))
+
+		case isAmbiguousCancellationError(err):
+			// Cancellation surfaced from inside the transport while our caller
+			// context is still live (mcp-go internals, an HTTP client timeout,
+			// or remote error text). It could be a dead server or just a dropped
+			// request — probe asynchronously instead of evicting on a guess.
+			mc.logger.Warn("Tool call failed with an ambiguous cancellation; probing server liveness before marking it unhealthy",
+				zap.String("server", mc.GetConfig().Name),
+				zap.String("tool", toolName),
+				zap.Error(err))
+			mc.probeAfterAmbiguousCallError(err)
+
+		default:
+			// Hard evidence (connection refused/reset, broken pipe, dial i/o
+			// timeout…): the transport is genuinely broken — existing behavior.
 			if mc.isNormalReconnectionError(err) {
 				mc.logger.Warn("Tool call failed due to connection loss, will attempt reconnection",
 					zap.String("server", mc.GetConfig().Name),
@@ -661,12 +1158,6 @@ func (mc *Client) CallTool(ctx context.Context, toolName string, args map[string
 					zap.Error(err))
 			}
 			mc.StateManager.SetError(err)
-		} else {
-			// Log non-connection errors at error level
-			mc.logger.Error("Tool call failed",
-				zap.String("server", mc.GetConfig().Name),
-				zap.String("tool", toolName),
-				zap.Error(err))
 		}
 		return nil, err
 	}
@@ -699,6 +1190,123 @@ func (mc *Client) recordCallToolOAuthSignal(toolName string, err error) {
 			zap.String("server", mc.GetConfig().Name),
 			zap.String("tool", toolName))
 	}
+}
+
+// isAmbiguousCancellationError reports whether a tools/call error is a
+// cancellation/deadline signal rather than hard evidence that the transport is
+// broken (GH #965).
+//
+// These arrive with a live caller context — mcp-go cancelling internally, the
+// HTTP client's own timeout firing, or the remote echoing cancellation text —
+// so they say nothing definitive about the server's health. isConnectionError
+// matches them by substring today, which is what evicted the whole upstream on
+// a single client disconnect. It is deliberately NOT modified: ListTools, the
+// health loop and reconnect all rely on its current matching.
+func isAmbiguousCancellationError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+
+	errStr := err.Error()
+	// "cancelled" (British) is how mcp-go's sse.go spells it; the plain-text
+	// forms cover errors whose chain was stripped before reaching us.
+	for _, marker := range []string{"context canceled", "context cancelled", "context deadline exceeded"} {
+		if containsString(errStr, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// probeAfterAmbiguousCallError fires one bounded liveness probe after an
+// ambiguous tools/call cancellation (GH #965) and classifies the outcome:
+//
+//   - healthy probe → the call was merely canceled; the server is left untouched.
+//   - transient probe failure (deadline exceeded on the ping, momentary
+//     overload, or a non-connection error such as an upstream without `ping`)
+//     → nothing happens here. A busy upstream is precisely what produces slow
+//     calls and ambiguous cancellations, so a single missed 5s ping is not
+//     eviction-grade evidence; the background health loop owns transient
+//     failures and its healthCheckFailureThreshold consecutive-miss budget.
+//   - hard probe failure (connection refused/reset, broken pipe, no such
+//     host…) on the SAME connection generation → Error, as before.
+//
+// Runs asynchronously so the tool call returns immediately, and is gated to a
+// single in-flight probe so a burst of canceled calls cannot stampede the
+// upstream. The connection epoch captured before launching guards against a
+// disconnect+reconnect completing mid-probe: a verdict about a superseded
+// session is dropped rather than applied to the fresh one.
+func (mc *Client) probeAfterAmbiguousCallError(cause error) {
+	if !mc.ambiguousProbeInFlight.CompareAndSwap(false, true) {
+		return
+	}
+
+	epoch := mc.connectionEpoch.Load()
+
+	go func() {
+		defer mc.ambiguousProbeInFlight.Store(false)
+
+		if !mc.IsConnected() || mc.connectionEpoch.Load() != epoch {
+			return
+		}
+
+		prober := mc.healthProbe
+		if prober == nil {
+			if mc.coreClient == nil {
+				return
+			}
+			prober = mc.coreClient
+		}
+
+		// Derived from Background: the caller context that produced the
+		// ambiguous error is very likely already dead.
+		ctx, cancel := context.WithTimeout(context.Background(), ambiguousProbeTimeout)
+		defer cancel()
+
+		err := prober.Ping(ctx)
+		if err == nil {
+			mc.logger.Debug("Liveness probe after canceled tool call succeeded; server left untouched",
+				zap.String("server", mc.GetConfig().Name),
+				zap.NamedError("call_error", cause))
+			return
+		}
+
+		// Only hard transport evidence evicts. Transient failures are the
+		// background health loop's business — it counts consecutive misses
+		// instead of acting on one. consecutiveHealthFailures is deliberately
+		// NOT touched here: it is only synchronized for the monitor goroutine.
+		if !mc.isConnectionError(err) || isTransientHealthCheckError(err) {
+			mc.logger.Info("Liveness probe after canceled tool call failed transiently; leaving state to the background health loop",
+				zap.String("server", mc.GetConfig().Name),
+				zap.NamedError("call_error", cause),
+				zap.Error(err))
+			return
+		}
+
+		// The state may have moved on while the probe was in flight (disconnect,
+		// or a full reconnect that opened a new connection generation) — this
+		// verdict describes a session nobody is using any more. epochMu pairs
+		// this check-and-SetError with Connect's bump-and-Ready so a reconnect
+		// cannot complete between the check and the verdict (GH #965 review,
+		// round 2).
+		mc.epochMu.Lock()
+		defer mc.epochMu.Unlock()
+		if !mc.IsConnected() || mc.connectionEpoch.Load() != epoch {
+			mc.logger.Debug("Liveness probe after canceled tool call failed, but the connection it observed is gone; skipping",
+				zap.String("server", mc.GetConfig().Name),
+				zap.Error(err))
+			return
+		}
+
+		mc.logger.Warn("Liveness probe after canceled tool call failed with hard connection evidence; marking server unhealthy",
+			zap.String("server", mc.GetConfig().Name),
+			zap.NamedError("call_error", cause),
+			zap.Error(err))
+		mc.StateManager.SetError(err)
+	}()
 }
 
 func (mc *Client) cancelInFlightListTools() {
@@ -751,6 +1359,24 @@ func (mc *Client) cancelInFlightConnect() {
 	cancel()
 }
 
+// logSafeURL renders the configured upstream URL for a LOG FIELD, with its
+// credential-bearing query parameters and any userinfo password masked.
+//
+// Issue #1148, round 4: the deprecated-endpoint branch of onStateChange below
+// logged mc.GetConfig().URL verbatim, at Error level — the exact twin of the
+// connection_oauth.go site round 3 fixed, and it fires on every 410 Gone from a
+// server whose URL carries `?token=…`. The line goes to main.log and to the
+// per-server log, and `upstream_servers tail_log` hands the latter to any MCP
+// caller. Scheme, host, path and non-sensitive parameters survive, so the
+// "your URL needs updating" advice stays actionable.
+func (mc *Client) logSafeURL() string {
+	cfg := mc.GetConfig()
+	if cfg == nil {
+		return ""
+	}
+	return oauth.LogSafeURL(cfg.URL)
+}
+
 // onStateChange handles state transition events
 func (mc *Client) onStateChange(oldState, newState types.ConnectionState, info *types.ConnectionInfo) {
 	mc.logger.Info("State transition",
@@ -764,7 +1390,7 @@ func (mc *Client) onStateChange(oldState, newState types.ConnectionState, info *
 		if mc.isDeprecatedEndpointError(info.LastError) {
 			mc.logger.Error("⚠️ ENDPOINT DEPRECATED: Server URL needs to be updated",
 				zap.String("server", mc.GetConfig().Name),
-				zap.String("current_url", mc.GetConfig().URL),
+				zap.String("current_url", mc.logSafeURL()),
 				zap.String("error_type", "endpoint_deprecated"),
 				zap.String("action", "Update the server URL in your configuration"),
 				zap.String("hint", "The server may have migrated from /sse to /mcp - check the server's documentation"),
@@ -787,8 +1413,19 @@ func (mc *Client) onStateChange(oldState, newState types.ConnectionState, info *
 	}
 }
 
-// startBackgroundMonitoring starts monitoring the connection health
+// startBackgroundMonitoring starts monitoring the connection health.
+//
+// Idempotent: tryReconnect() re-enters Connect() after tearing down only the
+// core client, so this is reached again on every reconnect while the existing
+// monitor is still running (stopBackgroundMonitoring is only called from the
+// managed client's Disconnect()). Without this guard each reconnect leaked
+// another backgroundHealthCheck goroutine, multiplying the ListTools liveness
+// probes sent to the upstream server for the rest of the process's life.
 func (mc *Client) startBackgroundMonitoring() {
+	if mc.monitoringStarted {
+		return
+	}
+
 	// Mark that monitoring has been started
 	mc.monitoringStarted = true
 	mc.monitoringWG.Add(1)
@@ -974,8 +1611,51 @@ func (mc *Client) performHealthCheck() {
 	err := prober.Ping(ctx)
 
 	if err != nil {
+		// Pick up any rate-limit hint this ping's response carried, BEFORE the
+		// classification below (#1040). A 429 does not read as a connection
+		// error — isConnectionError matches transport-level failures, not HTTP
+		// statuses — so gating the sync on that branch would make it
+		// unreachable for exactly the case it exists for. Recording the window
+		// does not change the health verdict; it only stops the automatic
+		// reconnect paths from returning before the upstream said we may.
+		mc.syncRetryAfterFromTransport()
+
 		// Only mark as error if it's a real connection issue, not timeout during high activity
 		if mc.isConnectionError(err) {
+			// #1317: a transient ping failure while a tool call is in flight
+			// is fully explained by the upstream serving one JSON-RPC
+			// exchange at a time on the same stdio process — it is not
+			// evidence the connection is dead. Don't let it accumulate
+			// toward the eviction threshold; the in-flight call's own
+			// CallToolTimeout already bounds how long this can mask a truly
+			// dead upstream. Hard failures (connection refused/reset, broken
+			// pipe) still evict immediately below, in-flight call or not —
+			// that IS real evidence.
+			if isTransientHealthCheckError(err) {
+				elapsed, withinCap, inFlight := mc.trackInFlightSuppression()
+				switch {
+				case inFlight && withinCap:
+					mc.logger.Info("Health check ping failed while a tool call is in flight, tolerating",
+						zap.String("server", mc.GetConfig().Name),
+						zap.Duration("suppressed_for", elapsed),
+						zap.Error(err))
+					return
+				case inFlight:
+					mc.logger.Warn("In-flight suppression cap exceeded; resuming normal eviction accounting despite in-flight call",
+						zap.String("server", mc.GetConfig().Name),
+						zap.Duration("suppressed_for", elapsed),
+						zap.Duration("cap", inFlightSuppressionCap),
+						zap.Error(err))
+					// Deliberately fall through to the normal accounting
+					// below WITHOUT resetting the suppression clock -- a
+					// still-busy upstream must not re-enter tolerance
+					// mid-streak once the cap trips (that would defeat the
+					// cap). The clock only resets once inFlightCalls reaches
+					// 0 (beginInFlightCall's end(), or below on success).
+				}
+			} else {
+				mc.resetInFlightSuppression()
+			}
 			if mc.recordHealthCheckFailure(err) {
 				mc.logger.Warn("Health check failed repeatedly, marking as error",
 					zap.String("server", mc.GetConfig().Name),
@@ -997,6 +1677,7 @@ func (mc *Client) performHealthCheck() {
 		return
 	}
 
+	mc.resetInFlightSuppression()
 	mc.recordHealthCheckSuccess()
 	mc.logger.Debug("Health check passed successfully",
 		zap.String("server", mc.GetConfig().Name))
@@ -1012,6 +1693,30 @@ func (mc *Client) performHealthCheck() {
 // failures (connection refused, host unreachable, DNS gone) trigger Error
 // immediately because waiting buys nothing — the server is genuinely
 // unreachable and the user should see that.
+// syncRetryAfterFromTransport copies any rate-limit hint the transport
+// RoundTripper recorded for this upstream into the state machine, where both
+// reconnect gates can see it (#1040).
+//
+// It is called from every path that turns an upstream failure into Error state,
+// not just connect: a 429 answered to a tools/call or to the health-check ping
+// is just as much a "come back later" as one answered to initialize, and the
+// recorder is the only place that hint exists — mcp-go has already flattened
+// the response into a string by the time the error reaches us.
+func (mc *Client) syncRetryAfterFromTransport() {
+	if mc.coreClient == nil {
+		return
+	}
+	deadline := mc.coreClient.RetryAfterDeadline()
+	if deadline.IsZero() {
+		return
+	}
+	mc.logger.Warn("Upstream rate-limited us; parking reconnects until it says we may return",
+		zap.String("server", mc.GetConfig().Name),
+		zap.Time("retry_not_before", deadline),
+		zap.Duration("retry_after", time.Until(deadline)))
+	mc.StateManager.SetRetryAfter(deadline)
+}
+
 func (mc *Client) recordHealthCheckFailure(err error) bool {
 	mc.consecutiveHealthFailures++
 	if !isTransientHealthCheckError(err) {
@@ -1151,6 +1856,21 @@ func (mc *Client) tryReconnect() {
 		zap.String("server", mc.GetConfig().Name),
 		zap.String("current_state", mc.StateManager.GetState().String()))
 
+	// #1317: the health check's own in-flight check (performHealthCheck)
+	// happens BEFORE this point in time, so a call can start in the gap
+	// between that check and this reconnect attempt actually running. The
+	// only race-free place to guard the disconnect is right here,
+	// immediately before it: re-check now via guardReconnectAgainstInFlightCall,
+	// which shares the SAME bounded suppression window the health check
+	// itself uses, so a truly stuck call still eventually loses this
+	// protection. Skipping here just leaves reconnectInProgress cleared
+	// (deferred above) and StateError in place — the next health-check tick
+	// (or a fresh ForceReconnect) tries again, so this is a delay, not a
+	// permanently abandoned reconnect.
+	if mc.guardReconnectAgainstInFlightCall() {
+		return
+	}
+
 	// First, disconnect the current client to clean up any broken connections
 	// Cancel any in-flight connect/listTools before attempting reconnection
 	mc.cancelInFlightConnect()
@@ -1201,6 +1921,13 @@ func (mc *Client) tryReconnect() {
 // Unlike ForceReconnect which spawns a goroutine, this blocks until the reconnect
 // attempt completes or the context is cancelled. It uses the existing reconnectInProgress
 // flag to prevent concurrent reconnection storms.
+//
+// Shares the #1317 in-flight-call guard with tryReconnect (see
+// guardReconnectAgainstInFlightCall): IsConnected()==false above proves this
+// client isn't Ready right now, but NOT that every call on it is doomed —
+// an unrelated concurrent failure can flip state to Error while a genuinely
+// healthy CallTool is still in flight on the same connection (review round
+// 3 caught this: an earlier version of this comment assumed otherwise).
 //
 // Returns nil if reconnection succeeds, error otherwise.
 func (mc *Client) TryReconnectSync(ctx context.Context) error {
@@ -1253,6 +1980,16 @@ func (mc *Client) TryReconnectSync(ctx context.Context) error {
 
 	mc.logger.Info("TryReconnectSync: starting synchronous reconnect",
 		zap.String("server", serverName))
+
+	// #1317 round 3: IsConnected()==false above only proves this client
+	// isn't Ready right now -- not that every call on it is doomed. A
+	// concurrent, unrelated failure (e.g. a ListTools timeout) can flip
+	// state to Error while a genuinely healthy CallTool is still in flight
+	// on the same connection; reconnect-on-use (manager.go) then reaches
+	// this unconditional Disconnect() next. Same guard as tryReconnect().
+	if mc.guardReconnectAgainstInFlightCall() {
+		return fmt.Errorf("reconnect deferred: a tool call is still in flight")
+	}
 
 	// Disconnect stale state first
 	mc.cancelInFlightConnect()
@@ -1609,6 +2346,18 @@ func (mc *Client) GetContainerID() string {
 	return mc.coreClient.GetContainerID()
 }
 
+// ForceRemoveTrackedContainerIfOwned is the manager's disconnect-timeout
+// path: it removes the container tracked as containerID only after the core
+// client re-establishes canonical ownership (Spec 105 FR-007 / D9, codex
+// round 3) and hands back the owner label it read at that moment (codex
+// round 5). See core.Client.ForceRemoveTrackedContainerIfOwned.
+func (mc *Client) ForceRemoveTrackedContainerIfOwned(ctx context.Context, containerID string) (string, bool, error) {
+	if mc.coreClient == nil {
+		return "", false, nil
+	}
+	return mc.coreClient.ForceRemoveTrackedContainerIfOwned(ctx, containerID)
+}
+
 // setToolCountCache records the latest tool count and timestamp for non-blocking consumers.
 func (mc *Client) setToolCountCache(count int) {
 	mc.toolCountMu.Lock()
@@ -1621,3 +2370,11 @@ func (mc *Client) setToolCountCache(count int) {
 func (mc *Client) isDockerServer() bool {
 	return containsString(mc.GetConfig().Command, "docker")
 }
+
+// connectionEpochCounter hands out connection epochs to every managed client
+// in the process. It is process-wide so an epoch never repeats across client
+// instances that share a server name (see Client.connectionEpoch).
+var connectionEpochCounter atomic.Int64
+
+// nextConnectionEpoch returns a fresh, strictly increasing epoch.
+func nextConnectionEpoch() int64 { return connectionEpochCounter.Add(1) }

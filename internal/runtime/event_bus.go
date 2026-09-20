@@ -2,6 +2,8 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -164,7 +166,25 @@ const defaultEventBuffer = 256 // Increased from 16 to prevent event dropping wh
 func (r *Runtime) SubscribeEvents() chan Event {
 	ch := make(chan Event, defaultEventBuffer)
 	r.eventMu.Lock()
+	if r.eventSubs == nil {
+		r.eventSubs = make(map[chan Event]struct{})
+	}
 	r.eventSubs[ch] = struct{}{}
+	r.eventMu.Unlock()
+	return ch
+}
+
+// subscribeInternalEvents registers a trusted in-process subscriber. These
+// subscribers receive detector-only payload fields that must never reach SSE
+// or other ordinary event consumers. ActivityService is the only production
+// caller.
+func (r *Runtime) subscribeInternalEvents() chan Event {
+	ch := make(chan Event, defaultEventBuffer)
+	r.eventMu.Lock()
+	if r.internalEventSubs == nil {
+		r.internalEventSubs = make(map[chan Event]struct{})
+	}
+	r.internalEventSubs[ch] = struct{}{}
 	r.eventMu.Unlock()
 	return ch
 }
@@ -175,19 +195,46 @@ func (r *Runtime) UnsubscribeEvents(ch chan Event) {
 	if _, ok := r.eventSubs[ch]; ok {
 		delete(r.eventSubs, ch)
 		close(ch)
+	} else if _, ok := r.internalEventSubs[ch]; ok {
+		delete(r.internalEventSubs, ch)
+		close(ch)
 	}
 	r.eventMu.Unlock()
 }
 
 func (r *Runtime) publishEvent(evt Event) {
+	publicEvent := eventWithoutDetectorPayload(evt)
 	r.eventMu.RLock()
 	for ch := range r.eventSubs {
+		select {
+		case ch <- publicEvent:
+		default:
+		}
+	}
+	for ch := range r.internalEventSubs {
 		select {
 		case ch <- evt:
 		default:
 		}
 	}
 	r.eventMu.RUnlock()
+}
+
+// eventWithoutDetectorPayload returns the event representation safe for
+// ordinary subscribers. detection_text can contain the complete upstream
+// response beyond the activity display limit; only ActivityService needs it.
+func eventWithoutDetectorPayload(evt Event) Event {
+	if _, sensitive := evt.Payload["detection_text"]; !sensitive {
+		return evt
+	}
+	payload := make(map[string]any, len(evt.Payload)-1)
+	for key, value := range evt.Payload {
+		if key != "detection_text" {
+			payload[key] = value
+		}
+	}
+	evt.Payload = payload
+	return evt
 }
 
 // emitServersChanged signals that the server list (or any per-server stat)
@@ -316,38 +363,42 @@ func (r *Runtime) enrichServersWithQuarantineStats(servers []contracts.Server) {
 	}
 }
 
-// redactServerSecrets mirrors httpapi.(*Server).redactServerSecrets. It masks
-// the secret-bearing fields (sensitive headers, env-var secrets, URL query
-// credentials, and secrets echoed into last_error / health.detail) unless the
-// loaded config opts out via reveal_secret_headers: true. Keeping SSE
-// subscribers behind the exact same trust boundary as the REST list is
-// load-bearing: the Web UI's mergeServers treats each payload as authoritative,
-// so a masked-vs-plaintext mismatch between the two would flicker on every
-// delivery.
+// redactServerSecrets masks the secret-bearing fields of every server in an SSE
+// payload. ALWAYS - there is no opt-out on this door.
+//
+// Issue #1167. A payload produced ONCE for a mixed-privilege audience is
+// masked for the least-privileged member of that audience. This function has
+// no caller to gate against by construction: publishEvent fans one Event value
+// out to every subscriber channel under eventMu, and the subscribers are one
+// SSE connection per HTTP client (each with its own privilege level) plus
+// three in-process consumers. There is no request context at build time, and
+// the payload map and the []contracts.Server it holds are shared, so no
+// consumer may re-render it in place either. Emitting raw here and trusting
+// each consumer to mask is the fail-open shape #1167 is made of - it is how a
+// scoped, read-only agent token subscribed to /events and received every
+// server Authorization header, URL credential, argv secret and env secret in
+// the clear.
+//
+// The cost of that, for an operator who deliberately set the opt-in flag, is
+// paid at the per-subscriber seam instead: httpapi.renderEventPayloadForCaller
+// degrades this embed to the notify-only shape for a caller who MAY see raw
+// values, so the client re-fetches through the gated REST door and the two
+// doors stay in parity rather than flickering masked/raw.
+//
+// The field list AND the rules are oauth.RedactServerSecretFields — the same
+// function the REST list path calls, applying the same oauth.LiveRedaction the
+// MCP payloads are built from. It used to be a hand-copied MIRROR of that list,
+// which is exactly how `args` and `oauth.extra_params` came to be masked on the
+// MCP surface and published in the clear on both of these doors (issue #1148,
+// round 4 finding 3); sharing the list but not the value-shaped detector then
+// left a credential under a benign env/header name in the clear here (round 6
+// finding 2). Keeping SSE subscribers behind the exact same trust boundary as
+// the REST list is load-bearing: the Web UI's mergeServers treats each payload
+// as authoritative, so a masked-vs-plaintext mismatch between the two would
+// flicker on every delivery.
 func (r *Runtime) redactServerSecrets(servers []contracts.Server) {
-	cfg := r.Config()
-	if cfg != nil && cfg.RevealSecretHeaders {
-		return
-	}
 	for i := range servers {
-		if len(servers[i].Headers) > 0 {
-			servers[i].Headers = oauth.RedactStringHeaders(servers[i].Headers)
-		}
-		if len(servers[i].Env) > 0 {
-			servers[i].Env = oauth.RedactEnvValues(servers[i].Env)
-		}
-		if servers[i].URL != "" {
-			servers[i].URL = oauth.RedactURLQueryParams(servers[i].URL)
-		}
-		if servers[i].LastError != "" {
-			servers[i].LastError = oauth.RedactSensitiveData(servers[i].LastError)
-		}
-		if servers[i].Health != nil && servers[i].Health.Detail != "" {
-			servers[i].Health.Detail = oauth.RedactSensitiveData(servers[i].Health.Detail)
-		}
-		if servers[i].Diagnostic != nil && servers[i].Diagnostic.Cause != "" {
-			servers[i].Diagnostic.Cause = oauth.RedactSensitiveData(servers[i].Diagnostic.Cause)
-		}
+		oauth.RedactServerSecretFields(&servers[i])
 	}
 }
 
@@ -427,7 +478,9 @@ func (r *Runtime) EmitActivityToolCallStarted(serverName, toolName, sessionID, r
 // detectionText is the spec-084 pre-encoding sensitive-data scan input (FR-007b);
 // empty means "scan response as before" (feature off / non-call_tool_* paths)
 // toonOutput is the spec-084 per-block encoding decision metadata (FR-010) - optional
-func (r *Runtime) EmitActivityToolCallCompleted(serverName, toolName, sessionID, requestID, source, status, errorMsg string, durationMs int64, arguments map[string]interface{}, response string, responseTruncated bool, toolVariant string, intent map[string]interface{}, contentTrust, profile string, requestBytes, responseBytes int, detectionText string, toonOutput map[string]interface{}) {
+// parentID is the correlation id of the parent code_execution call for a
+// sandbox sub-call; empty for every top-level dispatch
+func (r *Runtime) EmitActivityToolCallCompleted(serverName, toolName, sessionID, requestID, source, status, errorMsg string, durationMs int64, arguments map[string]interface{}, response string, responseTruncated bool, toolVariant string, intent map[string]interface{}, contentTrust, profile string, requestBytes, responseBytes int, detectionText string, toonOutput map[string]interface{}, parentID string) {
 	// Spec 042: classify failed tool calls into the upstream error categories.
 	// We never record the error message itself; only a fixed enum value.
 	if status == "error" && errorMsg != "" {
@@ -490,11 +543,55 @@ func (r *Runtime) EmitActivityToolCallCompleted(serverName, toolName, sessionID,
 	if toonOutput != nil {
 		payload["toon_output"] = toonOutput
 	}
+	// Correlation id of the code_execution whose sandbox issued this sub-call.
+	// Only set when there IS a parent, so every top-level dispatch keeps the
+	// payload it emitted before — and the SSE /events stream, which forwards
+	// this map verbatim, carries parent_id for free.
+	if parentID != "" {
+		payload["parent_id"] = parentID
+	}
 	r.publishEvent(newEvent(EventTypeActivityToolCallCompleted, payload))
 }
 
+// EmitActivityToolCallRejected emits an event when a concurrency limiter shed a
+// tool call (spec 093 FR-012). This is the ORIGIN-INDEPENDENT rejection seam:
+// it is invoked from the limiter observer inside the managed client, so a shed
+// is recorded identically whether the call came from an MCP tool-call variant,
+// the REST endpoint, a sandboxed code-execution script or an activity replay.
+//
+// reason is queue_full | queue_timeout; scope is server | global.
+// Unlike every other activity emission, the RECORD is written synchronously
+// here rather than by the activity service's bus subscriber: publishEvent drops
+// events for any subscriber whose channel is full, and a burst of sheds is
+// precisely the load that fills it. The bus copy is still published, but only
+// so live subscribers (SSE, tray) see the rejection — the durable row no longer
+// depends on it.
+func (r *Runtime) EmitActivityToolCallRejected(serverName, toolName, source, requestID, reason, scope, message string, limit int, retryAfterMs, waitedMs int64) {
+	payload := map[string]any{
+		"server_name":    serverName,
+		"tool_name":      toolName,
+		"source":         source,
+		"request_id":     requestID,
+		"reason":         reason,
+		"scope":          scope,
+		"message":        message,
+		"limit":          limit,
+		"retry_after_ms": retryAfterMs,
+		"duration_ms":    waitedMs,
+	}
+	evt := newEvent(EventTypeActivityToolCallRejected, payload)
+	r.activityService.RecordToolCallRejected(evt)
+	r.publishEvent(evt)
+}
+
 // EmitActivityPolicyDecision emits an event when a policy blocks a tool call.
-func (r *Runtime) EmitActivityPolicyDecision(serverName, toolName, sessionID, decision, reason string) {
+//
+// requestID is the dispatch's correlation id, and it is what lets a consumer
+// recognise the live event and the record persisted from it as one thing rather
+// than two. Every other activity event already carries it; policy decisions
+// gained it in spec 090, so records written before then have none and must not
+// be correlated at all (FR-015) rather than correlated by an empty key.
+func (r *Runtime) EmitActivityPolicyDecision(serverName, toolName, sessionID, requestID, decision, reason string) {
 	// Spec 042: classify policy blocks as a tool quarantine error category.
 	// "blocked" decisions are user-visible reliability events worth counting.
 	if decision == "blocked" || decision == "block" {
@@ -505,6 +602,7 @@ func (r *Runtime) EmitActivityPolicyDecision(serverName, toolName, sessionID, de
 		"server_name": serverName,
 		"tool_name":   toolName,
 		"session_id":  sessionID,
+		"request_id":  requestID,
 		"decision":    decision,
 		"reason":      reason,
 	}
@@ -549,6 +647,23 @@ func (r *Runtime) EmitActivitySystemStop(reason, signal string, uptimeSeconds in
 // arguments contains the input parameters, response contains the output
 // intent is the intent declaration metadata
 func (r *Runtime) EmitActivityInternalToolCall(internalToolName, targetServer, targetTool, toolVariant, sessionID, requestID, status, errorMsg string, durationMs int64, arguments map[string]interface{}, response interface{}, intent map[string]interface{}, contentTrust string) {
+	r.EmitActivityInternalToolCallTruncated(internalToolName, targetServer, targetTool, toolVariant, sessionID, requestID, status, errorMsg, durationMs, arguments, response, intent, contentTrust, false)
+}
+
+// EmitActivityInternalToolCallTruncated is EmitActivityInternalToolCall for a
+// built-in whose RECORDED response is larger than the one the agent received.
+//
+// The non-internal path has carried this since Spec 024 (see the
+// "response_truncated" key in EmitActivityToolCallCompleted); the internal path
+// did not, and that asymmetry is a correctness problem rather than a cosmetic
+// one. retrieve_tools deliberately writes its FULL pre-truncation response to
+// the activity log while the agent consumed only the cut text, so a record that
+// does not say it was truncated is indistinguishable from a complete one.
+// Anything recomputing cost from the log then tokenizes text the agent never
+// paid for and OVERSTATES what mcpproxy cost — the one direction of error the
+// Spec 103 token benchmark exists to prevent, and one that cannot be detected
+// after the fact.
+func (r *Runtime) EmitActivityInternalToolCallTruncated(internalToolName, targetServer, targetTool, toolVariant, sessionID, requestID, status, errorMsg string, durationMs int64, arguments map[string]interface{}, response interface{}, intent map[string]interface{}, contentTrust string, responseTruncated bool) {
 	payload := map[string]any{
 		"internal_tool_name": internalToolName,
 		"session_id":         sessionID,
@@ -578,7 +693,58 @@ func (r *Runtime) EmitActivityInternalToolCall(internalToolName, targetServer, t
 	if contentTrust != "" {
 		payload["content_trust"] = contentTrust
 	}
+	// Always set, never omitempty-style conditional: absent and false must not be
+	// the same wire state here, because a consumer reading "no key" as "not
+	// truncated" is exactly the silent understatement this flag prevents.
+	payload["response_truncated"] = responseTruncated
+	// Spec 103: pre-truncation byte lengths, the same measure the upstream
+	// tool-call path carries. Every built-in call was unaccountable without
+	// these — 0 means UNKNOWN in the activity log, not free, so a cost
+	// recomputation had to withhold every internal row (bench records the gap
+	// as ReasonInternalNoByteCounts).
+	//
+	// `response` here is the FULL pre-truncation value (see the doc on
+	// MCPProxyServer.emitActivityInternalToolCallTruncated), which is exactly
+	// what response_bytes is defined to mean. When responseTruncated is set the
+	// agent consumed LESS than this, and the flag travelling beside it is what
+	// lets a consumer exclude the row rather than overstate mcpproxy's cost.
+	if n := jsonByteLen(arguments); n > 0 {
+		payload["request_bytes"] = n
+	}
+	if n := jsonByteLen(response); n > 0 {
+		payload["response_bytes"] = n
+	}
 	r.publishEvent(newEvent(EventTypeActivityInternalToolCall, payload))
+}
+
+// EmitActivityPromptGet emits an event when an upstream prompts/get completes
+// (Finding F10). serverName/promptName identify the prompt, arguments are the
+// prompt inputs, response is the *mcp.GetPromptResult (marshaled by the handler).
+func (r *Runtime) EmitActivityPromptGet(serverName, promptName, sessionID, requestID, status, errorMsg string, durationMs int64, arguments map[string]interface{}, response interface{}) {
+	payload := map[string]any{
+		"server_name":   serverName,
+		"prompt_name":   promptName,
+		"session_id":    sessionID,
+		"request_id":    requestID,
+		"status":        status,
+		"error_message": errorMsg,
+		"duration_ms":   durationMs,
+	}
+	if arguments != nil {
+		payload["arguments"] = arguments
+	}
+	if response != nil {
+		payload["response"] = response
+	}
+	r.publishEvent(newEvent(EventTypeActivityPromptGet, payload))
+}
+
+// emitUpstreamPromptsChanged signals that a connected upstream changed its
+// advertised prompt list at runtime (F13). Debounced by promptsRefreshDebouncer,
+// so it fires at most once per window regardless of how many upstreams changed.
+// server.listenForRoutingModeRefresh subscribes and calls RefreshPrompts once.
+func (r *Runtime) emitUpstreamPromptsChanged() {
+	r.publishEvent(newEvent(EventTypeUpstreamPromptsChanged, nil))
 }
 
 // EmitActivityConfigChange emits an event when configuration changes (Spec 024).
@@ -607,8 +773,9 @@ func (r *Runtime) EmitActivityConfigChange(action, affectedEntity, source string
 // detectionCount is the number of sensitive data detections found.
 // maxSeverity is the highest severity level among detections (e.g., "high", "medium", "low").
 // detectionTypes is a list of detection type names (e.g., "credit_card", "api_key").
-func (r *Runtime) EmitSensitiveDataDetected(activityID string, detectionCount int, maxSeverity string, detectionTypes []string) {
+func (r *Runtime) EmitSensitiveDataDetected(activityID string, detectionCount int, maxSeverity string, detectionTypes []string, serverName string) {
 	payload := map[string]any{
+		"server_name":     serverName,
 		"activity_id":     activityID,
 		"detection_count": detectionCount,
 		"max_severity":    maxSeverity,
@@ -654,6 +821,24 @@ func (r *Runtime) EmitSecurityScanFailed(serverName, _, errMsg string) {
 	r.publishScanSettled(serverName, "failed", nil, errMsg)
 }
 
+// EmitSecurityScanTelemetry is the sole producer of the schema-v8 TPA scanner
+// counters. The scanner package calls it exactly once per terminal, real
+// (non-dry-run) Pass-1 scan JOB — never per scanner and never for the Pass-2
+// deep supply-chain audit — so scans_completed/scans_failed count scans, not
+// scanner invocations or passes. See scanCallbackAdapter.countsForTelemetry.
+//
+// Only counts cross this boundary: the server name, the scanner id, and the
+// error text are not parameters at all, and the registry drops any severity key
+// outside the fixed enum. Nil-safe: telemetry may be disabled or not yet
+// initialized.
+func (r *Runtime) EmitSecurityScanTelemetry(completed bool, findingsBySeverity map[string]int) {
+	if completed {
+		telemetry.RecordTPAScanCompletedOn(r.TelemetryRegistry(), findingsBySeverity)
+		return
+	}
+	telemetry.RecordTPAScanFailedOn(r.TelemetryRegistry())
+}
+
 // publishScanSettled emits the single debounced terminal scan event.
 func (r *Runtime) publishScanSettled(serverName, status string, findingsSummary map[string]int, errMsg string) {
 	payload := map[string]any{
@@ -689,4 +874,23 @@ func (r *Runtime) EmitSecurityScannerChanged(scannerID, status, errMsg string) {
 		payload["error"] = errMsg
 	}
 	r.publishEvent(newEvent(EventTypeSecurityScannerChanged, payload))
+}
+
+// jsonByteLen returns the JSON-serialized byte length of v, or 0 when there is
+// nothing to measure or it cannot be marshaled. A typed-nil pointer inside a
+// non-nil interface encodes as "null"; that is 4 bytes of nothing, so it is
+// reported as 0 rather than as a measured response.
+func jsonByteLen(v interface{}) int {
+	if v == nil {
+		return 0
+	}
+	if rv := reflect.ValueOf(v); (rv.Kind() == reflect.Ptr || rv.Kind() == reflect.Map ||
+		rv.Kind() == reflect.Slice || rv.Kind() == reflect.Interface) && rv.IsNil() {
+		return 0
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return 0
+	}
+	return len(b)
 }

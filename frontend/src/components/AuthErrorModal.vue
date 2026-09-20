@@ -13,19 +13,34 @@
         <div class="alert alert-info mb-4">
           <div class="flex-1">
             <h4 class="font-semibold mb-2">How to get the API key:</h4>
+            <!-- Audit F28: headless and server installs have no tray, so the
+                 tray route can't be the only one. The config file and the CLI
+                 work everywhere. -->
             <ol class="list-decimal list-inside space-y-1 text-sm">
-              <li><strong>Using Tray:</strong> Right-click the MCPProxy tray icon and select "Open Web UI"</li>
-              <li><strong>From Logs:</strong> Check mcpproxy startup logs for the API key, then add <code class="bg-base-200 px-1 rounded">?apikey=YOUR_KEY</code> to the URL</li>
-              <li><strong>Manual Entry:</strong> Enter your API key below if you have it</li>
+              <li><strong>From the CLI:</strong> run <code class="bg-base-200 px-1 rounded">mcpproxy status</code> — its "Web UI" line is a ready-to-open URL with the key embedded (<code class="bg-base-200 px-1 rounded">mcpproxy status --web-url</code> prints just that URL), or read <code class="bg-base-200 px-1 rounded">api_key</code> in <code class="bg-base-200 px-1 rounded">~/.mcpproxy/mcp_config.json</code></li>
+              <li><strong>From logs:</strong> the key is logged in full only by the start that generated it — later starts log a masked prefix</li>
+              <!-- The label is NOT an OS split. "Open Web UI in Browser" is
+                   the Swift app bundle (native/macos, shipped in the DMG);
+                   "Open Web Control Panel" is the Go tray
+                   (internal/tray/tray.go:594), whose build tag is
+                   `!nogui && !headless && !linux` — so it ships on Windows AND
+                   on macOS via the darwin tarball and Homebrew
+                   (`bin.install "mcpproxy-tray" if OS.mac?`). Naming one of
+                   them "Windows:" would put a fresh false statement on the
+                   screen this modal exists to make honest. Both trays fetch
+                   the URL from /api/v1/info over the socket, which answers
+                   with an admin context, so both get the key appended. -->
+              <li><strong>Using the tray</strong> (desktop installs): click the MCPProxy tray icon and choose "Open Web UI in Browser" or "Open Web Control Panel" (the wording depends on which tray build you have) — either opens an already-authenticated window</li>
             </ol>
           </div>
         </div>
       </div>
 
-      <!-- Manual API Key Entry -->
+      <!-- Manual API Key Entry. Audit F28: the field was labelled "(optional)"
+           while being the only way in. -->
       <div class="form-control mb-6">
         <label class="label">
-          <span class="label-text font-semibold">Enter API Key (optional)</span>
+          <span class="label-text font-semibold">API key <span class="text-error">(required)</span></span>
         </label>
         <div class="input-group">
           <input
@@ -72,8 +87,17 @@
           </svg>
           Refresh & Retry
         </button>
-        <button v-if="canClose" class="btn btn-outline" @click="handleClose">
-          Continue Without Auth
+        <!-- Audit F28: "Continue Without Auth" led to a shell of zero-valued
+             tiles, so it must not sit at equal weight beside the real way in.
+             Demoted to a link, and honest about where it goes. -->
+        <button
+          v-if="canClose"
+          class="btn btn-ghost btn-sm text-base-content/60"
+          data-test="auth-dismiss"
+          title="The UI cannot load data without a key — pages will render empty"
+          @click="handleClose"
+        >
+          Dismiss (pages stay empty)
         </button>
       </div>
     </div>
@@ -88,7 +112,10 @@ import { ref, computed, onMounted } from 'vue'
 import api from '@/services/api'
 
 interface Props {
-  show: boolean
+  // Spec 107 T088 (App.vue): bound as `authModal.show || undefined` so the
+  // stubbed component in tests never renders a literal `show="false"`
+  // attribute — accept the omitted case here too.
+  show?: boolean
   canClose?: boolean
   lastError?: string
 }
@@ -96,7 +123,9 @@ interface Props {
 interface Emits {
   (e: 'close'): void
   (e: 'authenticated'): void
-  (e: 'refresh'): void
+  // `verified` says whether the reloaded key actually authenticated. App.vue
+  // only invalidates views when it did (#1065).
+  (e: 'refresh', verified: boolean): void
 }
 
 const props = withDefaults(defineProps<Props>(), {
@@ -162,10 +191,27 @@ async function handleSetAPIKey() {
   }
 }
 
-function handleRefresh() {
-  // Reinitialize API key from URL/localStorage
-  api.reinitializeAPIKey()
-  emit('refresh')
+async function handleRefresh() {
+  // Reinitialize API key from URL/localStorage, then VERIFY it before telling
+  // the app auth is repaired. Without the verification this path could only
+  // assert recovery, so it could not safely invalidate the views holding stale
+  // auth errors -- and #1065's stale red panel survived on this path.
+  isValidating.value = true
+  inputError.value = ''
+  try {
+    api.reinitializeAPIKey()
+    const isValid = await api.validateAPIKey()
+    emit('refresh', isValid)
+    if (!isValid) {
+      inputError.value = 'No valid API key found — enter one above'
+    }
+  } catch (error) {
+    console.error('API key refresh error:', error)
+    inputError.value = error instanceof Error ? error.message : 'Refresh failed'
+    emit('refresh', false)
+  } finally {
+    isValidating.value = false
+  }
 }
 
 function handleClose() {

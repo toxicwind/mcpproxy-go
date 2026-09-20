@@ -104,9 +104,39 @@ A running MCPProxy core watches `mcp_config.json` and hot-reloads external edits
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `tools_limit` | integer | `15` | Maximum number of tools to return per request (1-1000) |
-| `tool_response_limit` | integer | `20000` | Maximum characters in tool responses (0 = unlimited) |
+| `tool_response_limit` | integer | `20000` | Maximum characters in tool responses (0 = unlimited). Applies to built-in tools too: an oversize `retrieve_tools` result is truncated and the full payload is retrievable via `read_cache` (except on the code-execution surface, which does not expose `read_cache`) |
 | `call_tool_timeout` | string | `"2m"` | Timeout for tool calls (e.g., `"30s"`, `"2m"`, `"5m"`). **Note**: When using agents like Codex or Claude as MCP servers, you may need to increase this timeout significantly, even up to 10 minutes (`"10m"`), as these agents may require longer processing times for complex operations |
 | `init_timeout` | duration | `"30s"` | Deadline for an upstream's MCP `initialize` handshake (e.g. `"30s"`, `"120s"`, `"3m"`). Raise this for servers that do legitimate first-run warmup — building a cache/index or prefetching — before they answer `initialize`, so they are not killed mid-startup. Global default; can be overridden per server (see [Server Fields](#server-fields)). Range: `1s`–`30m`; `"0s"`/unset uses the 30s default. |
+
+### HTTP Server Timeouts
+
+Deadlines applied to mcpproxy's own HTTP listener (REST API, `/mcp`, `/events`).
+These are separate from `call_tool_timeout`, which caps how long an *upstream
+tool* may run.
+
+```json
+{
+  "http_read_timeout": "120s",
+  "http_write_timeout": "120s",
+  "http_idle_timeout": "180s"
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `http_read_timeout` | duration | `"120s"` | Deadline for reading the entire request (headers + body). `"0s"` = no timeout. Range: `1s`–`24h`. |
+| `http_write_timeout` | duration | `"120s"` | Wall-clock cap on writing the entire response, counted from when the request headers were read. **Governs non-streaming endpoints only** (REST API, Web UI, health) — the MCP endpoints and the SSE `/events` stream are exempt by design (see below, [#965](https://github.com/smart-mcp-proxy/mcpproxy-go/issues/965)). `"0s"` disables it globally. Range: `1s`–`24h`. |
+| `http_idle_timeout` | duration | `"180s"` | Keep-alive timeout for idle persistent connections. `"0s"` removes the dedicated idle deadline, but Go's `net/http` then falls back to the read timeout — idle is fully unbounded only when `http_read_timeout` is also `"0s"`. Range: `1s`–`24h`. |
+
+Notes:
+
+- **Streaming routes are exempt from `http_write_timeout`.** A write deadline caps the whole response, so it would truncate any tool call slower than it and silently kill long-lived SSE streams. The MCP endpoints (`/mcp`, `/mcp/all`, `/mcp/code`, `/mcp/call`, `/mcp/p/<slug>`, plus the legacy `/v1/tool_code` and `/v1/tool-code` aliases) and `/events` therefore clear their own per-request write deadline (and, being body-less GETs, their read deadline). Everything else keeps the configured deadline, which is what protects a non-loopback deployment from slow readers. You do **not** need to disable `http_write_timeout` to run long tool calls ([#965](https://github.com/smart-mcp-proxy/mcpproxy-go/issues/965)).
+- **`"0s"` means "no timeout"**, not "use the default" — unlike `init_timeout`. Omit the key entirely to get the built-in default. Setting `http_write_timeout` to `"0s"` removes the deadline from *every* endpoint, including REST/UI/health. Exception: `http_idle_timeout: "0s"` alone does not unbound idle connections — Go's `net/http` falls back to the read timeout (see the field row above).
+- **A restart is required.** These values are baked into the HTTP server when it binds, so a config edit is reported as restart-required rather than hot-reloaded.
+- **Slowloris protection is unaffected**: the 60s request-header read deadline is hardcoded and not configurable.
+- **Long tool calls need `call_tool_timeout`.** It (default `"2m"`) separately caps tool execution. To allow tool calls longer than two minutes, raise `call_tool_timeout` — the MCP routes' write-deadline exemption alone is not enough.
+
+Environment overrides: `MCPPROXY_HTTP_READ_TIMEOUT`, `MCPPROXY_HTTP_WRITE_TIMEOUT`, `MCPPROXY_HTTP_IDLE_TIMEOUT`.
 
 ### TOON Output (Adaptive Result Encoding)
 
@@ -180,12 +210,152 @@ the proxy.
 > the Web UI / macOS app is planned; for now set per-server overrides via the
 > Raw JSON editor or the REST API.
 
+### Concurrency Limits & Request Queueing
+
+Multi-user or multi-agent deployments can overwhelm a fragile upstream (a
+database-backed stdio server, a rate-limited API) with simultaneous tool calls.
+MCPProxy can cap how many upstream tool calls run at once and park the excess in
+a bounded FIFO queue, shedding predictably when that queue is full
+(GitHub [#955](https://github.com/smart-mcp-proxy/mcpproxy-go/issues/955)).
+
+**Everything is off by default** — with no keys set, behavior is exactly as
+before: no limiting, no queueing, no new errors.
+
+There are **three separately named scopes**, each carrying the same three
+settings:
+
+| Scope | Where | What it caps |
+|-------|-------|--------------|
+| Global aggregate limiter | top-level `max_concurrent_requests` / `queue_size` / `queue_timeout` | All upstream tool calls across the whole proxy |
+| Per-server default set | `server_concurrency_defaults` object | Blanket per-server values, inherited by every server that does not override them |
+| Per-server override | the same three keys on an `mcpServers[]` entry | That one server |
+
+```json
+{
+  "max_concurrent_requests": 50,
+  "queue_size": 100,
+  "queue_timeout": "30s",
+
+  "server_concurrency_defaults": {
+    "max_concurrent_requests": 5,
+    "queue_size": 10,
+    "queue_timeout": "30s"
+  },
+
+  "mcpServers": [
+    { "name": "fragile-db", "command": "db-mcp", "max_concurrent_requests": 1, "queue_size": 2 },
+    { "name": "fast-api", "url": "https://api.example.com/mcp", "max_concurrent_requests": 0 }
+  ]
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `max_concurrent_requests` | integer | unset (off) | Maximum upstream tool calls running at once in this scope. `0` (or unset) = no limiter for this scope. |
+| `queue_size` | integer | `0` | How many calls may wait for a slot. `0` = no pending capacity: a call arriving at the cap is shed immediately. |
+| `queue_timeout` | duration | `"30s"` when a limiter is active | How long a call may wait in the queue before being shed. |
+
+**Tri-state per-server semantics.** Each per-server key is independently
+tri-state:
+
+- **absent** — inherit the value from `server_concurrency_defaults`;
+- **`0`** — disable that setting for this server. `max_concurrent_requests: 0`
+  opts the server out of per-server limiting entirely (even when the default set
+  configures one); `queue_size: 0` keeps the cap but removes the queue, so
+  excess calls are shed instantly;
+- **positive** — override the default for this server.
+
+The global aggregate limiter is **never** an inheritance source for a server.
+It applies *on top*: a server's effective concurrency is
+**min(resolved per-server limit, global limit)**. Waiting for a per-server slot
+does not consume global capacity — the per-server slot is taken first.
+
+**One deadline, not two.** `queue_timeout` is a total wait budget, not a
+per-tier one: a call waiting for a per-server slot and then a global slot shares
+a single absolute deadline (the smallest configured timeout among the active
+scopes). Queue waiting never consumes the call's execution timeout — the
+execution budget starts after admission.
+
+**Recommended starting point for stdio upstreams: `5`.** stdio does not mean
+serial: the MCP stdio transport multiplexes by JSON-RPC id and common SDK
+servers process calls through a small worker pool, so `5` mirrors typical
+upstream capacity. Drop to `1` only for a server you know is single-threaded or
+backed by a fragile store.
+
+**Shedding.** A shed call is reported as a readable, retry-friendly error rather
+than a dropped connection: MCP tool calls get an error tool result, the REST
+tool-call endpoint returns `429` with `Retry-After`, and the activity log
+records the call with a `rejected` status carrying the reason (`queue_full` or
+`queue_timeout`) and scope (`server` or `global`).
+
+**Batched sandbox calls.** A `call_tools()` batch from
+[code execution](#code-execution) goes through the same admission path, so these
+limits are never bypassed by batching. A server capped at
+`max_concurrent_requests: 1` with `queue_size: 9` serializes a 10-element batch;
+the same server with **no** `queue_size` returns one result and nine per-slot
+`queue_full` errors. Give servers you fan out against enough `queue_size`
+headroom (or keep `code_execution_max_parallel` at their cap).
+
+**Hot reload.** All limits are hot-reloadable — edit the config file and the new
+values govern subsequent admissions without a restart. Running calls are never
+interrupted, but they keep counting against the new caps: after lowering a cap,
+nothing new is admitted until occupancy drains below it. Raising a cap admits
+waiting calls immediately; queued calls keep their original deadline.
+
+**Validation.** Negative values are rejected, as is a positive `queue_size` in a
+scope whose `max_concurrent_requests` resolves to disabled (a queue in front of
+no limiter can never admit anything). Errors name the offending scope and field.
+The exception is the documented opt-out above: an explicit per-server
+`max_concurrent_requests: 0` is valid even when the default set defines a queue.
+
+Only the **global aggregate** scope has environment overrides
+(`MCPPROXY_MAX_CONCURRENT_REQUESTS`, `MCPPROXY_QUEUE_SIZE`,
+`MCPPROXY_QUEUE_TIMEOUT`); the default set and per-server overrides are
+file/API-configured.
+
+**Per-server limits over REST.** `POST /api/v1/servers` and
+`PATCH /api/v1/servers/{name}` accept `max_concurrent_requests`, `queue_size`
+and `queue_timeout` alongside the other per-server fields, and
+`GET /api/v1/servers` echoes them back. All three keep tri-state semantics on
+PATCH: omitting a key leaves the stored value alone, and an explicit `0` is the
+documented opt-out — it is applied, not treated as "unset".
+
+```bash
+curl -X PATCH http://127.0.0.1:8080/api/v1/servers/fragile-db \
+  -H "X-API-Key: $MCPPROXY_API_KEY" -H 'Content-Type: application/json' \
+  -d '{"max_concurrent_requests": 1, "queue_size": 2, "queue_timeout": "10s"}'
+```
+
+**What is limited, and what is not.** Limits apply to *upstream tool calls* from
+every in-process origin — the `call_tool_*` variants, direct-routing mode, the
+REST `POST /api/v1/tools/call` endpoint, sandboxed `code_execution` scripts and
+activity replay. Local tool search, coalesced tool listings and health probes
+are never throttled: they are lightweight and must not be able to queue behind a
+saturated upstream. The separate-process CLI debug client is out of scope.
+
+**Observability.** Saturation is visible on the Prometheus surface:
+
+| Metric | Type | Labels | Meaning |
+|--------|------|--------|---------|
+| `mcpproxy_tool_calls_rejected_total` | counter | `server`, `reason`, `scope` | Calls shed by a limit. `reason` = `queue_full` \| `queue_timeout`; `scope` = `server` \| `global`. `server` is the call's target even for a global shed. |
+| `mcpproxy_concurrency_active` | gauge | `scope`, `server` | Calls currently holding a slot. |
+| `mcpproxy_concurrency_queue_depth` | gauge | `scope`, `server` | Calls currently waiting for a slot. |
+
+Gauges are sampled every 10s; the counter is exact — it is incremented at the
+rejection itself, not derived from the internal event stream, so a burst of
+sheds cannot lose increments. The same sheds also appear in the activity log
+(`status: rejected`) — written on the same synchronous path, and exactly one row
+per shed — including the ones from `code_execution` and replay: the rejection is
+recorded at the limiter, below the MCP dispatch layer, so no origin can bypass
+it and none can double-report it.
+
 ### Debug & Development
 
 ```json
 {
   "debug_search": false,
   "enable_prompts": true,
+  "aggregate_upstream_prompts": false,
   "check_server_repo": true
 }
 ```
@@ -193,7 +363,8 @@ the proxy.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `debug_search` | boolean | `false` | Enable debug logging for search operations |
-| `enable_prompts` | boolean | `true` | Enable MCP prompts feature for workflow guidance and interactive assistance with common tasks (finding tools, debugging search, setting up servers, troubleshooting connections) |
+| `enable_prompts` | boolean | `true` | Enable mcpproxy's built-in prompts (setup / troubleshoot workflows) and advertise the MCP `prompts` capability. Governs only the built-ins; upstream aggregation is controlled separately by `aggregate_upstream_prompts`. |
+| `aggregate_upstream_prompts` | boolean | `false` | **Opt-in.** When `true`, aggregate every connected upstream server's MCP prompts into mcpproxy's own `prompts/list` (exposed as `<server>__<prompt>`). Off by default so users are safe until they deliberately enable it. Requires `enable_prompts: true` (the default) to have any effect. Hot-reloadable. The per-server [`expose_prompts`](#per-server-settings) override further filters which servers contribute once this is on. |
 | `check_server_repo` | boolean | `true` | Enable repository detection for MCP servers (shows install commands) |
 
 ---
@@ -237,11 +408,15 @@ the proxy.
 | `health_check_interval` | duration | No | Per-server override for the global [`health_check_interval`](#discovery--health-checks). `"0s"` disables the liveness probe for this server only. Range: `5s`–`1h`. Omit to inherit the global value. |
 | `tool_discovery_interval` | duration | No | Per-server override for the global [`tool_discovery_interval`](#discovery--health-checks). Overrides the global/default cadence for this server only; `"0s"` disables the periodic tool-discovery sweep for this server (connect-time and reactive `list_changed` discovery still run). Range: `30s`–`24h`. Omit to inherit the global value. |
 | `init_timeout` | duration | No | Per-server override for the global [`init_timeout`](#search--tool-limits) — the MCP `initialize` handshake deadline. Raise it for an upstream that warms up (caches/indexes data) before responding to `initialize` (e.g. `"120s"`, `"3m"`); without it such a server is killed mid-startup and, with `docker run --rm`, retries forever. Range: `1s`–`30m`. Omit to inherit the global value (30s default). Settable via the `upstream_servers` tool and `mcpproxy upstream patch --init-timeout`. |
+| `max_concurrent_requests` | integer | No | Per-server cap on concurrently running upstream tool calls (see [Concurrency Limits & Request Queueing](#concurrency-limits--request-queueing)). Omit to inherit `server_concurrency_defaults`; `0` opts this server out of per-server limiting; positive = that cap. The global limiter still applies on top. |
+| `queue_size` | integer | No | How many calls may wait for this server's slot. Omit to inherit the default set; `0` = no pending capacity (shed immediately at the cap). |
+| `queue_timeout` | duration | No | How long a call may wait for this server's slot (e.g. `"10s"`). Omit to inherit the default set (30s when a limiter is active). |
 | `oauth` | object | No | OAuth configuration (see [OAuth Configuration](#oauth-configuration)) |
 | `isolation` | object | No | Per-server Docker isolation settings (see [Docker Isolation](#docker-isolation)) |
 | `enabled` | boolean | No | Enable/disable server (default: `true`) |
 | `quarantined` | boolean | No | Security quarantine status (default: `false` for manually added servers, `true` for LLM-added servers) |
 | `reconnect_on_use` | boolean | No | When `true`, tool calls to a disconnected server trigger an immediate reconnect attempt (15s timeout) before failing (default: `false`) |
+| `expose_prompts` | boolean | No | Per-server override for whether this server's MCP prompts are aggregated into mcpproxy's `prompts/list`. Only takes effect when the global `aggregate_upstream_prompts` master switch is on. Omit to expose prompts whenever the server advertises `Capabilities.Prompts`; `false` opts this server out even if it does. |
 | `toon_output` | string | No | Per-server override for the global [`toon_output`](#toon-output-adaptive-result-encoding): `off`, `adaptive`, or `always`. Non-empty value wins over the global for this server's tools; omit to inherit. See [TOON Output](features/toon-output.md). |
 | `created` | string | No | ISO 8601 timestamp (auto-generated) |
 | `updated` | string | No | ISO 8601 timestamp (auto-updated) |
@@ -354,7 +529,7 @@ explicitly to one of `http`, `sse`, or `streamable-http`.
   "oauth": {
     "client_id": "your-client-id",
     "client_secret": "secret-reference",
-    "redirect_uri": "http://localhost:8080/oauth/callback",
+    "redirect_uri": "http://127.0.0.1:54108/oauth/callback",
     "scopes": ["repo", "user"],
     "pkce_enabled": true
   }
@@ -365,9 +540,115 @@ explicitly to one of `http`, `sse`, or `streamable-http`.
 |-------|------|----------|-------------|
 | `client_id` | string | No | OAuth client ID (uses Dynamic Client Registration if empty) |
 | `client_secret` | string | No | OAuth client secret (can reference secure storage) |
-| `redirect_uri` | string | No | OAuth redirect URI (auto-generated if not provided) |
+| `redirect_uri` | string | No | Pins the loopback callback URL (auto-allocated if not provided) |
 | `scopes` | array | No | OAuth scopes to request |
 | `pkce_enabled` | boolean | No | PKCE is always enabled for security; this flag is currently ignored |
+
+#### The `oauth` block declares that OAuth is required
+
+An `oauth` block — even an empty `{}` — tells mcpproxy the upstream needs OAuth.
+Without one, mcpproxy probes the server anonymously first and only falls back to
+OAuth when that probe is rejected. Most OAuth servers reject the anonymous
+`initialize`, so autodetection works for them.
+
+Some servers authorise **per method** instead: they answer `initialize` and
+`tools/list` anonymously and reject only `tools/call`. Google's Gmail MCP endpoint
+(`https://gmailmcp.googleapis.com/mcp/v1`) is one. For these the anonymous probe
+succeeds, so autodetection can never reach OAuth — every tool call then fails
+with `authorization required` while the server shows as connected. Declare
+OAuth explicitly:
+
+```json
+{
+  "name": "Gmail",
+  "url": "https://gmailmcp.googleapis.com/mcp/v1",
+  "protocol": "http",
+  "oauth": {
+    "client_id": "<client-id>.apps.googleusercontent.com",
+    "client_secret": "${keyring:gmail_client_secret}",
+    "scopes": ["https://mail.google.com/"]
+  }
+}
+```
+
+With an `oauth` block mcpproxy skips the anonymous probe: the stored token is
+attached to every request (including `tools/call`), and `mcpproxy auth login`
+always starts a fresh sign-in — even when a valid token is already stored and
+even though the anonymous handshake would have succeeded.
+Static `headers` ride along with the bearer; the token store owns the
+`Authorization` header, so a static `Authorization` value is not used while an
+`oauth` block is present.
+
+Do not add an `oauth` block to a server that needs no sign-in: it will wait for
+a login instead of connecting anonymously (the server's health detail says so:
+"the server's oauth block declares OAuth, so the anonymous probe was skipped").
+Because no request is sent until a token exists, an unreachable URL on such a
+server also shows as "Sign-in required" rather than a connection error until
+the first login.
+
+#### Pinning the callback port with `redirect_uri`
+
+By default mcpproxy asks the OS for a free loopback port on the first OAuth
+login, then persists that port and tries to reuse it. If the saved port is taken
+next time, a different one is allocated — so the callback URL is not guaranteed
+to stay put. Some providers require the port to match the registered callback
+URL exactly, so it must not move at all. GitHub OAuth Apps are the common case:
+even with GitHub's wildcard matching enabled, that matching covers subdomains
+and subdirectory paths only — the host and port must still match exactly.
+
+Set `redirect_uri` to pin it. mcpproxy then binds that exact port and sends that
+exact string to the provider as `redirect_uri`:
+
+```json
+{
+  "oauth": {
+    "client_id": "Iv1.abc123",
+    "redirect_uri": "http://127.0.0.1:54108/oauth/callback"
+  }
+}
+```
+
+The value must be an RFC 8252 loopback redirect: `http` scheme, a loopback host
+(`127.0.0.1`, `localhost` or `::1`), and an explicit port. mcpproxy binds its
+callback listener to whatever path the URI specifies, so a provider that only
+lets you register a different one (some publish a single shared OAuth
+application whose callback path an individual user cannot change) still
+works — e.g. `http://127.0.0.1:54108/callback`. A pin with no path at all
+(`http://127.0.0.1:54108`) binds `/`, not `/oauth/callback`; `/oauth/callback`
+is only the default when `redirect_uri` is omitted entirely and mcpproxy
+allocates a dynamic port. Register the same URL with the provider.
+
+Prefer `127.0.0.1`. `localhost` is accepted, and the string is sent to the
+provider exactly as written, but the listener binds `127.0.0.1` — on a host
+whose browser resolves `localhost` to `::1` without falling back, the redirect
+would reach a closed port. Write `http://[::1]:PORT/oauth/callback` if you want
+the IPv6 loopback; mcpproxy then binds `::1` itself.
+
+A malformed value, or a pinned port that is already in use, fails the login with
+an explicit error rather than silently falling back to a random port. The error
+appears in three places:
+
+- the connection error and the server's `health.detail` (it names
+  `oauth.redirect_uri` and the reason),
+- `mcpproxy upstream logs <name>` (the per-server log), and
+- the main log (`~/Library/Logs/mcpproxy/main.log` on macOS,
+  `~/.mcpproxy/logs/main.log` on Linux), under the `oauth` logger name.
+
+A malformed value is also rejected up front by the write surfaces — the REST
+config API (`POST /api/v1/config/validate`, `POST /api/v1/config/apply`,
+`PATCH /api/v1/config`), the Web UI that calls them, and the MCP
+`upstream_servers` tool. Hand-editing `mcp_config.json` bypasses that check by
+design: a bad value already on disk must not stop the daemon from booting, so it
+is reported at connect time instead.
+
+When `redirect_uri` is not set, mcpproxy persists the port used by the first
+successful login and reuses it for subsequent logins.
+
+If the server previously logged in without a pin, its client registration was
+issued through Dynamic Client Registration against that old port. Adding a
+`redirect_uri` with a different port clears that registration automatically so
+the next login re-registers against the pinned URL; a statically configured
+`client_id` is never cleared.
 
 See [OAuth Documentation](mcp-go-oauth.md) for complete details.
 
@@ -379,6 +660,7 @@ See [OAuth Documentation](mcp-go-oauth.md) for complete details.
 {
   "api_key": "your-secret-api-key",
   "trusted_hosts": ["mcp.example.com"],
+  "trusted_proxies": ["127.0.0.1"],
   "read_only_mode": false,
   "disable_management": false,
   "allow_server_add": true,
@@ -390,6 +672,7 @@ See [OAuth Documentation](mcp-go-oauth.md) for complete details.
 |-------|------|---------|-------------|
 | `api_key` | string | Auto-generated | API key for REST API authentication. Required; if empty, one is auto-generated and enforced (logged on startup) |
 | `trusted_hosts` | string[] | `[]` | Non-loopback `Host` header values accepted on loopback listeners (reverse-proxy deployments). See below |
+| `trusted_proxies` | string[] | `[]` (trust nobody) | CIDRs or IP addresses whose `X-Forwarded-For` / `X-Real-IP` / `X-Forwarded-Proto` / `X-Forwarded-Host` headers are honoured; any other peer's forwarded headers are ignored and `RemoteAddr` is used. Env `MCPPROXY_TRUSTED_PROXIES`. Hot-reloadable. Invalid entry: `trusted_proxies[N] "value" is not a valid CIDR or IP address` (boot, PATCH and apply). See [Reverse Proxy Deployment](operations/reverse-proxy.md#trusted_proxies-forwarded-headers) |
 | `read_only_mode` | boolean | `false` | Prevent all configuration modifications |
 | `disable_management` | boolean | `false` | Disable server management operations (restart, enable, disable) |
 | `allow_server_add` | boolean | `true` | Allow adding new servers via API/tools |
@@ -400,6 +683,36 @@ See [OAuth Documentation](mcp-go-oauth.md) for complete details.
 - **Empty API Key**: Empty values are replaced with an auto-generated key; authentication is always enforced
 - **Auto-Generation**: If no API key is provided, one is generated and logged for easy access
 - **Tray Integration**: Tray app automatically manages API keys for core communication
+
+## Audit Log
+
+One JSONL line per authorization decision and tool call, edition-neutral. Personal
+edition defaults to off; the server edition defaults to on (stdout, unless the native
+stdio transport is in use — see below). See [Audit Log](features/audit-log.md).
+
+```json
+{
+  "audit_log": {
+    "enabled": true,
+    "stdout": false,
+    "path": "/var/log/mcpproxy/audit.jsonl",
+    "max_size_mb": 50,
+    "max_backups": 10,
+    "max_age_days": 90,
+    "compress": true
+  }
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `audit_log.enabled` | boolean | personal: `false`; server: `true` | Turn audit logging on. Restart-pinned — the sink is bound at construction |
+| `audit_log.stdout` | boolean | server: `true` when the block is absent | Write lines to stdout. Env `MCPPROXY_AUDIT_LOG_STDOUT`. Not used under the native stdio transport (stdout carries JSON-RPC); an explicit `stdout: true` with no `path` there fails boot with exit code 4 |
+| `audit_log.path` | string | `""` | File to append lines to (rotated). Env `MCPPROXY_AUDIT_LOG_PATH`. An unwritable path fails boot with exit code 4 |
+| `audit_log.max_size_mb` | int | `50` | Rotate after this size. Must be positive when a path is set |
+| `audit_log.max_backups` | int | `10` | Rotated files to keep. Must be positive when a path is set |
+| `audit_log.max_age_days` | int | `90` | Delete rotated files after this many days. Must be positive when a path is set |
+| `audit_log.compress` | boolean | `true` | gzip rotated files |
 
 ### Reverse Proxy Deployments (`trusted_hosts`)
 
@@ -464,6 +777,8 @@ block** — off by default, best-effort, and unable to change the baseline verdi
     "integrity_check_interval": "1h",
     "integrity_check_on_restart": false,
     "scanner_registry_url": "",
+    "tpa_bundle_path": "",
+    "auto_baseline_scan": true,
     "deep_scan": {
       "enabled": false,
       "fetch_package_source": true,
@@ -476,6 +791,8 @@ block** — off by default, best-effort, and unable to change the baseline verdi
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
+| `tpa_bundle_path` | string | `""` (embedded) | Filesystem path to the tpa-db `scanner-bundle.json` the offline TPA scanner runs. Empty uses the corpus embedded in the build. Env override: `MCPPROXY_TPA_BUNDLE_PATH`, which wins over this field on every path (loader, hot-reload, `/api/v1/config/apply`). Re-read on config hot-reload and honoured in every transport, stdio included. A bundle that fails to read/parse/version-check/compile — or that contributes zero runnable rules — is refused and the previously active corpus stays live; the reason is surfaced as `signature_bundle.load_error` in `GET /api/v1/security/overview` and in `mcpproxy security overview`. |
+| `auto_baseline_scan` | boolean | `true` | Kill switch for the **automatic informational baseline scan**. When on (the default), every newly added server gets one free in-process Pass-1 TPA scan, and once per installation a background sweep scans pre-existing enabled servers that have never been scanned (marker persisted in BBolt, so it runs exactly once and never delays startup). The result only populates the security badge / scan summary: it **never** quarantines, approves, or otherwise gates a server. Disabled servers are skipped, and so are `trust_mode: "scan"` servers — that mode's own admission gate scans them and auto-approves on a clean verdict, so the informational path stays out of it entirely rather than risk feeding that gate; this flag does not affect that separate path. Set to `false` to suppress all automatic scans; manual scans keep working. Hot-reloadable — the flag is read live at each decision point. Env override: `MCPPROXY_AUTO_BASELINE_SCAN` (`true`/`1`/`false`/`0`), which wins over this field on every path. |
 | `deep_scan.enabled` | boolean | `false` | Master opt-in for the heavy layer. When `false`, no Docker scanner runs and no source extraction is attempted — only the in-process baseline scanner executes. |
 | `deep_scan.fetch_package_source` | boolean | `true` (when deep scan is on) | Whether the scanner fetches (never executes) the published source of `npx`/`uvx` package-runner servers when no local source is available. Set `false` for air-gapped deployments. |
 | `deep_scan.disable_no_new_privileges` | boolean | `false` | Omits `--security-opt no-new-privileges` from scanner container runs (snap-docker/AppArmor escape hatch). |
@@ -688,9 +1005,10 @@ See [Logging Documentation](logging.md) for complete details.
   "docker_isolation": {
     "enabled": false,
     "default_images": {
-      "python": "python:3.11",
-      "node": "node:20",
-      "npx": "node:20"
+      "python": "ghcr.io/astral-sh/uv:python3.13-bookworm-slim",
+      "uvx": "ghcr.io/astral-sh/uv:python3.13-bookworm-slim",
+      "node": "node:22",
+      "npx": "node:22"
     },
     "registry": "docker.io",
     "network_mode": "bridge",
@@ -708,7 +1026,7 @@ See [Logging Documentation](logging.md) for complete details.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `enabled` | boolean | `false` | Enable Docker isolation globally |
-| `default_images` | object | See below | Map of runtime type to Docker image |
+| `default_images` | object | See below | Map of runtime type to Docker image, merged over the built-in map (a partial map only overrides the keys it lists). The optional `uvx-git` key — **not** part of the built-in map — overrides the git-capable image used instead of the Python default when a Python package runner installs from a `git+` URL (the slim uv image has no git); set it to `""` to opt out. Setting it always wins, including at the value MCPProxy ships. Leave it unset and MCPProxy picks the image: your own `uvx`/`python` image if you retargeted it at your registry, otherwise `ghcr.io/astral-sh/uv:python3.13-bookworm` — qualified with `registry` when you set one |
 | `registry` | string | `"docker.io"` | Docker registry to use |
 | `network_mode` | string | `"bridge"` | Docker network mode |
 | `memory_limit` | string | `"512m"` | Memory limit for containers |
@@ -929,7 +1247,31 @@ Controls only the *serialization* of `retrieve_tools` responses (Spec 085) — n
 - **Per-call override**: the `detail` parameter on `retrieve_tools` (`compact` | `full`) overrides the configured mode for that call only.
 - **describe_tool**: in compact mode, agents fetch full definitions on demand with `describe_tool` (batch of 1–5 `server:tool` ids; same visibility rules as search).
 - **Hot-reload**: changes apply on the next call via the config file reload or `POST /api/v1/config/apply` — no restart.
-- Env: `MCPPROXY_TOOL_RESPONSE_MODE` · Flag: `--tool-response-mode`.
+- Env: `MCPPROXY_TOOL_RESPONSE_MODE` · Flag: `--tool-response-mode` · UI: Settings → General → "Detail in tool-search results" (Web UI and macOS tray).
+
+---
+
+## Direct Tool Response Mode
+
+Controls only the *serialization* of the **direct enumeration surface** (Spec 102) — `/mcp/all`, plus `/mcp` and its legacy aliases `/v1/tool_code` and `/v1/tool-code` when `routing_mode` is `direct`. It never changes which tools are listed, only how each one is rendered.
+
+```json
+{
+  "direct_tool_response_mode": "full"
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `direct_tool_response_mode` | string | `"full"` | `full` lists every upstream tool with its complete `inputSchema` (pre-Spec-102 behavior, byte-identical); an empty value means `full`. `deferred` keeps each tool's name and annotations but advertises `inputSchema` as exactly `{"type": "object"}`, drops `outputSchema`, and appends a compact signature line to the description. |
+
+- **Deferred entries**: description first, then the signature on its own line — e.g. `[github] Create a new issue.` / `create_issue(owner*:str, repo*:str, title*:str, labels:[str], milestone~:obj)`. As in compact mode, `*` marks a required parameter and `~` marks a lossy collapse.
+- **describe_tool**: registered on the direct surface too, so agents recover a full schema on demand (batch of 1–5 ids). It accepts both id spellings the surface can hand an agent: `server:tool` and the direct surface's own `server__tool`.
+- **A wrong guess never reaches the upstream**: a call whose arguments do not fit the stored schema is rejected pre-dispatch with an `invalid_params` error embedding the full stored schema plus a hint, so the agent can correct itself without a separate lookup. (The schema is returned; whether the agent's next attempt is valid is up to the agent.)
+- **Separate axis from `tool_response_mode`**: that key governs `retrieve_tools` responses, this one governs the direct enumeration surface, and setting one never moves the other. `tool_response_mode: "compact"` together with `direct_tool_response_mode: "deferred"` is a legal, intentional combination — each still governs only its own surface.
+- **Not a `routing_mode` value**: `routing_mode: "schema_deferred"` is rejected by config validation with a message naming the supported composition (`routing_mode: "direct"` with `direct_tool_response_mode: "deferred"`).
+- **Hot-reload**: flipping the mode rebuilds the direct surface and emits `notifications/tools/list_changed` to connected direct-surface sessions — no restart.
+- Env: `MCPPROXY_DIRECT_TOOL_RESPONSE_MODE` · Flag: `--direct-tool-response-mode` · UI: Settings → General → "Detail in Direct-mode listings" (Web UI and macOS tray).
 
 ## Server Instructions
 
@@ -948,6 +1290,8 @@ Text returned in the MCP `initialize` response to guide AI agents on how to use 
 You can edit this from the Web UI under **Settings → Advanced → MCP server instructions**. The textarea shows the built-in default as a greyed-out placeholder; clearing it restores that default.
 
 **Note:** Applied at startup / on the next client connect — editing this value does not hot-reload into already-connected MCP sessions.
+
+**Warning:** the text is operator-published content, returned verbatim to **every** client that initializes — including [agent tokens](https://docs.mcpproxy.app/features/agent-tokens/#what-a-scoped-token-cannot-learn) scoped to a subset of servers. Do not put server names, hostnames, credentials or other secrets in it.
 
 ---
 
@@ -992,23 +1336,45 @@ See [Tool Quarantine](features/tool-quarantine.md) for complete details.
 
 ```json
 {
-  "enable_code_execution": false,
+  "enable_code_execution": true,
   "code_execution_timeout_ms": 120000,
   "code_execution_max_tool_calls": 0,
-  "code_execution_pool_size": 10
+  "code_execution_pool_size": 10,
+  "code_execution_max_parallel": 8
 }
 ```
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `enable_code_execution` | boolean | `false` | Enable JavaScript/TypeScript code execution tool (disabled by default for security) |
+| `enable_code_execution` | boolean | `true` | Enable JavaScript/TypeScript code execution tool (on by default since v0.66.0; set `false` to switch it off). While `false` the `code_execution` tool is not advertised in `tools/list`. Hot-reloaded: a flip adds/removes the tool and sends `notifications/tools/list_changed` |
 | `code_execution_timeout_ms` | integer | `120000` | Default timeout in milliseconds (1-600000, max 10 minutes) |
 | `code_execution_max_tool_calls` | integer | `0` | Maximum tool calls per execution (0 = unlimited) |
 | `code_execution_pool_size` | integer | `10` | Number of JavaScript VM instances in pool (1-100) |
+| `code_execution_max_parallel` | integer | `8` | Default concurrency for `call_tools()` batches (1-32). Hot-reloaded; applies to executions that start after the change |
 
 Code execution supports both JavaScript (ES2020+) and TypeScript. TypeScript code is automatically transpiled via esbuild before execution.
 
-See [Code Execution Documentation](code_execution/overview.md) for complete details.
+Inside a script, `call_tool(server, tool, args)` runs one upstream tool at a time and `call_tools(requests, options)` fans out **independent** calls in parallel:
+
+```javascript
+var slots = call_tools([
+  {server: "github", tool: "get_pull_request", args: {owner: "acme", repo: "api", pullNumber: 1}},
+  {server: "github", tool: "get_pull_request", args: {owner: "acme", repo: "api", pullNumber: 2}}
+], {max_parallel: 5});
+// slots[i] is {ok: true, result} or {ok: false, error} for requests[i]
+```
+
+`requests` holds at most 100 elements; each costs one unit of `code_execution_max_tool_calls` budget. Concurrency precedence is `options.max_parallel` (1-32) > `code_execution_max_parallel` > built-in 8.
+
+> **Batching vs. per-server limits.** [Concurrency limits](#concurrency-limits--request-queueing) still govern each element. A server with `max_concurrent_requests` set and **no** `queue_size` sheds everything over the cap — a 10-element batch against `max_concurrent_requests: 1` returns 1 result and 9 per-slot `queue_full` errors. Give such servers `queue_size` headroom (or lower `max_parallel`) before fanning out against them.
+
+### Stored Scripts
+
+Long workflows do not have to be re-sent inline on every call. A `<name>.js` / `<name>.ts` file placed in the `scripts/` directory **next to this configuration file** (`~/.mcpproxy/scripts/` by default, `<dir-of---config>/scripts/` when `--config` points elsewhere) is invocable by name — `{"script": "<name>", "input": {...}}` over MCP/REST, or `mcpproxy code exec --script <name>`.
+
+There is no configuration key for this: the directory convention is the whole surface, and the scripts directory is never derived from `--data-dir`. Names are 1-64 characters of `A-Za-z0-9_-` (never a path), files are lowercase `.js`/`.ts` up to 256 KB, and each invocation re-reads the file, so an atomic replacement takes effect on the next run with no restart. `mcpproxy code scripts list` (or `GET /api/v1/code/scripts`) lists what exists; nothing writes scripts through any API.
+
+See [Code Execution Documentation](code_execution/overview.md) for complete details, and [Stored Scripts](code_execution/overview.md#stored-scripts) for the authoring rules.
 
 ---
 
@@ -1152,7 +1518,7 @@ offline.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `enabled` | boolean | `true` | Master switch for update checking. When `false`, no network check is performed (background poll *and* the manual `/api/v1/info?refresh=true` re-check) and no upgrade nudge appears on any surface — the `update` object is omitted from `/api/v1/info`. |
-| `channel` | string | `"stable"` | Release channel: `"stable"` (GitHub `releases/latest`; prereleases never offered) or `"rc"` (prerelease tags such as `v0.47.0-rc.1` included). |
+| `channel` | string | `"stable"` | Release channel: `"stable"` (GitHub `releases/latest`; prereleases never offered) or `"rc"` (prerelease tags such as `v0.47.0-rc.1` included). **Released builds ignore this field** — the running binary's own version is authoritative (a stable build is never offered an RC; an RC build always tracks `rc`); it only applies to dev/unstamped builds. See [docs/prerelease-builds.md](prerelease-builds.md). |
 
 Both keys are optional and hot-reloadable: editing them (config file or
 `POST /api/v1/config/apply`) takes effect without a restart, and re-enabling
@@ -1163,8 +1529,15 @@ triggers a prompt re-check.
 
 | Variable | Effect |
 |----------|--------|
-| `MCPPROXY_DISABLE_AUTO_UPDATE=true` | Force-disables update checking even when `update_check.enabled` is `true`. |
+| `MCPPROXY_DISABLE_AUTO_UPDATE=true` | Force-disables update checking even when `update_check.enabled` is `true`. Read by the **core and the macOS tray** — one export silences both, including the tray's one-click updater. |
 | `MCPPROXY_ALLOW_PRERELEASE_UPDATES=true` | Force-selects the prerelease (`rc`) channel even when `update_check.channel` is `stable`. |
+| `CI=true` / `CI=1` | Suppresses every update nudge and the tray's unattended checks (non-interactive context). Machine-readable fields keep reporting the facts, and a user-initiated "Check for Updates" still runs. |
+
+Both keys and both switches are reported to the tray as an explicit contract —
+`update_policy` in `GET /api/v1/info` — rather than inferred from missing data.
+The macOS one-click updater, the channel matrix and the release-infrastructure
+side (feed, enclosure, signing keys) are documented in
+[Auto-Update](/features/auto-update).
 
 The env vars only widen in one direction (disable checks / enable
 prereleases); they cannot force-enable checking that config disabled — with
@@ -1271,10 +1644,11 @@ Here's a complete configuration example with all major sections:
     "enhance_path": false
   },
 
-  "enable_code_execution": false,
+  "enable_code_execution": true,
   "code_execution_timeout_ms": 120000,
   "code_execution_max_tool_calls": 0,
   "code_execution_pool_size": 10,
+  "code_execution_max_parallel": 8,
 
   "read_only_mode": false,
   "disable_management": false,
@@ -1293,11 +1667,20 @@ Many configuration options can be overridden via environment variables:
 |----------------------|--------------|-------------|
 | `MCPPROXY_LISTEN` / `MCPP_LISTEN` | `listen` | Network binding address |
 | `MCPPROXY_API_KEY` | `api_key` | API key for authentication (empty values trigger auto-generation; auth remains enabled) |
+| `MCPPROXY_TRUSTED_HOSTS` | `trusted_hosts` | Comma-separated `Host` allowlist for loopback listeners behind a reverse proxy |
+| `MCPPROXY_TRUSTED_PROXIES` | `trusted_proxies` | Comma-separated CIDRs/IPs whose `X-Forwarded-*` headers are honoured |
+| `MCPPROXY_AUDIT_LOG_ENABLED` | `audit_log.enabled` | Turn audit logging on/off |
+| `MCPPROXY_AUDIT_LOG_PATH` | `audit_log.path` | Audit log file path |
+| `MCPPROXY_AUDIT_LOG_STDOUT` | `audit_log.stdout` | Write audit lines to stdout |
 | `MCPPROXY_TLS_ENABLED` | `tls.enabled` | Enable HTTPS/TLS |
 | `MCPPROXY_TLS_REQUIRE_CLIENT_CERT` | `tls.require_client_cert` | Enable mTLS |
 | `MCPPROXY_CERTS_DIR` | `tls.certs_dir` | Custom certificates directory |
 | `MCPPROXY_DATA` | `data_dir` | Override data directory |
 | `MCPPROXY_TOOL_RESPONSE_MODE` | `tool_response_mode` | `retrieve_tools` serialization: `full` (default) or `compact` |
+| `MCPPROXY_DIRECT_TOOL_RESPONSE_MODE` | `direct_tool_response_mode` | Direct enumeration surface serialization: `full` (default) or `deferred` |
+| `MCPPROXY_MAX_CONCURRENT_REQUESTS` | `max_concurrent_requests` | Global aggregate cap on concurrent upstream tool calls (`0` disables it). See [Concurrency Limits](#concurrency-limits--request-queueing) |
+| `MCPPROXY_QUEUE_SIZE` | `queue_size` | Global aggregate wait-queue length (`0` = shed at the cap) |
+| `MCPPROXY_QUEUE_TIMEOUT` | `queue_timeout` | Global aggregate queue wait budget, e.g. `30s` |
 | `MCPPROXY_DISABLE_OAUTH` | - | Disable OAuth for testing |
 | `HEADLESS` | - | Run in headless mode |
 
